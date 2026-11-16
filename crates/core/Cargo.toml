@@ -1,0 +1,31 @@
+[package]
+name = "pcshare-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "电脑共享核心层：身份、存储、配对、连接、文件、传输、软件与进程"
+
+[dependencies]
+base64.workspace = true
+blake3.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+constant_time_eq.workspace = true
+fastrand.workspace = true
+futures-util.workspace = true
+iroh.workspace = true
+notify.workspace = true
+pcshare-platform.workspace = true
+pcshare-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+simple-dns.workspace = true
+socket2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+png.workspace = true

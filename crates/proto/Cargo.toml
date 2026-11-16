@@ -1,0 +1,15 @@
+[package]
+name = "pcshare-proto"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "电脑共享协议：消息类型、帧编码解码、错误码、版本与权限"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util"] }

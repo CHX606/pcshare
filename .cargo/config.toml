@@ -1,0 +1,3 @@
+# 把 C 运行库打进程序里，拷到别的电脑上不用再装任何运行库
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

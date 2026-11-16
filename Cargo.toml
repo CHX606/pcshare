@@ -1,0 +1,53 @@
+# 整个项目是一个 Rust 工作区，以后的核心库、被控端、控制台都作为成员加进来。
+[workspace]
+resolver = "3"
+members = ["probe", "crates/*", "app/src-tauri"]
+exclude = ["app"]
+
+[workspace.package]
+version = "0.3.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+blake3 = "1.8"
+bytes = "1.12"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+constant_time_eq = "0.4"
+fastrand = "2.5"
+futures-util = "0.3"
+iroh = { version = "1.4", features = ["unstable-net-report"] }
+notify = "8.2"
+png = "0.18"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+simple-dns = "0.12"
+socket2 = "0.6"
+tauri = { version = "2.12", features = ["tray-icon"] }
+tauri-build = { version = "2.7", features = [] }
+thiserror = "2.0"
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "time", "io-util", "fs", "process", "sync", "net", "signal"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "ansi"] }
+url = "2.5"
+windows = "0.62"
+windows-registry = "0.6"
+
+pcshare-proto = { path = "crates/proto" }
+pcshare-platform = { path = "crates/platform" }
+pcshare-core = { path = "crates/core" }
+
+[profile.release]
+strip = true
+
+[profile.dev.package.serde_json]
+opt-level = 2
+
+[profile.dev.package.pcshare-proto]
+opt-level = 2
+
+[profile.dev.package.blake3]
+opt-level = 2
