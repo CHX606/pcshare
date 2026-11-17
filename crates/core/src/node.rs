@@ -1146,7 +1146,11 @@ impl CoreNode {
     }
 
     pub async fn local_launch(&self, args: AppLaunchArgs) -> Result<AppLaunchReply, CoreError> {
-        let perms = Permissions::default();
+        // 本机操作本机，不受“命令行”权限限制（例如批量操作里带参数打开本机软件）。
+        let perms = Permissions {
+            terminal: true,
+            ..Permissions::default()
+        };
         Ok(handle_app_launch(&self.platform, &perms, args).await?)
     }
 

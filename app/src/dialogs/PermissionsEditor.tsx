@@ -3,10 +3,14 @@ import type { Permissions } from '../api/types'
 const ROWS: Array<{ key: keyof Permissions; label: string; desc: string; risky?: boolean }> = [
   { key: 'readFiles', label: '读文件', desc: '浏览文件夹、下载文件' },
   { key: 'writeFiles', label: '写文件', desc: '新建、重命名、移动、删除、上传' },
-  { key: 'apps', label: '开软件、管进程', desc: '打开软件、结束卡死的程序' },
+  {
+    key: 'apps',
+    label: '开软件、管进程',
+    desc: '打开软件、结束卡死的程序。如果同时允许“写文件”，对方可以先传程序再打开，等于能运行任何程序',
+  },
   { key: 'screenshot', label: '截图', desc: '看这台电脑的屏幕', risky: true },
   { key: 'input', label: '点按', desc: '替你在这台电脑上点击和打字', risky: true },
-  { key: 'terminal', label: '命令行', desc: '在这台电脑上执行任意命令', risky: true },
+  { key: 'terminal', label: '命令行', desc: '在这台电脑上执行任意命令，也包括带参数打开软件、打开脚本文件', risky: true },
   { key: 'power', label: '电源', desc: '关机、重启、睡眠、锁屏', risky: true },
   { key: 'clipboard', label: '剪贴板', desc: '读写这台电脑的剪贴板', risky: true },
 ]

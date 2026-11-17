@@ -13,6 +13,97 @@ use pcshare_proto::{
 };
 
 use crate::error::map_platform_to_rpc;
+use crate::path_guard::{resolve_authorized_path, to_display_path};
+
+/// 打开后会直接执行其中命令的脚本类文件。打开它们等同于执行命令，需要“命令行”权限。
+const SCRIPT_EXTENSIONS: &[&str] = &[
+    "bat", "cmd", "ps1", "psm1", "psd1", "vbs", "vbe", "js", "jse", "wsf", "wsh", "hta",
+];
+
+/// 检查一次“打开软件”请求是否越权，通过时返回实际要交给系统打开的目标。
+///
+/// - 带命令行参数打开任何程序（例如 `cmd.exe /c ...`）等同于执行任意命令，要求同时有“命令行”权限。
+/// - 打开脚本类文件同理。
+/// - 按完整路径打开时，和文件操作一样受“只开放这几个文件夹”限制。
+/// - 不接受带目录的相对路径：它会相对被控程序的工作目录解析，绕过上面的文件夹限制。
+pub fn authorize_launch(perms: &Permissions, args: &AppLaunchArgs) -> Result<String, RpcError> {
+    let has_args = args.args.as_deref().is_some_and(|a| !a.trim().is_empty());
+    if has_args && !perms.terminal {
+        return Err(RpcError::new(
+            ErrorCode::Forbidden,
+            "带参数打开软件等同于执行命令，需要对方同时开放“命令行”权限",
+        ));
+    }
+
+    let target = args.target.trim().trim_matches('"').trim();
+    if args.kind != LaunchKind::PathOrTarget {
+        return Ok(target.to_string());
+    }
+    if target.is_empty() {
+        return Err(RpcError::new(ErrorCode::Invalid, "要打开的路径不能为空"));
+    }
+
+    let scheme = url_scheme(target);
+    // 网址交给浏览器打开，末尾是 .js 也不会被当脚本执行；其他情况（含 file:）都要看扩展名。
+    let is_web = matches!(scheme.as_deref(), Some("http" | "https"));
+    if !is_web && is_script_target(target) && !perms.terminal {
+        return Err(RpcError::new(
+            ErrorCode::Forbidden,
+            "打开脚本文件（.bat、.ps1 等）等同于执行命令，需要对方同时开放“命令行”权限",
+        ));
+    }
+
+    if looks_like_absolute_path(target) {
+        let (clean, _) = resolve_authorized_path(target, perms)?;
+        return Ok(to_display_path(&clean));
+    }
+
+    if let Some(scheme) = scheme.as_deref() {
+        // file: 和 shell: 能打开任意文件夹或文件，绕过开放文件夹的限制。
+        if !perms.allowed_roots.is_empty() && matches!(scheme, "file" | "shell") {
+            return Err(RpcError::new(
+                ErrorCode::Forbidden,
+                "对方只开放了部分文件夹，不能用 file: 或 shell: 地址打开，请直接填写完整路径",
+            ));
+        }
+        return Ok(target.to_string());
+    }
+
+    if target.contains(['\\', '/']) {
+        return Err(RpcError::new(
+            ErrorCode::Invalid,
+            format!("请填写完整路径（例如 D:\\软件\\程序.exe），不支持相对路径：{target}"),
+        ));
+    }
+    // 只有一个名字（如 notepad、calc.exe），由系统按 PATH 和“应用路径”查找。
+    Ok(target.to_string())
+}
+
+fn looks_like_absolute_path(target: &str) -> bool {
+    let b = target.as_bytes();
+    let drive = b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':';
+    let drive_abs = drive && (b.len() == 2 || b[2] == b'\\' || b[2] == b'/');
+    drive_abs || target.starts_with(r"\\") || target.starts_with("//")
+}
+
+/// 取出 `https:`、`ms-settings:` 这类地址的协议名（小写）；盘符 `C:` 不算。
+fn url_scheme(target: &str) -> Option<String> {
+    let (scheme, _) = target.split_once(':')?;
+    let valid = scheme.len() >= 2
+        && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    valid.then(|| scheme.to_ascii_lowercase())
+}
+
+fn is_script_target(target: &str) -> bool {
+    // 去掉 URL 里可能附带的 ?参数 和 #锚点 后再看扩展名
+    let core = target.split(['?', '#']).next().unwrap_or(target);
+    let last = core.rsplit(['\\', '/']).next().unwrap_or(core);
+    let ext = last.trim_end_matches(['.', ' ']).rsplit_once('.').map(|(_, e)| e);
+    ext.is_some_and(|e| SCRIPT_EXTENSIONS.iter().any(|s| s.eq_ignore_ascii_case(e)))
+}
 
 pub fn to_proto_desktop(env: DesktopEnvironment) -> DesktopStatus {
     let interactive = env.is_interactive();
@@ -72,6 +163,7 @@ pub async fn handle_app_launch(
     if !perms.app_launch {
         return Err(RpcError::new(ErrorCode::Forbidden, "对方没有开放启动软件的权限"));
     }
+    let launch_target = authorize_launch(perms, &args)?;
 
     let before_desktop = platform.desktop_environment();
     let before_hwnds: HashSet<usize> = platform
@@ -90,7 +182,7 @@ pub async fn handle_app_launch(
         }
         LaunchKind::PathOrTarget => {
             let out = platform
-                .open_target(&args.target, args.args.as_deref())
+                .open_target(&launch_target, args.args.as_deref())
                 .await
                 .map_err(|e| map_platform_to_rpc(&e))?;
             (None, out)
