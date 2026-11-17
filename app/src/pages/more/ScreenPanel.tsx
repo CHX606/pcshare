@@ -1,7 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { backend } from '../../api'
 import { humanError } from '../../api/errors'
-import { SELF_ID, type CapturedShot, type DeviceId, type ShotTargets } from '../../api/types'
+import {
+  SELF_ID,
+  type CapturedShot,
+  type DesktopState,
+  type DeviceId,
+  type ShotTargets,
+} from '../../api/types'
 import { Icon } from '../../components/Icon'
 import { Button } from '../../components/Modal'
 import { Toolbar } from '../../components/Toolbar'
@@ -10,6 +16,40 @@ import { mapClientPointToRemoteScreen } from '../../lib/stage3'
 import { toast } from '../../store/toasts'
 
 type ClickMode = 'left' | 'right' | 'double'
+type ViewMode = 'fit' | 'actual'
+
+const DESKTOP_PLACE_TEXT: Record<DesktopState['place'], string> = {
+  normal: '正常桌面',
+  locked: '锁屏或权限确认界面',
+  service: '系统服务环境（看不到桌面）',
+  remote: '远程桌面会话',
+}
+
+/** 选中的来源还在就保留，否则退回第一块显示器或第一个窗口。 */
+function pickSourceChoice(t: ShotTargets, current: string | null): string {
+  if (current) {
+    const stillThere = current.startsWith('win:')
+      ? t.windows.some((w) => `win:${w.hwnd}` === current)
+      : t.monitors.some((m) => `mon:${m.index}` === current)
+    if (stillThere) return current
+  }
+  if (t.monitors.length > 0) return `mon:${t.monitors[0].index}`
+  if (t.windows.length > 0) return `win:${t.windows[0].hwnd}`
+  return 'mon:0'
+}
+
+/** 截本机时先等界面重画到屏幕上，否则截到的是切换前的旧画面。 */
+function waitForRepaint(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve, ms)))
+  })
+}
+
+function formatClock(ms: number): string {
+  const d = new Date(ms)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+}
 
 const QUICK_KEYS = [
   { label: 'Enter', combo: 'Enter' },
@@ -33,7 +73,11 @@ export function ScreenPanel({ device, canInput }: { device: DeviceId; canInput: 
   const [warning, setWarning] = useState<string | null>(null)
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
   const [textInput, setTextInput] = useState('')
+  const [viewMode, setViewMode] = useState<ViewMode>('fit')
+  const [autoRefreshSec, setAutoRefreshSec] = useState<number>(0)
   const imgRef = useRef<HTMLImageElement>(null)
+  /** 防止手动截图、点按刷新和自动刷新同时向对方要图。 */
+  const inflightRef = useRef(false)
 
   const parsedSource = useCallback((choice: string): { monitorIndex?: number; hwnd?: string } => {
     if (choice.startsWith('win:')) return { hwnd: choice.slice(4) }
@@ -42,12 +86,18 @@ export function ScreenPanel({ device, canInput }: { device: DeviceId; canInput: 
   }, [])
 
   const captureNow = useCallback(
-    async (choiceOverride?: string, widthOverride?: number) => {
+    async (choiceOverride?: string, widthOverride?: number, quiet = false) => {
+      if (inflightRef.current) return
+      inflightRef.current = true
       const src = parsedSource(choiceOverride ?? sourceChoice)
       const mw = widthOverride ?? maxWidth
-      setBusy(true)
-      setErrorMsg(null)
+      // 自动刷新时不改 busy，免得输入框每隔几秒被禁用一次、丢掉焦点。
+      if (!quiet) {
+        setBusy(true)
+        setErrorMsg(null)
+      }
       try {
+        if (device === SELF_ID) await waitForRepaint(quiet ? 0 : 200)
         const res = await backend.shotCapture({
           device,
           monitorIndex: src.monitorIndex,
@@ -56,10 +106,12 @@ export function ScreenPanel({ device, canInput }: { device: DeviceId; canInput: 
           quality: 80,
         })
         setShot(res)
+        if (quiet) setErrorMsg(null)
       } catch (err) {
         setErrorMsg(humanError(err))
       } finally {
-        setBusy(false)
+        inflightRef.current = false
+        if (!quiet) setBusy(false)
       }
     },
     [device, maxWidth, parsedSource, sourceChoice],
@@ -71,20 +123,16 @@ export function ScreenPanel({ device, canInput }: { device: DeviceId; canInput: 
     try {
       const t = await backend.shotMonitors(device)
       setTargets(t)
-      const defaultChoice =
-        t.monitors.length > 0
-          ? `mon:${t.monitors[0].index}`
-          : t.windows.length > 0
-            ? `win:${t.windows[0].hwnd}`
-            : 'mon:0'
-      setSourceChoice(defaultChoice)
-      await captureNow(defaultChoice)
+      const choice = pickSourceChoice(t, sourceChoice)
+      setSourceChoice(choice)
+      setBusy(false)
+      await captureNow(choice)
     } catch (err) {
       setErrorMsg(humanError(err))
     } finally {
       setBusy(false)
     }
-  }, [captureNow, device])
+  }, [captureNow, device, sourceChoice])
 
   useEffect(() => {
     let cancelled = false
@@ -93,14 +141,11 @@ export function ScreenPanel({ device, canInput }: { device: DeviceId; canInput: 
       .then(async (t) => {
         if (cancelled) return
         setTargets(t)
-        const defaultChoice =
-          t.monitors.length > 0
-            ? `mon:${t.monitors[0].index}`
-            : t.windows.length > 0
-              ? `win:${t.windows[0].hwnd}`
-              : 'mon:0'
+        const defaultChoice = pickSourceChoice(t, null)
         setSourceChoice(defaultChoice)
         const src = parsedSource(defaultChoice)
+        if (device === SELF_ID) await waitForRepaint(200)
+        if (cancelled) return
         const res = await backend.shotCapture({
           device,
           monitorIndex: src.monitorIndex,
@@ -120,6 +165,27 @@ export function ScreenPanel({ device, canInput }: { device: DeviceId; canInput: 
       cancelled = true
     }
   }, [device, parsedSource])
+
+  // 自动刷新：上一张到手后再等一个间隔；窗口不在前台时暂停。
+  const captureRef = useRef(captureNow)
+  useEffect(() => {
+    captureRef.current = captureNow
+  }, [captureNow])
+  useEffect(() => {
+    if (autoRefreshSec <= 0) return
+    let stopped = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const tick = async () => {
+      if (stopped) return
+      if (!document.hidden) await captureRef.current(undefined, undefined, true)
+      if (!stopped) timer = setTimeout(() => void tick(), autoRefreshSec * 1000)
+    }
+    timer = setTimeout(() => void tick(), autoRefreshSec * 1000)
+    return () => {
+      stopped = true
+      clearTimeout(timer)
+    }
+  }, [autoRefreshSec, device])
 
   const onImageClick = async (e: React.MouseEvent<HTMLImageElement>) => {
     if (!shot || device === SELF_ID || !canInput || busy) return
@@ -238,6 +304,27 @@ export function ScreenPanel({ device, canInput }: { device: DeviceId; canInput: 
             <Icon name="refresh" size={14} className={busy ? 'spin' : ''} />
             刷新截图
           </Button>
+
+          <select
+            aria-label="自动刷新"
+            value={autoRefreshSec}
+            onChange={(e) => setAutoRefreshSec(Number(e.target.value))}
+            className="h-8 rounded-md border border-line bg-panel px-2 text-xs outline-none focus:border-accent"
+          >
+            <option value={0}>不自动刷新</option>
+            <option value={2}>每 2 秒刷新</option>
+            <option value={5}>每 5 秒刷新</option>
+          </select>
+
+          <button
+            type="button"
+            aria-pressed={viewMode === 'actual'}
+            onClick={() => setViewMode((m) => (m === 'fit' ? 'actual' : 'fit'))}
+            title="原始大小时可以滚动查看，字更清楚"
+            className="h-8 rounded-md border border-line bg-panel px-2.5 text-xs hover:bg-hover aria-pressed:border-accent aria-pressed:text-accent"
+          >
+            {viewMode === 'fit' ? '按原始大小看' : '缩到窗口内'}
+          </button>
         </div>
 
         {device !== SELF_ID && (
@@ -321,7 +408,11 @@ export function ScreenPanel({ device, canInput }: { device: DeviceId; canInput: 
         </form>
       )}
 
-      <div className="scroll-thin flex min-h-0 flex-1 flex-col items-center justify-center overflow-auto rounded-lg border border-line bg-bg p-3">
+      <div
+        className={`scroll-thin flex min-h-0 flex-1 flex-col overflow-auto rounded-lg border border-line bg-bg p-3 ${
+          viewMode === 'fit' ? 'items-center justify-center' : 'items-start justify-start'
+        }`}
+      >
         {errorMsg ? (
           <div className="max-w-md text-center">
             <Icon name="alert" size={28} className="mx-auto mb-2 text-warn" />
@@ -334,11 +425,15 @@ export function ScreenPanel({ device, canInput }: { device: DeviceId; canInput: 
             </Button>
           </div>
         ) : shot ? (
-          <div className="flex max-h-full max-w-full flex-col items-center gap-2">
+          <div
+            className={`flex flex-col gap-2 ${
+              viewMode === 'fit' ? 'max-h-full max-w-full items-center' : 'items-start'
+            }`}
+          >
             <img
               ref={imgRef}
               src={shot.imageDataUrl}
-              alt="远端桌面或窗口实时截图"
+              alt="对方桌面或窗口的截图"
               width={shot.transform.imageWidth}
               height={shot.transform.imageHeight}
               onClick={(e) => void onImageClick(e)}
@@ -349,7 +444,12 @@ export function ScreenPanel({ device, canInput }: { device: DeviceId; canInput: 
                 setClickMode('right')
                 void onImageClick(e).finally(() => setClickMode(prev))
               }}
-              className={`max-h-[calc(100vh-300px)] max-w-full rounded border border-line shadow-sm ${
+              // h-auto w-auto 让浏览器按原比例缩放；只写最大宽高会被横竖分别压扁。
+              className={`rounded border border-line shadow-sm ${
+                viewMode === 'fit'
+                  ? 'h-auto max-h-[calc(100vh-300px)] w-auto max-w-full'
+                  : 'h-auto w-auto max-w-none'
+              } ${
                 interactiveRemote ? 'cursor-crosshair' : ''
               }`}
             />
@@ -359,9 +459,9 @@ export function ScreenPanel({ device, canInput }: { device: DeviceId; canInput: 
                 {shot.transform.imageWidth}×{shot.transform.imageHeight}（JPEG{' '}
                 {formatSize(shot.byteLen)}）
               </span>
-              <span>
-                桌面状态：{shot.desktop.elevated ? '管理员权限' : '普通权限'}
-              </span>
+              <span>截于 {formatClock(shot.capturedAtMs)}</span>
+              <span>桌面：{DESKTOP_PLACE_TEXT[shot.desktop.place] ?? shot.desktop.place}</span>
+              <span>被控程序：{shot.desktop.elevated ? '管理员权限' : '普通权限'}</span>
               {interactiveRemote && (
                 <span className="text-accent">直接点击上方画面即可在对方对应屏幕位置触发操作并自动刷新</span>
               )}

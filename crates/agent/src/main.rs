@@ -29,6 +29,9 @@ struct GlobalOpts {
 
 #[tokio::main]
 async fn main() {
+    // 必须在任何截图、点按之前调用，否则系统缩放下坐标会被虚拟化。
+    pcshare_platform::enable_per_monitor_dpi_awareness();
+
     tracing_subscriber::fmt()
         .with_writer(io::stderr)
         .with_target(false)

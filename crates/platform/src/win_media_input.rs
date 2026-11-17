@@ -43,7 +43,10 @@ use windows::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::System::Variant::{VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_R4};
-use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+use windows::Win32::UI::HiDpi::{
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor, MDT_EFFECTIVE_DPI,
+    SetProcessDpiAwarenessContext,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
     MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
@@ -58,7 +61,8 @@ use windows::Win32::UI::Shell::{
     SHCreateShellItemArrayFromIDLists, SHDoDragDrop,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GA_ROOT, GetAncestor, GetForegroundWindow, GetSystemMetrics, GetWindowRect,
+    CURSOR_SHOWING, CURSORINFO, DI_NORMAL, DrawIconEx, EnumWindows, GA_ROOT, GetCursorInfo,
+    GetIconInfo, HICON, ICONINFO, GetAncestor, GetForegroundWindow, GetSystemMetrics, GetWindowRect,
     GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
     IsWindowVisible, MONITORINFOF_PRIMARY, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
     SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SetForegroundWindow, WindowFromPoint,
@@ -365,6 +369,53 @@ pub fn capture_window_jpeg_impl(
     }
 }
 
+/// 把当前鼠标指针画到截图位图上；`origin_x/origin_y` 是截图区域左上角的屏幕坐标。
+/// 指针隐藏或读取失败时什么都不画，不影响截图本身。
+unsafe fn draw_cursor_onto(mem_dc: HDC, origin_x: i32, origin_y: i32) {
+    unsafe {
+        let mut ci = CURSORINFO {
+            cbSize: std::mem::size_of::<CURSORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetCursorInfo(&mut ci).is_err() || ci.flags != CURSOR_SHOWING || ci.hCursor.is_invalid()
+        {
+            return;
+        }
+        let icon = HICON(ci.hCursor.0);
+        let mut info = ICONINFO::default();
+        let (hot_x, hot_y) = if GetIconInfo(icon, &mut info).is_ok() {
+            if !info.hbmMask.is_invalid() {
+                let _ = DeleteObject(HGDIOBJ(info.hbmMask.0));
+            }
+            if !info.hbmColor.is_invalid() {
+                let _ = DeleteObject(HGDIOBJ(info.hbmColor.0));
+            }
+            (info.xHotspot as i32, info.yHotspot as i32)
+        } else {
+            (0, 0)
+        };
+        let _ = DrawIconEx(
+            mem_dc,
+            ci.ptScreenPos.x - origin_x - hot_x,
+            ci.ptScreenPos.y - origin_y - hot_y,
+            icon,
+            0,
+            0,
+            0,
+            None,
+            DI_NORMAL,
+        );
+    }
+}
+
+/// 声明本进程按显示器 DPI 工作。不声明时，系统缩放 125%/150% 的电脑上
+/// 截图坐标会被系统“虚拟化”，截不全、点按也会偏。已声明过（例如写在清单里）时调用失败，忽略即可。
+pub fn enable_per_monitor_dpi_awareness() {
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+}
+
 fn capture_dc_rect_bgra(
     x: i32,
     y: i32,
@@ -406,6 +457,8 @@ fn capture_dc_rect_bgra(
         .is_ok();
 
         let res = if blt_ok || composite_desktop_windows_fallback(screen_dc, mem_dc, x, y, w, h) {
+            // BitBlt 截不到鼠标指针，自己画上去，方便看清对方鼠标停在哪里。
+            draw_cursor_onto(mem_dc, x, y);
             extract_bgra_top_down(mem_dc, bmp, w, h)
         } else if !desktop.is_interactive() {
             Err(PlatformError::PermissionDenied(

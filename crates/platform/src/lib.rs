@@ -397,6 +397,14 @@ mod windows_impl;
 #[cfg(windows)]
 pub use windows_impl::WindowsPlatform as NativePlatform;
 
+/// 让进程按显示器 DPI 工作（命令行版启动时调用；图形界面版由窗口框架自动处理）。
+#[cfg(windows)]
+pub use win_media_input::enable_per_monitor_dpi_awareness;
+
+/// 非 Windows 系统上没有这回事，保留同名空函数方便调用方不写条件编译。
+#[cfg(not(windows))]
+pub fn enable_per_monitor_dpi_awareness() {}
+
 #[cfg(not(windows))]
 mod stub_impl;
 #[cfg(not(windows))]
