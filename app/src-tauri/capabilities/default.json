@@ -3,6 +3,7 @@
   "description": "电脑共享主窗口默认权限",
   "windows": ["main"],
   "permissions": [
-    "core:default"
+    "core:default",
+    "core:window:allow-set-fullscreen"
   ]
 }

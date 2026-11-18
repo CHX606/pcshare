@@ -12,8 +12,10 @@ import { Icon } from '../../components/Icon'
 import { Button } from '../../components/Modal'
 import { Toolbar } from '../../components/Toolbar'
 import { formatSize } from '../../lib/format'
+import { QUICK_KEYS, canDecodeVideo, pickSourceChoice } from '../../lib/desktop'
 import { mapClientPointToRemoteScreen } from '../../lib/stage3'
 import { toast } from '../../store/toasts'
+import { DesktopView } from './DesktopView'
 
 type ClickMode = 'left' | 'right' | 'double'
 type ViewMode = 'fit' | 'actual'
@@ -23,19 +25,6 @@ const DESKTOP_PLACE_TEXT: Record<DesktopState['place'], string> = {
   locked: '锁屏或权限确认界面',
   service: '系统服务环境（看不到桌面）',
   remote: '远程桌面会话',
-}
-
-/** 选中的来源还在就保留，否则退回第一块显示器或第一个窗口。 */
-function pickSourceChoice(t: ShotTargets, current: string | null): string {
-  if (current) {
-    const stillThere = current.startsWith('win:')
-      ? t.windows.some((w) => `win:${w.hwnd}` === current)
-      : t.monitors.some((m) => `mon:${m.index}` === current)
-    if (stillThere) return current
-  }
-  if (t.monitors.length > 0) return `mon:${t.monitors[0].index}`
-  if (t.windows.length > 0) return `win:${t.windows[0].hwnd}`
-  return 'mon:0'
 }
 
 /** 截本机时先等界面重画到屏幕上，否则截到的是切换前的旧画面。 */
@@ -51,19 +40,77 @@ function formatClock(ms: number): string {
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
 }
 
-const QUICK_KEYS = [
-  { label: 'Enter', combo: 'Enter' },
-  { label: 'Esc', combo: 'Esc' },
-  { label: 'Tab', combo: 'Tab' },
-  { label: 'Backspace', combo: 'Backspace' },
-  { label: 'Ctrl+C', combo: 'Ctrl+C' },
-  { label: 'Ctrl+V', combo: 'Ctrl+V' },
-  { label: 'Alt+F4', combo: 'Alt+F4' },
-  { label: 'Win+D', combo: 'Win+D' },
-]
+type PanelMode = 'live' | 'shot'
+
+/**
+ * 看屏入口：远程设备默认用实时桌面会话（后端对旧版对端自动走逐步截图）；
+ * 界面解不了视频或用户手动切换时用截图模式；查看本机始终用截图。
+ */
+export function ScreenPanel({ device, canInput }: { device: DeviceId; canInput: boolean }) {
+  const remote = device !== SELF_ID
+  const [mode, setMode] = useState<PanelMode>(() => (canDecodeVideo() ? 'live' : 'shot'))
+  const [fallbackNote, setFallbackNote] = useState<string | null>(null)
+
+  if (!remote) return <ShotView device={device} canInput={false} />
+
+  const switchTo = (next: PanelMode) => {
+    setFallbackNote(null)
+    setMode(next)
+  }
+
+  return (
+    <div className="flex min-h-0 flex-1 flex-col gap-3">
+      <div className="flex flex-wrap items-center gap-2 text-xs">
+        <div role="radiogroup" aria-label="看屏方式" className="flex items-center gap-1">
+          {(
+            [
+              ['live', '实时画面'],
+              ['shot', '截图模式'],
+            ] as const
+          ).map(([id, label]) => (
+            <button
+              key={id}
+              type="button"
+              role="radio"
+              aria-checked={mode === id}
+              disabled={id === 'live' && !canDecodeVideo()}
+              onClick={() => switchTo(id)}
+              className="h-7 rounded-md border border-line bg-panel px-2.5 hover:bg-hover disabled:opacity-40 aria-checked:border-accent aria-checked:text-accent"
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        <span className="text-muted">
+          {mode === 'live'
+            ? '流畅的视频画面，可直接用鼠标键盘操作；网络差时自动降为逐张截图'
+            : '按需截一张图，省流量；点击画面即可点按'}
+        </span>
+      </div>
+      {fallbackNote && (
+        <div role="status" className="rounded-lg border border-line bg-bg/40 px-3 py-2 text-xs text-muted">
+          {fallbackNote}
+        </div>
+      )}
+      {mode === 'live' ? (
+        <DesktopView
+          key={device}
+          device={device}
+          canInput={canInput}
+          onFallback={(reason) => {
+            setFallbackNote(reason)
+            setMode('shot')
+          }}
+        />
+      ) : (
+        <ShotView key={device} device={device} canInput={canInput} />
+      )}
+    </div>
+  )
+}
 
 /** 任务 3.2 & 3.3：看一眼（显示器/窗口截图，JPEG 缩放省流量）+ 在截图上点按与键盘输入（含管理员窗口 UIPI 拦截提示）。 */
-export function ScreenPanel({ device, canInput }: { device: DeviceId; canInput: boolean }) {
+function ShotView({ device, canInput }: { device: DeviceId; canInput: boolean }) {
   const [targets, setTargets] = useState<ShotTargets | null>(null)
   const [sourceChoice, setSourceChoice] = useState<string>('mon:0')
   const [maxWidth, setMaxWidth] = useState<number>(1280)

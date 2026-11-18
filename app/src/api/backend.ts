@@ -5,6 +5,9 @@ import type {
   ClipboardPreview,
   ConflictPolicy,
   Device,
+  DesktopFrame,
+  DesktopInputEvent,
+  DesktopOpened,
   DeviceId,
   DiagLogs,
   DiagSummary,
@@ -177,6 +180,15 @@ export interface Backend {
     refreshHwnd?: string
     maxWidth?: number
   }): Promise<InputOutcome>
+
+  // 实时桌面会话：远程设备用；查看本机仍用 shotCapture
+  desktopOpen(opts: { device: DeviceId; monitorIndex?: number; hwnd?: string }): Promise<DesktopOpened>
+  /** 取下一帧；逐步模式下会一直等到有输入、手动刷新或链路恢复。会话关闭时以 not_found 失败。 */
+  desktopNext(sessionId: number): Promise<DesktopFrame>
+  /** 每批 1～64 个事件，等上一批确认再发下一批。 */
+  desktopInput(sessionId: number, events: DesktopInputEvent[]): Promise<void>
+  desktopRefresh(sessionId: number): Promise<void>
+  desktopClose(sessionId: number): Promise<void>
 
   powerExec(device: DeviceId, action: PowerActionKind, countdownSecs?: number): Promise<PowerResult>
   powerCancel(device: DeviceId): Promise<boolean>

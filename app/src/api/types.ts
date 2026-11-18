@@ -436,3 +436,45 @@ export interface SystemNotice {
   body: string
   kind: 'info' | 'success' | 'warn' | 'error'
 }
+
+// ───────────── 实时桌面会话（H.264 视频 + 原始键鼠，旧版对端自动走逐步截图） ─────────────
+
+export interface DesktopOpened {
+  sessionId: number
+  /** 对端支持原始鼠标键盘（移动、按下、松开、滚轮、按键）；否则只能单击、双击、文字和组合键。 */
+  rawInput: boolean
+}
+
+/** desktop_next 返回的二进制帧头。 */
+export interface DesktopFrameMeta {
+  mode: 'live' | 'step'
+  format: 'h264-annexb' | 'jpeg'
+  timestampUs: number
+  key: boolean
+  epoch: number
+  /** 含 SPS 的 H.264 关键帧才有，例如 avc1.42C028 */
+  codec?: string | null
+  encoder: string
+  /** 进入逐步模式的原因；正常首屏可为空 */
+  reason?: string | null
+  transform: ShotTransform
+}
+
+export interface DesktopFrame {
+  meta: DesktopFrameMeta
+  /** JPEG 图片或一个完整的 H.264 Annex B 访问单元 */
+  data: Uint8Array<ArrayBuffer>
+}
+
+export type DesktopMouseButton = 'left' | 'right' | 'middle'
+
+/** 所有 x、y 都是远端虚拟桌面物理像素。 */
+export type DesktopInputEvent =
+  | { kind: 'move'; x: number; y: number }
+  | { kind: 'button'; x: number; y: number; button: DesktopMouseButton; down: boolean }
+  | { kind: 'wheel'; x: number; y: number; deltaX: number; deltaY: number }
+  | { kind: 'key'; vk: number; down: boolean }
+  | { kind: 'click'; x: number; y: number; button: DesktopMouseButton; double?: boolean }
+  | { kind: 'text'; text: string }
+  | { kind: 'shortcut'; combo: string }
+  | { kind: 'release' }

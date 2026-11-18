@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import type { Backend, BackendEvents, Unlisten } from './backend'
 import { toApiError } from './errors'
+import { parseDesktopPacket } from '../lib/desktop'
 import type { Reply } from './types'
 
 /**
@@ -137,6 +138,26 @@ export function createTauriBackend(): Backend {
         refreshHwnd: opts.refreshHwnd ?? null,
         maxWidth: opts.maxWidth ?? null,
       }),
+
+    desktopOpen: (opts) =>
+      call('desktop_open', {
+        device: opts.device,
+        monitorIndex: opts.monitorIndex ?? null,
+        hwnd: opts.hwnd ?? null,
+      }),
+    desktopNext: async (sessionId) => {
+      // 成功时直接返回二进制，失败时以 { code, msg } 拒绝，不走 Reply 包装
+      let buf: ArrayBuffer
+      try {
+        buf = await invoke<ArrayBuffer>('desktop_next', { sessionId })
+      } catch (e) {
+        throw toApiError(e)
+      }
+      return parseDesktopPacket(buf)
+    },
+    desktopInput: (sessionId, events) => call('desktop_input', { sessionId, events }),
+    desktopRefresh: (sessionId) => call('desktop_refresh', { sessionId }),
+    desktopClose: (sessionId) => call('desktop_close', { sessionId }),
 
     powerExec: (device, action, countdownSecs) =>
       call('power_exec', { device, action, countdownSecs: countdownSecs ?? null }),

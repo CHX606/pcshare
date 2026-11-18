@@ -6,6 +6,7 @@ import {
   DEFAULT_PERMISSIONS,
   SELF_ID,
   type ConflictPolicy,
+  type DesktopInputEvent,
   type Device,
   type DeviceId,
   type FsCacheHit,
@@ -23,6 +24,51 @@ import { MockFs } from './fs'
 
 type Listener = (payload: never) => void
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+interface MockDesktopSession {
+  wake: (() => void) | null
+  closed: boolean
+  dirty: boolean
+  frames: number
+  lastInput: string
+}
+
+/** 模拟后端的桌面画面：画一张 1280×720 的 JPEG，写上帧号和最近一次输入。 */
+async function mockDesktopJpeg(frame: number, lastInput: string): Promise<Uint8Array<ArrayBuffer>> {
+  const c = document.createElement('canvas')
+  c.width = 1280
+  c.height = 720
+  const g = c.getContext('2d')
+  if (g) {
+    g.fillStyle = '#1e293b'
+    g.fillRect(0, 0, c.width, c.height)
+    g.fillStyle = '#e2e8f0'
+    g.textAlign = 'center'
+    g.font = '28px sans-serif'
+    g.fillText(`模拟远程桌面 · 逐步模式 · 第 ${frame} 帧`, 640, 340)
+    g.font = '18px sans-serif'
+    g.fillText(lastInput || '点击画面或发送文字后会回传新画面', 640, 380)
+  }
+  const blob = await new Promise<Blob | null>((r) => c.toBlob(r, 'image/jpeg', 0.8))
+  return new Uint8Array(blob ? await blob.arrayBuffer() : new ArrayBuffer(0))
+}
+
+function describeInput(ev: DesktopInputEvent): string {
+  switch (ev.kind) {
+    case 'text':
+      return `最近输入：文字「${ev.text}」`
+    case 'shortcut':
+      return `最近输入：组合键 ${ev.combo}`
+    case 'key':
+      return `最近输入：按键 0x${ev.vk.toString(16)} ${ev.down ? '按下' : '松开'}`
+    case 'release':
+      return '最近输入：释放全部按键'
+    case 'move':
+      return `最近输入：移动到 (${ev.x}, ${ev.y})`
+    default:
+      return `最近输入：${ev.kind} (${ev.x}, ${ev.y})`
+  }
+}
 const SPEED: Record<LinkKind, number> = { local: 420e6, direct: 92e6, relay: 2.8e6 }
 
 interface RunningTask {
@@ -42,6 +88,8 @@ export function createMockBackend(): Backend & { debug: MockDebug } {
   const procs = new Map<DeviceId, ProcInfo[]>()
   const tasks = new Map<string, RunningTask>()
   const cache = new Map<string, FsCacheHit>()
+  const desktopSessions = new Map<number, MockDesktopSession>()
+  let desktopSeq = 0
   let settings: Settings = {
     deviceName: '客厅主机',
     autostart: false,
@@ -585,6 +633,70 @@ export function createMockBackend(): Backend & { debug: MockDebug } {
     },
     async inputKey() {
       return { uipiBlocked: false }
+    },
+    async desktopOpen(opts) {
+      if (opts.device === SELF_ID) throw new ApiError('invalid', '查看本机请用截图')
+      await reach(opts.device, 20)
+      const sessionId = ++desktopSeq
+      desktopSessions.set(sessionId, { wake: null, closed: false, dirty: true, frames: 0, lastInput: '' })
+      return { sessionId, rawInput: true }
+    },
+    async desktopNext(sessionId) {
+      const s = desktopSessions.get(sessionId)
+      if (!s) throw new ApiError('not_found', '桌面会话已关闭')
+      if (!s.dirty) await new Promise<void>((r) => (s.wake = r))
+      if (s.closed) throw new ApiError('not_found', '桌面会话已关闭')
+      s.dirty = false
+      s.frames += 1
+      const data = await mockDesktopJpeg(s.frames, s.lastInput)
+      return {
+        meta: {
+          mode: 'step',
+          format: 'jpeg',
+          timestampUs: Date.now() * 1000,
+          key: true,
+          epoch: 0,
+          encoder: 'mock',
+          reason: s.frames > 1 ? '模拟后端只提供逐步截图' : null,
+          transform: {
+            originX: 0,
+            originY: 0,
+            sourceWidth: 1920,
+            sourceHeight: 1080,
+            imageWidth: 1280,
+            imageHeight: 720,
+            dpiScalePercent: 100,
+            monitorIndex: 0,
+          },
+        },
+        data,
+      }
+    },
+    async desktopInput(sessionId, events) {
+      const s = desktopSessions.get(sessionId)
+      if (!s) throw new ApiError('not_found', '桌面会话已关闭')
+      await sleep(15)
+      const done = events.filter(
+        (e) => !(e.kind === 'move' || ((e.kind === 'key' || e.kind === 'button') && e.down)),
+      )
+      if (done.length > 0) {
+        s.lastInput = describeInput(done[done.length - 1])
+        s.dirty = true
+        s.wake?.()
+      }
+    },
+    async desktopRefresh(sessionId) {
+      const s = desktopSessions.get(sessionId)
+      if (!s) throw new ApiError('not_found', '桌面会话已关闭')
+      s.dirty = true
+      s.wake?.()
+    },
+    async desktopClose(sessionId) {
+      const s = desktopSessions.get(sessionId)
+      if (!s) throw new ApiError('not_found', '桌面会话已关闭')
+      s.closed = true
+      s.wake?.()
+      desktopSessions.delete(sessionId)
     },
     async powerExec(_device, action) {
       return { action, cancelled: false, executed: true, message: `已触发 ${action}` }
