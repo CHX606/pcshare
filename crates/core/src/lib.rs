@@ -7,6 +7,7 @@
 
 pub mod app_proc;
 pub mod clipboard;
+pub mod desktop;
 pub mod diagnostics;
 pub mod dir_cache;
 pub mod edit_sync;

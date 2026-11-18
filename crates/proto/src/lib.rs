@@ -2,6 +2,7 @@
 //!
 //! 职责边界：只定义消息结构、帧编码解码、错误码、版本号与权限模型；不联网，不访问文件系统。
 
+pub mod desktop;
 pub mod error;
 pub mod frame;
 pub mod messages;

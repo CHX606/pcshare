@@ -3556,9 +3556,12 @@ dependencies = [
 name = "pcshare-platform"
 version = "0.3.0"
 dependencies = [
+ "fastrand",
+ "flate2",
  "png",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.21",
  "tokio",
  "windows",

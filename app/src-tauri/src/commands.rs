@@ -1,0 +1,88 @@
+use super::*;
+pub(super) mod desktop;
+
+pub(super) mod applications;
+pub(super) mod devices;
+pub(super) mod files;
+pub(super) mod operations;
+pub(super) mod screen;
+
+macro_rules! handlers {
+    () => {
+        tauri::generate_handler![
+            commands::desktop::desktop_open,
+            commands::desktop::desktop_next,
+            commands::desktop::desktop_input,
+            commands::desktop::desktop_refresh,
+            commands::desktop::desktop_close,
+            commands::devices::self_info,
+            commands::devices::settings_get,
+            commands::devices::settings_set,
+            commands::devices::host_status,
+            commands::devices::host_set_paused,
+            commands::devices::device_list,
+            commands::devices::lan_list,
+            commands::devices::device_rename,
+            commands::devices::device_remove,
+            commands::devices::device_set_permissions,
+            commands::devices::device_reconnect,
+            commands::devices::pair_begin,
+            commands::devices::pair_cancel,
+            commands::devices::pair_connect,
+            commands::devices::pair_respond,
+            commands::files::fs_roots,
+            commands::files::fs_cache_get,
+            commands::files::fs_list,
+            commands::files::fs_watch,
+            commands::files::fs_unwatch,
+            commands::files::fs_check_conflicts,
+            commands::files::fs_mkdir,
+            commands::files::fs_rename,
+            commands::files::fs_copy,
+            commands::files::fs_move,
+            commands::files::fs_delete,
+            commands::files::transfer_start,
+            commands::files::task_pause,
+            commands::files::task_resume,
+            commands::files::task_cancel,
+            commands::files::transfer_get_speed_limit,
+            commands::files::transfer_set_speed_limit,
+            commands::files::pick_local_files,
+            commands::files::pick_local_dir,
+            commands::applications::app_list,
+            commands::applications::app_icon,
+            commands::applications::app_launch,
+            commands::applications::proc_list,
+            commands::applications::proc_kill,
+            commands::applications::diag_summary,
+            commands::applications::diag_netcheck,
+            commands::applications::diag_logs,
+            commands::applications::diag_export,
+            commands::applications::launcher_consume_pending,
+            commands::applications::quick_search,
+            commands::applications::quick_launch,
+            commands::applications::fs_search_start,
+            commands::applications::fs_search_cancel,
+            commands::screen::shot_monitors,
+            commands::screen::shot_capture,
+            commands::screen::input_click,
+            commands::screen::input_key,
+            commands::operations::fs_open_remote,
+            commands::operations::fs_open_local_edit,
+            commands::operations::fs_edit_sync_back,
+            commands::operations::power_exec,
+            commands::operations::power_cancel,
+            commands::operations::power_wake,
+            commands::operations::term_open,
+            commands::operations::term_write,
+            commands::operations::term_resize,
+            commands::operations::term_close,
+            commands::operations::clip_push,
+            commands::operations::clip_pull,
+            commands::operations::clip_peek,
+            commands::operations::batch_exec,
+            commands::operations::fs_drag_out,
+        ]
+    };
+}
+pub(super) use handlers;

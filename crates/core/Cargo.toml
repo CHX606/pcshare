@@ -28,4 +28,5 @@ tracing.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+iroh = { workspace = true, features = ["unstable-custom-transports"] }
 png.workspace = true

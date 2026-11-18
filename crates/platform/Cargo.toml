@@ -12,6 +12,9 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["process", "rt", "sync", "time"] }
 
 [target.'cfg(windows)'.dependencies]
+fastrand.workspace = true
+flate2 = "1"
+sha2 = "0.10"
 png.workspace = true
 windows = { workspace = true, features = [
     "Data_Xml_Dom",

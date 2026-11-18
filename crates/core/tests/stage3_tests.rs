@@ -6,6 +6,8 @@ use pcshare_core::*;
 use pcshare_platform::NativePlatform;
 use pcshare_proto::*;
 use tokio_util::sync::CancellationToken;
+#[path = "desktop/session.rs"]
+mod desktop_session;
 
 fn temp_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
