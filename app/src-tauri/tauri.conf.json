@@ -1,6 +1,6 @@
 {
   "productName": "电脑共享",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "identifier": "app.pcshare.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",

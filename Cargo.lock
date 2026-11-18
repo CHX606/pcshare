@@ -3490,7 +3490,7 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "pcshare-agent"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "fastrand",
@@ -3506,7 +3506,7 @@ dependencies = [
 
 [[package]]
 name = "pcshare-app"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -3527,7 +3527,7 @@ dependencies = [
 
 [[package]]
 name = "pcshare-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -3554,7 +3554,7 @@ dependencies = [
 
 [[package]]
 name = "pcshare-platform"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "fastrand",
  "flate2",
@@ -3581,7 +3581,7 @@ dependencies = [
 
 [[package]]
 name = "pcshare-proto"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
