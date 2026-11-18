@@ -158,7 +158,7 @@ async fn bridge_commands_and_events_cover_full_stage1_contract() {
     let info = unwrap_ok(client.self_info());
     assert_eq!(info.id.len(), 64);
     assert_eq!(info.name, "界面节点-client");
-    assert_eq!(info.version, "0.3.0");
+    assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
 
     let cur_settings = unwrap_ok(client.settings_get());
     assert_eq!(cur_settings.device_name, "界面节点-client");
@@ -572,7 +572,7 @@ async fn bridge_stage2_cache_watch_batches_folder_transfer_pause_direct_p2p_icon
 
     let _ = unwrap_ok(ctrl.lan_list());
     let summary = unwrap_ok(ctrl.diag_summary());
-    assert_eq!(summary.app_version, "0.3.0");
+    assert_eq!(summary.app_version, env!("CARGO_PKG_VERSION"));
     assert!(summary.working_set_bytes > 0);
     let logs = unwrap_ok(ctrl.diag_logs(50));
     assert!(!logs.runtime_logs.is_empty());
