@@ -95,7 +95,6 @@ async fn old_peer_waits_for_refresh_and_close_cancels_pending_frame() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 #[ignore = "需要解锁的 Windows 桌面，实采显示器并在内存中解码"]
 async fn native_video_over_paired_quic_and_live_permission_revocation() {
-    use tokio::io::AsyncWriteExt;
     let pair = Pair::new(true, false).await;
     let session = DesktopSession::open(&pair.client, &pair.id, Source::Monitor(0))
         .await
@@ -116,7 +115,8 @@ async fn native_video_over_paired_quic_and_live_permission_revocation() {
     assert_eq!(first.info.mode, "live", "{:?}", first.info.reason);
     assert!(first.info.key);
     let startup = started.elapsed();
-    let mut bytes = first.bytes;
+    let mut epoch = first.info.epoch;
+    let mut segments = vec![(first.bytes, 1usize)];
     let mut gaps = Vec::new();
     let start = Instant::now();
     let mut prev = start;
@@ -126,10 +126,19 @@ async fn native_video_over_paired_quic_and_live_permission_revocation() {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(frame.info.epoch, first.info.epoch);
-        assert!(frame.info.timestamp_us > last);
+        assert_eq!(frame.info.format, "h264-annexb");
+        if frame.info.epoch == epoch {
+            assert!(frame.info.timestamp_us > last);
+        } else {
+            assert!(frame.info.epoch > epoch);
+            assert!(frame.info.key, "a new decoder needs a keyframe");
+            epoch = frame.info.epoch;
+            segments.push((Vec::new(), 0));
+        }
         last = frame.info.timestamp_us;
+        let (bytes, frames) = segments.last_mut().unwrap();
         bytes.extend_from_slice(&frame.bytes);
+        *frames += 1;
         let now = Instant::now();
         gaps.push((now - prev).as_micros());
         prev = now;
@@ -144,7 +153,7 @@ async fn native_video_over_paired_quic_and_live_permission_revocation() {
         89.0 / start.elapsed().as_secs_f64(),
         gaps[44] as f64 / 1000.0,
         gaps[84] as f64 / 1000.0,
-        bytes.len()
+        segments.iter().map(|(bytes, _)| bytes.len()).sum::<usize>()
     );
     let binary = std::fs::read_dir(pair.dirs[1].join("media"))
         .unwrap()
@@ -153,46 +162,9 @@ async fn native_video_over_paired_quic_and_live_permission_revocation() {
         .unwrap()
         .path()
         .join("ffmpeg.exe");
-    let mut decoder = tokio::process::Command::new(binary)
-        .args([
-            "-nostdin",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-xerror",
-            "-f",
-            "h264",
-            "-i",
-            "pipe:0",
-            "-progress",
-            "pipe:1",
-            "-f",
-            "null",
-            "-",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    decoder
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(&bytes)
-        .await
-        .unwrap();
-    let decoded = decoder.wait_with_output().await.unwrap();
-    assert!(
-        decoded.status.success(),
-        "{}",
-        String::from_utf8_lossy(&decoded.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&decoded.stdout)
-            .lines()
-            .any(|s| s.trim() == "frame=90")
-    );
+    for (bytes, count) in segments {
+        assert_decoded_frames(&binary, &bytes, count).await;
+    }
     let viewer = pair.client.endpoint_id().to_string();
     pair.host
         .update_peer_permissions(
@@ -219,6 +191,42 @@ async fn native_video_over_paired_quic_and_live_permission_revocation() {
         }
     }
     panic!("video stayed active after revocation");
+}
+
+#[cfg(windows)]
+async fn assert_decoded_frames(binary: &std::path::Path, bytes: &[u8], expected: usize) {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+
+    let mut decoder = tokio::process::Command::new(binary)
+        .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-xerror"])
+        .args(["-f", "h264", "-i", "pipe:0", "-fps_mode", "passthrough"])
+        .args(["-progress", "pipe:1", "-f", "null", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    decoder
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(bytes)
+        .await
+        .unwrap();
+    let decoded = decoder.wait_with_output().await.unwrap();
+    assert!(
+        decoded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decoded.stderr)
+    );
+    let progress = String::from_utf8_lossy(&decoded.stdout);
+    let frames = progress
+        .lines()
+        .rev()
+        .find_map(|s| s.strip_prefix("frame="))
+        .and_then(|value| value.trim().parse::<usize>().ok());
+    assert_eq!(frames, Some(expected));
 }
 
 #[cfg(windows)]
