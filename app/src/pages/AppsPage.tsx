@@ -1,39 +1,102 @@
+import { useVirtualizer } from '@tanstack/react-virtual'
 import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import { backend } from '../api'
 import type { AppInfo, DeviceId } from '../api/types'
 import { Icon } from '../components/Icon'
 import { Button } from '../components/Modal'
+import { isImeComposing } from '../lib/keyboard'
 import { fuzzyScore } from '../lib/sort'
 import { isOnline, useDevice } from '../store/devices'
 import { useRemote } from '../store/remote'
 
 const EMPTY: string[] = []
-const iconMemCache = new Map<string, string | null>()
+const ROW_HEIGHT = 48
+const MAX_ICON_CACHE = 512
+const MAX_ICON_CONCURRENCY = 6
+
+/** 只长期缓存有效图标 URL（限制上限防常驻内存膨胀）；瞬态失败不缓存以便后续可重试。 */
+const iconUrlCache = new Map<string, string>()
+
+interface IconTask {
+  key: string
+  device: DeviceId
+  appId: string
+  resolve: (url: string | null) => void
+  cancelled: boolean
+}
+
+const iconQueue: IconTask[] = []
+const iconInflight = new Map<string, Promise<string | null>>()
+let activeIconLoads = 0
+
+function rememberIcon(key: string, url: string) {
+  if (iconUrlCache.size >= MAX_ICON_CACHE) {
+    const oldest = iconUrlCache.keys().next().value
+    if (oldest !== undefined) iconUrlCache.delete(oldest)
+  }
+  iconUrlCache.set(key, url)
+}
+
+function pumpIconQueue() {
+  while (activeIconLoads < MAX_ICON_CONCURRENCY && iconQueue.length > 0) {
+    const task = iconQueue.shift()!
+    if (task.cancelled) continue
+    const cached = iconUrlCache.get(task.key)
+    if (cached) {
+      task.resolve(cached)
+      continue
+    }
+    const existing = iconInflight.get(task.key)
+    if (existing) {
+      void existing.then((u) => task.resolve(u))
+      continue
+    }
+    activeIconLoads++
+    const p = backend
+      .appIcon(task.device, task.appId)
+      .then((url) => {
+        if (url) rememberIcon(task.key, url)
+        return url
+      })
+      .catch(() => null)
+      .finally(() => {
+        iconInflight.delete(task.key)
+        activeIconLoads--
+        pumpIconQueue()
+      })
+    iconInflight.set(task.key, p)
+    void p.then((u) => task.resolve(u))
+  }
+}
+
+function enqueueIconLoad(
+  device: DeviceId,
+  appId: string,
+  onReady: (url: string | null) => void,
+): () => void {
+  const key = `${device}|${appId}`
+  const task: IconTask = { key, device, appId, resolve: onReady, cancelled: false }
+  iconQueue.push(task)
+  pumpIconQueue()
+  return () => {
+    task.cancelled = true
+  }
+}
 
 function AppAvatar({ device, app }: { device: DeviceId; app: AppInfo }) {
   const cacheKey = `${device}|${app.id}`
   const [fetched, setFetched] = useState<{ key: string; url: string | null } | null>(null)
-  const iconUrl = iconMemCache.has(cacheKey)
-    ? iconMemCache.get(cacheKey)
-    : fetched?.key === cacheKey
-      ? fetched.url
-      : undefined
+  const iconUrl = iconUrlCache.get(cacheKey) ?? (fetched?.key === cacheKey ? fetched.url : undefined)
 
   useEffect(() => {
-    if (iconMemCache.has(cacheKey)) return
+    if (iconUrlCache.has(cacheKey)) return
     let alive = true
-    backend
-      .appIcon(device, app.id)
-      .then((url) => {
-        iconMemCache.set(cacheKey, url)
-        if (alive) setFetched({ key: cacheKey, url })
-      })
-      .catch(() => {
-        iconMemCache.set(cacheKey, null)
-        if (alive) setFetched({ key: cacheKey, url: null })
-      })
+    const cancel = enqueueIconLoad(device, app.id, (url) => {
+      if (alive) setFetched({ key: cacheKey, url })
+    })
     return () => {
       alive = false
+      cancel()
     }
   }, [cacheKey, device, app.id])
 
@@ -64,6 +127,7 @@ export function AppsPage({ device }: { device: DeviceId }) {
   const [query, setQuery] = useState('')
   const [active, setActive] = useState(0)
   const input = useRef<HTMLInputElement>(null)
+  const listRef = useRef<HTMLUListElement>(null)
   const listId = useId()
 
   useEffect(() => {
@@ -74,21 +138,30 @@ export function AppsPage({ device }: { device: DeviceId }) {
     input.current?.focus()
   }, [device])
 
+  const favSet = useMemo(() => new Set(favorites), [favorites])
+
   const results = useMemo(() => {
-    const fav = new Set(favorites)
     return (state?.data ?? [])
-      .map((a) => ({ a, score: fuzzyScore(a.name, query), fav: fav.has(a.id) }))
+      .map((a) => ({ a, score: fuzzyScore(a.name, query), fav: favSet.has(a.id) }))
       .filter((x) => x.score >= 0)
       .sort((x, y) => Number(y.fav) - Number(x.fav) || x.score - y.score || x.a.name.localeCompare(y.a.name, 'zh-CN'))
       .map((x) => x.a)
-  }, [state?.data, query, favorites])
+  }, [state?.data, query, favSet])
 
   const activeIdx = Math.min(active, Math.max(0, results.length - 1))
   const open = (a: AppInfo | undefined) => a && online && void launch(device, a)
 
+  // oxlint-disable-next-line react/incompatible-library
+  const virt = useVirtualizer({
+    count: results.length,
+    getScrollElement: () => listRef.current,
+    estimateSize: () => ROW_HEIGHT,
+    overscan: 8,
+  })
+
   useEffect(() => {
-    document.getElementById(`${listId}-${activeIdx}`)?.scrollIntoView({ block: 'nearest' })
-  }, [activeIdx, listId])
+    if (results.length > 0) virt.scrollToIndex(activeIdx, { align: 'auto' })
+  }, [activeIdx, results.length, virt])
 
   return (
     <section aria-label="软件" className="flex min-h-0 flex-1 flex-col">
@@ -110,6 +183,7 @@ export function AppsPage({ device }: { device: DeviceId }) {
               setActive(0)
             }}
             onKeyDown={(e) => {
+              if (isImeComposing(e)) return
               if (e.key === 'ArrowDown') {
                 e.preventDefault()
                 setActive(Math.min(results.length - 1, activeIdx + 1))
@@ -148,41 +222,64 @@ export function AppsPage({ device }: { device: DeviceId }) {
           )}
         </p>
       ) : (
-        <ul id={listId} role="listbox" aria-label="软件列表" className={`scroll-thin flex-1 overflow-y-auto p-2 ${online ? '' : 'opacity-60'}`}>
-          {results.length === 0 && <li className="p-8 text-center text-sm text-muted">没有找到“{query}”</li>}
-          {results.map((a, i) => {
-            const fav = favorites.includes(a.id)
-            return (
-              <li
-                key={a.id}
-                id={`${listId}-${i}`}
-                role="option"
-                aria-selected={i === activeIdx}
-                onMouseMove={() => i !== activeIdx && setActive(i)}
-                onDoubleClick={() => open(a)}
-                className={`group flex items-center gap-3 rounded-lg px-3 py-2 ${i === activeIdx ? 'bg-accent-soft' : ''}`}
-              >
-                <AppAvatar device={device} app={a} />
-                <span className="min-w-0 flex-1 truncate">{a.name}</span>
-                {i === 0 && query && <kbd className="rounded border border-line px-1.5 text-xs text-muted">Enter</kbd>}
-                <button
-                  type="button"
-                  tabIndex={-1}
-                  aria-label={fav ? `取消收藏 ${a.name}` : `收藏 ${a.name}`}
-                  title={fav ? '取消收藏（Ctrl+D）' : '收藏，排到最前（Ctrl+D）'}
-                  aria-pressed={fav}
-                  onClick={() => toggleFavorite(device, a.id)}
-                  className={`rounded p-1 hover:bg-hover ${fav ? 'text-warn' : 'text-faint opacity-0 group-hover:opacity-100'}`}
-                >
-                  <Icon name="star" fill={fav ? 'currentColor' : 'none'} />
-                </button>
-                <Button tabIndex={-1} variant={i === activeIdx ? 'primary' : 'default'} disabled={!online || launching === a.id} onClick={() => open(a)}>
-                  {launching === a.id ? <Icon name="loader" className="spin" /> : <Icon name="play" size={13} />}
-                  打开
-                </Button>
-              </li>
-            )
-          })}
+        <ul
+          ref={listRef}
+          id={listId}
+          role="listbox"
+          aria-label="软件列表"
+          className={`scroll-thin flex-1 overflow-y-auto p-2 ${online ? '' : 'opacity-60'}`}
+        >
+          {results.length === 0 ? (
+            <li className="p-8 text-center text-sm text-muted">没有找到“{query}”</li>
+          ) : (
+            <div style={{ height: virt.getTotalSize(), position: 'relative' }}>
+              {virt.getVirtualItems().map((row) => {
+                const a = results[row.index]
+                const fav = favSet.has(a.id)
+                const isActive = row.index === activeIdx
+                return (
+                  <li
+                    key={a.id}
+                    id={`${listId}-${row.index}`}
+                    role="option"
+                    aria-selected={isActive}
+                    onMouseMove={() => !isActive && setActive(row.index)}
+                    onDoubleClick={() => open(a)}
+                    style={{ height: ROW_HEIGHT, transform: `translateY(${row.start}px)` }}
+                    className={`group absolute inset-x-0 top-0 flex items-center gap-3 rounded-lg px-3 ${
+                      isActive ? 'bg-accent-soft' : ''
+                    }`}
+                  >
+                    <AppAvatar device={device} app={a} />
+                    <span className="min-w-0 flex-1 truncate">{a.name}</span>
+                    {row.index === 0 && query && (
+                      <kbd className="rounded border border-line px-1.5 text-xs text-muted">Enter</kbd>
+                    )}
+                    <button
+                      type="button"
+                      tabIndex={-1}
+                      aria-label={fav ? `取消收藏 ${a.name}` : `收藏 ${a.name}`}
+                      title={fav ? '取消收藏（Ctrl+D）' : '收藏，排到最前（Ctrl+D）'}
+                      aria-pressed={fav}
+                      onClick={() => toggleFavorite(device, a.id)}
+                      className={`rounded p-1 hover:bg-hover ${fav ? 'text-warn' : 'text-faint opacity-0 group-hover:opacity-100'}`}
+                    >
+                      <Icon name="star" fill={fav ? 'currentColor' : 'none'} />
+                    </button>
+                    <Button
+                      tabIndex={-1}
+                      variant={isActive ? 'primary' : 'default'}
+                      disabled={!online || launching === a.id}
+                      onClick={() => open(a)}
+                    >
+                      {launching === a.id ? <Icon name="loader" className="spin" /> : <Icon name="play" size={13} />}
+                      打开
+                    </Button>
+                  </li>
+                )
+              })}
+            </div>
+          )}
         </ul>
       )}
     </section>

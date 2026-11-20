@@ -1,5 +1,5 @@
 import { getCurrentWebview } from '@tauri-apps/api/webview'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { backend } from '../../api'
 import { SELF_ID, type DeviceId } from '../../api/types'
 import { Icon, type IconName } from '../../components/Icon'
@@ -8,7 +8,7 @@ import { ROOT } from '../../lib/path'
 import { sortEntries } from '../../lib/sort'
 import { tabLabelOf } from '../../lib/stage2'
 import { SELF_DEVICE, isOnline, useDevice, useDevices } from '../../store/devices'
-import { keyOf, paneOf, useFiles, viewOf } from '../../store/files'
+import { keyOf, paneOf, useFiles, viewOf, type PaneSide } from '../../store/files'
 import { useUi } from '../../store/ui'
 import { FileList } from './FileList'
 import { FileSearchPanel } from './FileSearchPanel'
@@ -20,11 +20,15 @@ export function FilesPage({ device }: { device: DeviceId }) {
   const rightDevice = useUi((s) => s.rightDevice)
   const setRightDevice = useUi((s) => s.setRightDevice)
   const devices = useDevices((s) => s.devices)
-  const [dropHoverPane, setDropHoverPane] = useState<DeviceId | null>(null)
+  const [dropHoverSide, setDropHoverSide] = useState<PaneSide | null>(null)
 
-  // 当打开双栏且左右两栏刚好选了同一台设备时，右栏自动挑另一台设备（如本机或第一台在线设备）
+  const prevDualRef = useRef(dualPane)
+
+  // 刚打开双栏且左右两栏刚好选了同一台设备时，右栏默认挑另一台设备；之后允许用户在右栏自由切换到同设备
   useEffect(() => {
-    if (!dualPane) return
+    const justOpened = dualPane && !prevDualRef.current
+    prevDualRef.current = dualPane
+    if (!justOpened) return
     if (rightDevice !== device) return
     const alt = device === SELF_ID ? (devices[0]?.id ?? SELF_ID) : SELF_ID
     if (alt !== rightDevice) setRightDevice(alt)
@@ -36,26 +40,28 @@ export function FilesPage({ device }: { device: DeviceId }) {
     let off: (() => void) | null = null
     let cancelled = false
 
-    const resolveHoveredDevice = (physX: number, physY: number): DeviceId => {
+    const resolveHoveredPane = (physX: number, physY: number): { device: DeviceId; side: PaneSide } => {
       const dpr = window.devicePixelRatio || 1
       const el = document
         .elementFromPoint(physX / dpr, physY / dpr)
-        ?.closest<HTMLElement>('[data-pane-device]')
-      return el?.dataset.paneDevice ?? device
+        ?.closest<HTMLElement>('[data-pane-side][data-pane-device]')
+      const side = (el?.dataset.paneSide as PaneSide | undefined) ?? 'left'
+      const dev = el?.dataset.paneDevice ?? device
+      return { device: dev, side }
     }
 
     void getCurrentWebview()
       .onDragDropEvent((ev) => {
         const p = ev.payload
         if (p.type === 'enter' || p.type === 'over') {
-          setDropHoverPane(resolveHoveredDevice(p.position.x, p.position.y))
+          setDropHoverSide(resolveHoveredPane(p.position.x, p.position.y).side)
         } else if (p.type === 'leave') {
-          setDropHoverPane(null)
+          setDropHoverSide(null)
         } else if (p.type === 'drop') {
-          const targetDev = resolveHoveredDevice(p.position.x, p.position.y)
-          setDropHoverPane(null)
+          const target = resolveHoveredPane(p.position.x, p.position.y)
+          setDropHoverSide(null)
           if (p.paths.length > 0) {
-            void useFiles.getState().dropLocalPaths(targetDev, p.paths)
+            void useFiles.getState().dropLocalPaths(target.device, p.paths, target.side)
           }
         }
       })
@@ -77,7 +83,7 @@ export function FilesPage({ device }: { device: DeviceId }) {
         device={device}
         side="left"
         showDualToggle
-        externalDropActive={dropHoverPane === device}
+        externalDropActive={dropHoverSide === 'left'}
       />
       {dualPane && (
         <div className="flex min-h-0 min-w-0 flex-1 border-l border-line">
@@ -85,7 +91,7 @@ export function FilesPage({ device }: { device: DeviceId }) {
             device={rightDevice}
             side="right"
             showDualToggle={false}
-            externalDropActive={dropHoverPane === rightDevice}
+            externalDropActive={dropHoverSide === 'right'}
           />
         </div>
       )}
@@ -100,15 +106,16 @@ function FilePane({
   externalDropActive,
 }: {
   device: DeviceId
-  side: 'left' | 'right'
+  side: PaneSide
   showDualToggle: boolean
   externalDropActive: boolean
 }) {
+  const paneRef = useRef<HTMLElement>(null)
   const dev = useDevice(device)
   const allDevices = useDevices((s) => s.devices)
   const online = isOnline(dev)
-  const pane = useFiles((s) => paneOf(s, device))
-  const view = useFiles((s) => viewOf(s, device))
+  const pane = useFiles((s) => paneOf(s, device, side))
+  const view = useFiles((s) => viewOf(s, device, side))
   const key = keyOf(device, view.path)
   const listing = useFiles((s) => s.listings[key])
   const streaming = useFiles((s) => s.streaming[key])
@@ -123,14 +130,15 @@ function FilePane({
   const act = useFiles.getState
   const reconnect = useDevices((s) => s.reconnect)
   const [editPath, setEditPath] = useState(0)
-  const [searchOpen, setSearchOpen] = useState(false)
+  // 用当前目录键绑定搜索栏开关：切目录、切设备或设备离线时自动重置并关闭旧结果
+  const [searchScope, setSearchScope] = useState<string | null>(null)
 
   const hasData = view.path === ROOT ? !!roots : !!listing
 
   // 初次进入或设备重连上线时刷新当前标签目录
   useEffect(() => {
-    if (online) act().refresh(device)
-  }, [device, online, act])
+    if (online) act().refresh(device, side)
+  }, [device, side, online, act])
 
   // 任务 2.2：进入目录开启变化监听，离开目录或切换设备时自动解除监听
   useEffect(() => {
@@ -151,6 +159,12 @@ function FilePane({
 
   const readOnly = !online
   const atRoot = view.path === ROOT
+  const canSearch = !readOnly && !atRoot && !!dev?.features.includes('search')
+  const searchOpen = canSearch && searchScope === key
+  const toggleSearch = () => {
+    if (!canSearch) return
+    setSearchScope((cur) => (cur === key ? null : key))
+  }
 
   const onKeyDown = (e: React.KeyboardEvent) => {
     if ((e.target as HTMLElement).tagName === 'INPUT') return
@@ -160,25 +174,27 @@ function FilePane({
       setEditPath((n) => n + 1)
     } else if (ctrl && e.key.toLowerCase() === 't') {
       e.preventDefault()
-      act().newTab(device)
+      act().newTab(device, undefined, side)
     } else if (ctrl && e.key.toLowerCase() === 'w') {
       e.preventDefault()
-      act().closeTab(device, pane.activeId)
+      act().closeTab(device, pane.activeId, side)
     } else if (e.key === 'F5' || (ctrl && e.key.toLowerCase() === 'r')) {
       e.preventDefault()
-      act().refresh(device)
+      act().refresh(device, side)
     } else if (e.altKey && e.key === 'ArrowLeft') {
       e.preventDefault()
-      act().goBack(device)
+      act().goBack(device, side)
     } else if (e.altKey && e.key === 'ArrowRight') {
       e.preventDefault()
-      act().goForward(device)
-    } else if (ctrl && e.key.toLowerCase() === 'f' && !atRoot) {
-      e.preventDefault()
-      setSearchOpen((v) => !v)
+      act().goForward(device, side)
+    } else if (ctrl && e.key.toLowerCase() === 'f') {
+      if (canSearch) {
+        e.preventDefault()
+        toggleSearch()
+      }
     } else if ((e.altKey && e.key === 'ArrowUp') || e.key === 'Backspace') {
       e.preventDefault()
-      act().goUp(device)
+      act().goUp(device, side)
     }
   }
 
@@ -209,8 +225,10 @@ function FilePane({
 
   return (
     <section
+      ref={paneRef}
       aria-label={side === 'left' ? '主文件栏' : '右侧对比文件栏'}
       data-pane-device={device}
+      data-pane-side={side}
       className={`file-pane flex min-h-0 min-w-0 flex-1 flex-col ${externalDropActive ? 'ring-2 ring-accent ring-inset' : ''}`}
       onKeyDown={onKeyDown}
     >
@@ -240,7 +258,7 @@ function FilePane({
                   role="tab"
                   aria-selected={selected}
                   title={t.path || '此电脑'}
-                  onClick={() => act().activateTab(device, t.id)}
+                  onClick={() => act().activateTab(device, t.id, side)}
                   className="folder-tab flex h-8 max-w-44 items-center gap-1.5 rounded-t-md px-2.5 text-muted hover:text-fg"
                 >
                   <Icon name={t.path === ROOT ? 'drive' : 'folder'} size={13} className="shrink-0" />
@@ -250,7 +268,7 @@ function FilePane({
                   <button
                     type="button"
                     aria-label={`关闭标签 ${tabLabelOf(t.path)}`}
-                    onClick={() => act().closeTab(device, t.id)}
+                    onClick={() => act().closeTab(device, t.id, side)}
                     className="-ml-1 mr-0.5 rounded p-0.5 text-faint hover:bg-hover hover:text-fg"
                   >
                     <Icon name="x" size={12} />
@@ -264,7 +282,7 @@ function FilePane({
           type="button"
           aria-label="新建文件夹标签页"
           title="新建标签页（Ctrl+T）"
-          onClick={() => act().newTab(device)}
+          onClick={() => act().newTab(device, undefined, side)}
           className="grid size-6 shrink-0 place-items-center rounded text-muted hover:bg-hover hover:text-fg"
         >
           <Icon name="plus" size={14} />
@@ -273,23 +291,28 @@ function FilePane({
 
       {/* 工具栏 */}
       <div className="flex items-center gap-1 border-b border-line px-2.5 py-1.5">
-        {tool('back', '后退', () => act().goBack(device), !view.back.length, 'Alt+←')}
-        {tool('forward', '前进', () => act().goForward(device), !view.fwd.length, 'Alt+→')}
-        {tool('up', '上一级', () => act().goUp(device), atRoot, 'Backspace')}
-        {tool('refresh', '刷新', () => act().refresh(device), !online, 'F5')}
+        {tool('back', '后退', () => act().goBack(device, side), !view.back.length, 'Alt+←')}
+        {tool('forward', '前进', () => act().goForward(device, side), !view.fwd.length, 'Alt+→')}
+        {tool('up', '上一级', () => act().goUp(device, side), atRoot, 'Backspace')}
+        {tool('refresh', '刷新', () => act().refresh(device, side), !online, 'F5')}
         <div className="mx-1 flex min-w-0 flex-1 items-center gap-2">
-          <PathBar path={view.path} editRequest={editPath} onNavigate={(p) => act().open(device, p)} />
+          <PathBar
+            path={view.path}
+            editRequest={editPath}
+            paneRef={paneRef}
+            onNavigate={(p) => act().open(device, p, 'push', side)}
+          />
           {loading && hasData && <Icon name="loader" size={16} className="spin shrink-0 text-accent" aria-label="正在刷新" />}
         </div>
-        {tool('folderPlus', '新建文件夹', () => void act().newFolder(device), readOnly || atRoot, 'Ctrl+Shift+N')}
-        {tool('upload', '上传文件', () => void act().upload(device), readOnly || atRoot || device === SELF_ID)}
-        {tool('folder', '上传整个文件夹', () => void act().uploadFolder(device), readOnly || atRoot || device === SELF_ID)}
-        {tool('paste', '粘贴', () => void act().paste(device), readOnly || atRoot || !hasClip, 'Ctrl+V')}
+        {tool('folderPlus', '新建文件夹', () => void act().newFolder(device, side), readOnly || atRoot, 'Ctrl+Shift+N')}
+        {tool('upload', '上传文件', () => void act().upload(device, side), readOnly || atRoot || device === SELF_ID)}
+        {tool('folder', '上传整个文件夹', () => void act().uploadFolder(device, side), readOnly || atRoot || device === SELF_ID)}
+        {tool('paste', '粘贴', () => void act().paste(device, side), readOnly || atRoot || !hasClip, 'Ctrl+V')}
         {tool(
           'search',
           '在此目录中搜索文件',
-          () => setSearchOpen((v) => !v),
-          readOnly || atRoot || !dev?.features.includes('search'),
+          toggleSearch,
+          !canSearch,
           'Ctrl+F',
           searchOpen,
         )}
@@ -297,11 +320,13 @@ function FilePane({
           tool('columns', '双栏对拷视图', () => setDualPane(!dualPane), false, undefined, dualPane)}
       </div>
 
-      {searchOpen && !atRoot && (
+      {searchOpen && (
         <FileSearchPanel
+          key={`${side}|${key}`}
           device={device}
+          side={side}
           rootPath={view.path}
-          onClose={() => setSearchOpen(false)}
+          onClose={() => setSearchScope(null)}
         />
       )}
 
@@ -329,7 +354,11 @@ function FilePane({
       )}
 
       {error && online && !(hasData && error.code === 'offline') ? (
-        <ErrorView msg={error.msg} onRetry={() => act().refresh(device)} onBack={view.back.length ? () => act().goBack(device) : undefined} />
+        <ErrorView
+          msg={error.msg}
+          onRetry={() => act().refresh(device, side)}
+          onBack={view.back.length ? () => act().goBack(device, side) : undefined}
+        />
       ) : !hasData ? (
         <div className="grid flex-1 place-items-center text-sm text-muted">
           {online || loading ? (
@@ -341,9 +370,9 @@ function FilePane({
           )}
         </div>
       ) : atRoot ? (
-        <RootsView roots={roots!} readOnly={readOnly} onOpen={(p) => act().open(device, p)} />
+        <RootsView roots={roots!} readOnly={readOnly} onOpen={(p) => act().open(device, p, 'push', side)} />
       ) : (
-        <FileList device={device} entries={entries} readOnly={readOnly} />
+        <FileList device={device} side={side} entries={entries} readOnly={readOnly} />
       )}
     </section>
   )

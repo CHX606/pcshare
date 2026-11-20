@@ -109,7 +109,7 @@ pub async fn handle_shot_screen_stream(
     perms: &Permissions,
     args: ShotScreenArgs,
     send: &mut SendStream,
-) -> Result<(), CoreError> {
+) -> Result<bool, CoreError> {
     if !perms.screenshot {
         write_frame(
             send,
@@ -119,7 +119,7 @@ pub async fn handle_shot_screen_stream(
             ),
         )
         .await?;
-        return Ok(());
+        return Ok(false);
     }
     let plat = platform.clone();
     let quality = args.quality.unwrap_or(80);
@@ -139,12 +139,13 @@ pub async fn handle_shot_screen_stream(
             send.write_all(&bytes)
                 .await
                 .map_err(|e| CoreError::NotConnected(format!("发送截图数据中断：{e}")))?;
+            Ok(true)
         }
         Err(err) => {
             write_frame(send, &ResponseEnvelope::<ShotHeader>::Err(err)).await?;
+            Ok(false)
         }
     }
-    Ok(())
 }
 
 pub async fn handle_shot_window_stream(
@@ -152,7 +153,7 @@ pub async fn handle_shot_window_stream(
     perms: &Permissions,
     args: ShotWindowArgs,
     send: &mut SendStream,
-) -> Result<(), CoreError> {
+) -> Result<bool, CoreError> {
     if !perms.screenshot {
         write_frame(
             send,
@@ -162,7 +163,7 @@ pub async fn handle_shot_window_stream(
             ),
         )
         .await?;
-        return Ok(());
+        return Ok(false);
     }
     let plat = platform.clone();
     let quality = args.quality.unwrap_or(80);
@@ -182,12 +183,13 @@ pub async fn handle_shot_window_stream(
             send.write_all(&bytes)
                 .await
                 .map_err(|e| CoreError::NotConnected(format!("发送窗口截图中断：{e}")))?;
+            Ok(true)
         }
         Err(err) => {
             write_frame(send, &ResponseEnvelope::<ShotHeader>::Err(err)).await?;
+            Ok(false)
         }
     }
-    Ok(())
 }
 
 async fn maybe_capture_refresh(
@@ -223,7 +225,7 @@ pub async fn handle_input_click_stream(
     perms: &Permissions,
     args: InputClickArgs,
     send: &mut SendStream,
-) -> Result<(), CoreError> {
+) -> Result<bool, CoreError> {
     if !perms.input_control {
         write_frame(
             send,
@@ -233,7 +235,7 @@ pub async fn handle_input_click_stream(
             ),
         )
         .await?;
-        return Ok(());
+        return Ok(false);
     }
     let btn = match args.button {
         MouseBtn::Left => PlatformMouseBtn::Left,
@@ -268,12 +270,13 @@ pub async fn handle_input_click_stream(
                     .await
                     .map_err(|e| CoreError::NotConnected(format!("发送刷新截图中断：{e}")))?;
             }
+            Ok(true)
         }
         Err(err) => {
             write_frame(send, &ResponseEnvelope::<InputReply>::Err(err)).await?;
+            Ok(false)
         }
     }
-    Ok(())
 }
 
 pub async fn handle_input_key_stream(
@@ -281,7 +284,7 @@ pub async fn handle_input_key_stream(
     perms: &Permissions,
     args: InputKeyArgs,
     send: &mut SendStream,
-) -> Result<(), CoreError> {
+) -> Result<bool, CoreError> {
     if !perms.input_control {
         write_frame(
             send,
@@ -291,7 +294,7 @@ pub async fn handle_input_key_stream(
             ),
         )
         .await?;
-        return Ok(());
+        return Ok(false);
     }
     let plat = platform.clone();
     let text = args.text.clone();
@@ -323,12 +326,13 @@ pub async fn handle_input_key_stream(
                     .await
                     .map_err(|e| CoreError::NotConnected(format!("发送刷新截图中断：{e}")))?;
             }
+            Ok(true)
         }
         Err(err) => {
             write_frame(send, &ResponseEnvelope::<InputReply>::Err(err)).await?;
+            Ok(false)
         }
     }
-    Ok(())
 }
 
 impl CoreNode {

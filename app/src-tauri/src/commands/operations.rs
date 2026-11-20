@@ -38,6 +38,13 @@ pub(crate) async fn fs_edit_sync_back(
 }
 
 #[tauri::command]
+pub(crate) async fn edit_pending_list(
+    state: State<'_, ManagedBridge>,
+) -> Result<Reply<Vec<UiEditSyncPrompt>>, ()> {
+    Ok(state.edit_pending_list())
+}
+
+#[tauri::command]
 pub(crate) async fn power_exec(
     state: State<'_, ManagedBridge>,
     device: String,

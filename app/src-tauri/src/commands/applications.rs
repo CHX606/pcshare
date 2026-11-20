@@ -4,8 +4,13 @@ use super::*;
 pub(crate) async fn app_list(
     state: State<'_, ManagedBridge>,
     device: String,
+    force: Option<bool>,
 ) -> Result<Reply<Vec<UiAppInfo>>, ()> {
-    Ok(state.inner().clone().app_list(device).await)
+    Ok(state
+        .inner()
+        .clone()
+        .app_list(device, force.unwrap_or(false))
+        .await)
 }
 
 #[tauri::command]
@@ -63,7 +68,8 @@ pub(crate) async fn diag_logs(
     state: State<'_, ManagedBridge>,
     limit: usize,
 ) -> Result<Reply<UiDiagLogs>, ()> {
-    Ok(state.diag_logs(limit))
+    let bridge = state.inner().clone();
+    spawn_blocking_reply("读取诊断日志任务", move || bridge.diag_logs(limit)).await
 }
 
 #[tauri::command]

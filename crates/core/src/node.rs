@@ -2,12 +2,11 @@
 //! 被控端指令分发与控制端远程调用（任务 1.7、1.8、1.9）。
 
 use std::collections::HashMap;
-use std::fs;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
@@ -15,8 +14,7 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, TransportAdd
 use pcshare_platform::Platform;
 use pcshare_proto::*;
 use serde::de::DeserializeOwned;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::broadcast;
+use tokio::sync::{Notify, broadcast};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
@@ -31,18 +29,14 @@ use crate::diagnostics::{
 };
 use crate::dir_cache::DirCache;
 use crate::edit_sync::EditSyncManager;
-use crate::error::{CoreError, map_io_to_rpc};
+use crate::error::CoreError;
 use crate::events::{
     CoreEvent, DeviceConnState, PairingDecision, PairingSessionTicket, ProgressCallback,
-    TransferDirection, TransferProgressEvent,
 };
-use crate::fs_service::{
-    FsService, pick_unique_target, replace_file_atomically, system_time_to_ms,
-};
+use crate::fs_service::FsService;
 use crate::fs_watch::FsWatchManager;
 use crate::lan_discovery::{LanDiscovery, LanPeerAnnouncement};
 use crate::pairing::{PairingManager, ParsedInvite, parse_invite_or_id};
-use crate::path_guard::{normalize_lexical_absolute, to_display_path, to_fs_path};
 use crate::screen_input::{
     handle_input_click_stream, handle_input_key_stream, handle_shot_monitors,
     handle_shot_screen_stream, handle_shot_window_stream,
@@ -84,8 +78,14 @@ impl Default for CoreConfig {
     }
 }
 
+pub(super) struct PeerWorkerEntry {
+    pub(super) id: u64,
+    pub(super) cancel: CancellationToken,
+}
+
 pub struct CoreNode {
     pub(crate) desktop_input_lock: tokio::sync::Mutex<()>,
+    pub(crate) power_exec_lock: tokio::sync::Mutex<()>,
     config: CoreConfig,
     pub(crate) storage: Arc<LocalStorage>,
     pub(crate) platform: Arc<dyn Platform>,
@@ -100,15 +100,20 @@ pub struct CoreNode {
     active_power_cancel: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
     dry_run_power_actions: AtomicBool,
     last_applied_clip_seq: AtomicU32,
+    clipboard_auto_sync_enabled: AtomicBool,
+    clipboard_auto_sync_notify: Arc<Notify>,
     host_paused: AtomicBool,
     direct_grants: Mutex<HashMap<String, DirectGrantRecord>>,
+    active_direct_transfers: Mutex<HashMap<String, CancellationToken>>,
     pairing: Arc<PairingManager>,
     pub(crate) events_tx: broadcast::Sender<CoreEvent>,
     remote_events_tx: broadcast::Sender<(String, RemoteEvent)>,
     active_conns: RwLock<HashMap<String, Connection>>,
+    incoming_conns: RwLock<HashMap<String, Vec<Connection>>>,
     dial_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     peer_states: RwLock<HashMap<String, DeviceConnState>>,
-    peer_workers: Mutex<HashMap<String, CancellationToken>>,
+    peer_workers: Mutex<HashMap<String, PeerWorkerEntry>>,
+    next_worker_id: AtomicU64,
     accept_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     shutdown_token: CancellationToken,
     startup_warnings: Vec<String>,
@@ -118,7 +123,6 @@ mod applications;
 mod connect;
 mod dispatch;
 mod download;
-mod file_progress;
 mod incoming;
 mod pair_client;
 mod peers;

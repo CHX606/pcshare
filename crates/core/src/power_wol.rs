@@ -9,10 +9,23 @@ use pcshare_proto::{
     PowerWakeWolArgs, PowerWakeWolReply, ResponseEnvelope, RpcError, read_frame, write_frame,
 };
 use serde::{Deserialize, Serialize};
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 use crate::CoreNode;
 use crate::error::{CoreError, map_platform_to_rpc};
+
+const MIN_POWER_COUNTDOWN_SECS: u32 = 10;
+const MAX_POWER_COUNTDOWN_SECS: u32 = 120;
+const WOL_RELAY_TIMEOUT: Duration = Duration::from_secs(3);
+
+struct PowerCancelResetGuard<'a>(&'a CoreNode);
+
+impl Drop for PowerCancelResetGuard<'_> {
+    fn drop(&mut self) {
+        self.0.set_active_power_cancel(None);
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WakePeerReport {
@@ -52,11 +65,22 @@ impl CoreNode {
             ));
         }
 
-        let default_secs = match args.action {
+        // 并发电源请求互斥，防止互相覆盖取消句柄
+        let _exec_guard = self.power_exec_lock.try_lock().map_err(|_| {
+            RpcError::new(
+                ErrorCode::Busy,
+                "当前已有另一项电源操作正在倒计时中，请先取消或等待完成",
+            )
+        })?;
+
+        // 非锁屏操作强制至少 10 秒可取消倒计时，忽略远端传入的 0 或过小值
+        let countdown_secs = match args.action {
             PowerAction::Lock => 0,
-            PowerAction::Sleep | PowerAction::Restart | PowerAction::Shutdown => 10,
+            PowerAction::Sleep | PowerAction::Restart | PowerAction::Shutdown => args
+                .countdown_secs
+                .unwrap_or(MIN_POWER_COUNTDOWN_SECS)
+                .clamp(MIN_POWER_COUNTDOWN_SECS, MAX_POWER_COUNTDOWN_SECS),
         };
-        let countdown_secs = args.countdown_secs.unwrap_or(default_secs).min(120);
         let requester = if args.requester_name.trim().is_empty() {
             "已配对设备".to_string()
         } else {
@@ -66,6 +90,7 @@ impl CoreNode {
         if countdown_secs > 0 {
             let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
             self.set_active_power_cancel(Some(cancel_tx));
+            let _reset_guard = PowerCancelResetGuard(self);
             let proceed_res = self
                 .platform
                 .show_power_countdown(
@@ -75,7 +100,7 @@ impl CoreNode {
                     cancel_rx,
                 )
                 .await;
-            self.set_active_power_cancel(None);
+            drop(_reset_guard);
 
             let proceed = proceed_res.map_err(|e| map_platform_to_rpc(&e))?;
             if !proceed {
@@ -136,7 +161,14 @@ impl CoreNode {
         args: PowerExecArgs,
     ) -> Result<PowerExecReply, CoreError> {
         let conn = self.get_or_connect(peer_id).await?;
-        let wait_limit = Duration::from_secs((args.countdown_secs.unwrap_or(10) as u64) + 20);
+        let eff_secs = match args.action {
+            PowerAction::Lock => 0,
+            PowerAction::Sleep | PowerAction::Restart | PowerAction::Shutdown => args
+                .countdown_secs
+                .unwrap_or(MIN_POWER_COUNTDOWN_SECS)
+                .clamp(MIN_POWER_COUNTDOWN_SECS, MAX_POWER_COUNTDOWN_SECS),
+        };
+        let wait_limit = Duration::from_secs(eff_secs as u64 + 20);
         let env = Command::PowerExec(args).to_envelope()?;
         timeout(wait_limit, async {
             let (mut send, mut recv) = conn
@@ -195,16 +227,28 @@ impl CoreNode {
             .map(|p| p.endpoint_id)
             .collect();
 
+        // 并发委托所有在线伙伴代发 WoL（短超时），避免单个慢节点串行阻塞 15 秒
+        let mut join_set = JoinSet::new();
         for helper_id in online_candidates {
-            if let Ok(rep) = self
-                .call_rpc::<PowerWakeWolReply>(
-                    &helper_id,
-                    Command::PowerWakeWol(PowerWakeWolArgs {
-                        mac_addresses: macs.clone(),
-                    }),
+            let node = self.clone();
+            let helper_macs = macs.clone();
+            join_set.spawn(async move {
+                timeout(
+                    WOL_RELAY_TIMEOUT,
+                    node.call_rpc::<PowerWakeWolReply>(
+                        &helper_id,
+                        Command::PowerWakeWol(PowerWakeWolArgs {
+                            mac_addresses: helper_macs,
+                        }),
+                    ),
                 )
                 .await
-            {
+                .ok()
+                .and_then(Result::ok)
+            });
+        }
+        while let Some(joined) = join_set.join_next().await {
+            if let Ok(Some(rep)) = joined {
                 relay_peers_notified += 1;
                 relayed_packets += rep.packets_sent;
             }

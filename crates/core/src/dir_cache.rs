@@ -9,9 +9,11 @@ use pcshare_proto::DirEntry;
 use serde::{Deserialize, Serialize};
 
 use crate::error::CoreError;
-use crate::storage::write_json_atomic;
+use crate::storage::write_json_compact_atomic;
 
 pub const MAX_DIR_CACHE_ENTRIES: usize = 200;
+/// 单个目录允许缓存在内存和磁盘中的最大条目数，避免超大目录撑爆内存和落盘耗时。
+pub const MAX_CACHED_DIR_ITEMS: usize = 5000;
 const DIR_CACHE_FILE: &str = "dir_cache.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,13 +54,17 @@ pub struct DirCache {
 }
 
 fn make_cache_key(device_id: &str, path: &str) -> String {
-    let norm = path.trim().replace('/', "\\");
-    let trimmed = if norm.len() > 3 {
-        norm.trim_end_matches('\\').to_lowercase()
-    } else {
-        norm.to_lowercase()
-    };
-    format!("{}|{}", device_id.trim().to_lowercase(), trimmed)
+    let mut norm = path.trim().replace('/', "\\");
+    while norm.len() > 1 && norm.ends_with('\\') {
+        norm.pop();
+    }
+    if norm.len() == 2
+        && norm.as_bytes()[0].is_ascii_alphabetic()
+        && norm.as_bytes()[1] == b':'
+    {
+        norm.push('\\');
+    }
+    format!("{}|{}", device_id.trim().to_lowercase(), norm.to_lowercase())
 }
 
 impl DirCache {
@@ -71,6 +77,9 @@ impl DirCache {
             && let Ok(persisted) = serde_json::from_str::<PersistedDirCache>(&raw)
         {
             for item in persisted.items {
+                if item.entries.len() > MAX_CACHED_DIR_ITEMS {
+                    continue;
+                }
                 let key = make_cache_key(&item.device_id, &item.path);
                 if map.contains_key(&key) {
                     lru_order.retain(|k| k != &key);
@@ -126,6 +135,12 @@ impl DirCache {
             }
         };
 
+        if entries.len() > MAX_CACHED_DIR_ITEMS {
+            guard.lru_order.retain(|k| k != &key);
+            guard.map.remove(&key);
+            return diff;
+        }
+
         let record = CachedDir {
             device_id: device_id.to_string(),
             path: path.to_string(),
@@ -148,8 +163,13 @@ impl DirCache {
 
     pub fn put_silent(&self, device_id: &str, path: &str, entries: Vec<DirEntry>) {
         let key = make_cache_key(device_id, path);
-        let now_ms = Utc::now().timestamp_millis() as u64;
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if entries.len() > MAX_CACHED_DIR_ITEMS {
+            guard.lru_order.retain(|k| k != &key);
+            guard.map.remove(&key);
+            return;
+        }
+        let now_ms = Utc::now().timestamp_millis() as u64;
         let record = CachedDir {
             device_id: device_id.to_string(),
             path: path.to_string(),
@@ -182,7 +202,7 @@ impl DirCache {
                 .filter_map(|k| guard.map.get(k).cloned())
                 .collect()
         };
-        write_json_atomic(&self.file_path, &PersistedDirCache { items })
+        write_json_compact_atomic(&self.file_path, &PersistedDirCache { items })
     }
 }
 

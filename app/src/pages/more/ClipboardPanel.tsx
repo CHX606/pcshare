@@ -18,6 +18,8 @@ export function ClipboardPanel({ device, deviceName }: { device: DeviceId; devic
   const copyTimer = useRef<number | null>(null)
 
   const loadSettingsAndPeek = useCallback(async () => {
+    if (device === SELF_ID) return
+    setBusy(true)
     try {
       const s = await backend.getSettings()
       setAutoSync(!!s.clipboardAutoSync)
@@ -27,13 +29,16 @@ export function ClipboardPanel({ device, deviceName }: { device: DeviceId; devic
     try {
       const p = await backend.clipPeek(device)
       setPreview(p)
-    } catch {
-      // Might not have clipboard permission yet
+    } catch (err) {
       setPreview(null)
+      toast.error(humanError(err))
+    } finally {
+      setBusy(false)
     }
   }, [device])
 
   useEffect(() => {
+    if (device === SELF_ID) return
     let cancelled = false
     void backend
       .getSettings()
@@ -59,9 +64,13 @@ export function ClipboardPanel({ device, deviceName }: { device: DeviceId; devic
     setBusy(true)
     try {
       const kind = await backend.clipPush(device)
-      toast.success(
-        `已把本机剪贴板${kind === 'image_png' ? '图片' : '文字'}发送到「${deviceName}」`,
-      )
+      if (kind === 'empty') {
+        toast.info('本机剪贴板当前为空，没有可发送的内容')
+      } else {
+        toast.success(
+          `已把本机剪贴板${kind === 'image_png' ? '图片' : '文字'}发送到「${deviceName}」`,
+        )
+      }
       const p = await backend.clipPeek(device).catch(() => null)
       if (p) setPreview(p)
     } catch (err) {
@@ -76,9 +85,13 @@ export function ClipboardPanel({ device, deviceName }: { device: DeviceId; devic
     try {
       const pulled = await backend.clipPull(device)
       setPreview(pulled)
-      toast.success(
-        `已把「${deviceName}」的剪贴板${pulled.kind === 'image_png' ? '图片' : '文字'}取回本机，可直接粘贴`,
-      )
+      if (pulled.kind === 'empty') {
+        toast.info(`「${deviceName}」的剪贴板当前为空`)
+      } else {
+        toast.success(
+          `已把「${deviceName}」的剪贴板${pulled.kind === 'image_png' ? '图片' : '文字'}取回本机，可直接粘贴`,
+        )
+      }
     } catch (err) {
       toast.error(humanError(err))
     } finally {

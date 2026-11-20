@@ -25,38 +25,41 @@ impl RpcStream<'_> {
         Ok(())
     }
     async fn on_shot_screen(&mut self, args: ShotScreenArgs) -> Result<(), CoreError> {
-        self.audit("shot.screen", "全屏截图", true);
-        handle_shot_screen_stream(
+        let res = handle_shot_screen_stream(
             &self.node.platform,
             &self.record.permissions,
             args,
             self.send,
         )
-        .await?;
+        .await;
+        self.audit("shot.screen", "全屏截图", matches!(res, Ok(true)));
+        res?;
         Ok(())
     }
     async fn on_shot_window(&mut self, args: ShotWindowArgs) -> Result<(), CoreError> {
         let detail = format!("HWND {}", args.hwnd);
-        self.audit("shot.window", &detail, true);
-        handle_shot_window_stream(
+        let res = handle_shot_window_stream(
             &self.node.platform,
             &self.record.permissions,
             args,
             self.send,
         )
-        .await?;
+        .await;
+        self.audit("shot.window", &detail, matches!(res, Ok(true)));
+        res?;
         Ok(())
     }
     async fn on_input_click(&mut self, args: InputClickArgs) -> Result<(), CoreError> {
         let detail = format!("({}, {})", args.screen_x, args.screen_y);
-        self.audit("input.click", &detail, true);
-        handle_input_click_stream(
+        let res = handle_input_click_stream(
             &self.node.platform,
             &self.record.permissions,
             args,
             self.send,
         )
-        .await?;
+        .await;
+        self.audit("input.click", &detail, matches!(res, Ok(true)));
+        res?;
         Ok(())
     }
     async fn on_input_key(&mut self, args: InputKeyArgs) -> Result<(), CoreError> {
@@ -64,14 +67,15 @@ impl RpcStream<'_> {
             .key_combo
             .clone()
             .unwrap_or_else(|| "文本输入".to_string());
-        self.audit("input.key", &detail, true);
-        handle_input_key_stream(
+        let res = handle_input_key_stream(
             &self.node.platform,
             &self.record.permissions,
             args,
             self.send,
         )
-        .await?;
+        .await;
+        self.audit("input.key", &detail, matches!(res, Ok(true)));
+        res?;
         Ok(())
     }
     async fn on_power_exec(&mut self, args: PowerExecArgs) -> Result<(), CoreError> {
@@ -98,35 +102,51 @@ impl RpcStream<'_> {
         Ok(())
     }
     async fn on_clip_get(&mut self) -> Result<(), CoreError> {
-        self.audit("clip.get", "", true);
-        handle_clip_get_stream(&self.node.platform, &self.record.permissions, self.send).await?;
+        let res =
+            handle_clip_get_stream(&self.node.platform, &self.record.permissions, self.send).await;
+        self.audit("clip.get", "", matches!(res, Ok(true)));
+        res?;
         Ok(())
     }
     async fn on_clip_set(&mut self, args: ClipSetArgs) -> Result<(), CoreError> {
         let detail = format!("{:?}", args.kind);
+        let node_ref = self.node;
+        let recv = self
+            .recv
+            .as_mut()
+            .ok_or_else(|| CoreError::Internal("剪贴板接收流不可用".to_string()))?;
         let res = handle_clip_set_stream(
             &self.node.platform,
             &self.record.permissions,
             args,
-            self.recv,
+            recv,
             self.send,
+            |seq| node_ref.record_applied_clipboard_seq(seq),
         )
         .await;
-        self.audit("clip.set", &detail, res.is_ok());
+        self.audit("clip.set", &detail, matches!(res, Ok(true)));
         res?;
         Ok(())
     }
     async fn on_term_open(&mut self, args: TermOpenArgs) -> Result<(), CoreError> {
         let detail = format!("{:?}", args.shell);
-        self.audit("term.open", &detail, true);
-        handle_term_open_stream(
+        let node_ref = self.node;
+        let peer = self.peer;
+        let peer_name = &self.record.name;
+        let recv = self
+            .recv
+            .take()
+            .ok_or_else(|| CoreError::Internal("终端输入流不可用".to_string()))?;
+        let res = handle_term_open_stream(
             &self.node.platform,
             &self.record.permissions,
             args,
             self.send,
-            self.recv,
+            recv,
+            |ok| node_ref.record_audit(peer, peer_name, "term.open", &detail, ok),
         )
-        .await?;
+        .await;
+        res?;
         Ok(())
     }
 }

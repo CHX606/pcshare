@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use constant_time_eq::constant_time_eq;
-use iroh::EndpointId;
+use iroh::{EndpointId, SecretKey};
 use pcshare_proto::{ErrorCode, RpcError};
 use tokio::sync::oneshot;
 use url::Url;
@@ -20,6 +20,51 @@ use crate::events::{PairingDecision, PairingRequestPrompt, PairingSessionTicket}
 
 const PAIRING_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_FAILED_ATTEMPTS: u32 = 5;
+const MAX_PENDING_APPROVALS: usize = 32;
+
+/// 使用操作系统密码学安全随机源生成 32 字节随机数（复用 `iroh::SecretKey::generate` 底层 CSPRNG）。
+pub(crate) fn csprng_bytes_32() -> [u8; 32] {
+    SecretKey::generate().to_bytes()
+}
+
+/// 生成 256-bit（64 位小写十六进制）密码学安全随机令牌。
+pub(crate) fn csprng_token_hex_64() -> String {
+    let bytes = csprng_bytes_32();
+    let mut out = String::with_capacity(64);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
+
+/// 生成 6 位数字配对码（OS CSPRNG + 拒绝采样消除取模偏差）。
+fn generate_pairing_code() -> String {
+    const BOUND: u32 = 1_000_000;
+    const LIMIT: u32 = u32::MAX - (u32::MAX % BOUND);
+    loop {
+        let bytes = csprng_bytes_32();
+        for &chunk in bytes.as_chunks::<4>().0 {
+            let v = u32::from_le_bytes(chunk);
+            if v < LIMIT {
+                return format!("{:06}", v % BOUND);
+            }
+        }
+    }
+}
+
+fn generate_request_id() -> String {
+    let bytes = csprng_bytes_32();
+    let id = u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]);
+    format!("pair-{id:016x}")
+}
+
+struct PendingApproval {
+    tx: oneshot::Sender<PairingDecision>,
+    expires_at: Instant,
+}
 
 struct ActivePairingSession {
     code: String,
@@ -115,7 +160,7 @@ pub fn format_invite_code(
 
 pub struct PairingManager {
     session: Mutex<Option<ActivePairingSession>>,
-    pending_approvals: Mutex<HashMap<String, oneshot::Sender<PairingDecision>>>,
+    pending_approvals: Mutex<HashMap<String, PendingApproval>>,
 }
 
 impl Default for PairingManager {
@@ -138,7 +183,10 @@ impl PairingManager {
         relay_url: Option<&str>,
         direct_addrs: &[SocketAddr],
     ) -> PairingSessionTicket {
-        let code = format!("{:06}", fastrand::u32(0..1_000_000));
+        // 重新开启配对会话时作废旧会话遗留的待审批项
+        self.clear_pending_approvals();
+
+        let code = generate_pairing_code();
         let expires_at = Instant::now() + PAIRING_TTL;
         let expires_at_ms = (Utc::now().timestamp_millis() as u64)
             .saturating_add(PAIRING_TTL.as_millis() as u64);
@@ -170,7 +218,7 @@ impl PairingManager {
         mutual: bool,
         submitted_code: &str,
     ) -> Result<(PairingRequestPrompt, oneshot::Receiver<PairingDecision>), RpcError> {
-        let expires_at_ms = {
+        let (expires_at, expires_at_ms) = {
             let mut guard = self.session.lock().unwrap_or_else(|e| e.into_inner());
             let Some(active) = guard.as_mut() else {
                 return Err(RpcError::new(
@@ -204,7 +252,7 @@ impl PairingManager {
                 ));
             }
 
-            active.expires_at_ms
+            (active.expires_at, active.expires_at_ms)
         };
 
         let peer_hex = peer_id.to_string();
@@ -213,7 +261,7 @@ impl PairingManager {
         } else {
             peer_hex.clone()
         };
-        let request_id = format!("pair-{:016x}", fastrand::u64(..));
+        let request_id = generate_request_id();
         let prompt = PairingRequestPrompt {
             request_id: request_id.clone(),
             peer_id: peer_hex,
@@ -225,12 +273,43 @@ impl PairingManager {
         };
 
         let (tx, rx) = oneshot::channel();
+        {
+            let now = Instant::now();
+            let mut pending = self
+                .pending_approvals
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            pending.retain(|_, p| p.expires_at > now && !p.tx.is_closed());
+            if pending.len() >= MAX_PENDING_APPROVALS {
+                return Err(RpcError::new(
+                    ErrorCode::Busy,
+                    "当前待审批的配对请求过多，请稍后再试",
+                ));
+            }
+            pending.insert(request_id, PendingApproval { tx, expires_at });
+        }
+
+        Ok((prompt, rx))
+    }
+
+    pub fn remove_pending(&self, request_id: &str) {
         self.pending_approvals
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(request_id, tx);
+            .remove(request_id);
+    }
 
-        Ok((prompt, rx))
+    fn clear_pending_approvals(&self) {
+        let old = {
+            let mut pending = self
+                .pending_approvals
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *pending)
+        };
+        for (_, item) in old {
+            let _ = item.tx.send(PairingDecision::Reject);
+        }
     }
 
     pub fn consume_session_on_approved(&self) {
@@ -239,20 +318,32 @@ impl PairingManager {
     }
 
     pub fn cancel_session(&self) {
-        let mut guard = self.session.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = None;
+        {
+            let mut guard = self.session.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = None;
+        }
+        self.clear_pending_approvals();
     }
 
     pub fn respond(&self, request_id: &str, decision: PairingDecision) -> Result<(), CoreError> {
-        let tx = self
-            .pending_approvals
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(request_id)
-            .ok_or_else(|| {
-                CoreError::InvalidArgument(format!("配对请求已过期或不存在：{request_id}"))
-            })?;
-        let _ = tx.send(decision);
+        let now = Instant::now();
+        let entry = {
+            let mut pending = self
+                .pending_approvals
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            pending.retain(|k, p| k == request_id || (p.expires_at > now && !p.tx.is_closed()));
+            pending.remove(request_id)
+        }
+        .ok_or_else(|| {
+            CoreError::InvalidArgument(format!("配对请求已过期或不存在：{request_id}"))
+        })?;
+        if now >= entry.expires_at {
+            return Err(CoreError::InvalidArgument(format!(
+                "配对请求已超时过期：{request_id}"
+            )));
+        }
+        let _ = entry.tx.send(decision);
         Ok(())
     }
 }

@@ -1,8 +1,8 @@
 use super::{CaptureArea, CaptureSource};
+use crate::win_util::window_dpi_scale_percent;
 use crate::{PlatformError, PlatformMonitor};
 use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{ClientToScreen, MONITOR_DEFAULTTONULL, MonitorFromPoint};
-use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, IsIconic, IsWindowVisible};
 
 pub fn capture_area(
@@ -33,7 +33,7 @@ fn monitor(index: u32, monitors: &[PlatformMonitor]) -> Result<CaptureArea, Plat
         y: m.origin_y,
         width: m.width,
         height: m.height,
-        dpi: m.dpi_scale_percent,
+        dpi: m.dpi_scale_percent.max(100),
         handle: handle.0 as usize,
     })
 }
@@ -55,7 +55,7 @@ fn window(raw: usize) -> Result<CaptureArea, PlatformError> {
             y: pt.y,
             width: rect.right as u32,
             height: rect.bottom as u32,
-            dpi: (GetDpiForWindow(hwnd) * 100 + 48) / 96,
+            dpi: window_dpi_scale_percent(hwnd),
             handle: raw,
         })
     }

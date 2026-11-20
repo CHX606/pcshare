@@ -29,7 +29,7 @@ impl EventSink for TauriEventSink {
     }
 
     fn emit_pair_request(&self, req: UiPairRequest) {
-        // 如果窗口已关闭到托盘，收到配对请求时主动唤出窗口方便屏幕前的人点确认
+        // 请求已先存入 BridgeState 待处理队列；若主窗口原本不存在，前端冷启就绪后会通过 pair_pending_list 补显
         create_or_focus_main_window(&self.app);
         let _ = self.app.emit("pair://request", req);
     }
@@ -76,6 +76,7 @@ impl EventSink for TauriEventSink {
     }
 
     fn emit_edit_sync_prompt(&self, ev: UiEditSyncPrompt) {
+        // 提示已先存入 BridgeState 待处理队列；若主窗口冷启尚未监听事件，前端就绪后会通过 edit_pending_list 补显
         create_or_focus_main_window(&self.app);
         let _ = self.app.emit("edit://prompt", ev);
     }
@@ -85,17 +86,19 @@ impl EventSink for TauriEventSink {
     }
 
     fn emit_system_notice(&self, ev: UiSystemNotice) {
-        // 窗口缩在托盘或未聚焦时优先发送系统桌面通知，同时通知前端展示提示（任务 3.10）
+        // 窗口缩在托盘或未聚焦时在阻塞线程池发送 WinRT 桌面通知，避免阻塞 Tokio 工作线程
         let window_focused = self
             .app
             .get_webview_window("main")
             .and_then(|w| w.is_focused().ok())
             .unwrap_or(false);
         if !window_focused && let Some(bridge) = self.app.try_state::<ManagedBridge>() {
-            let _ = bridge
-                .node()
-                .platform()
-                .show_system_notification(&ev.title, &ev.body);
+            let plat = bridge.node().platform().clone();
+            let title = ev.title.clone();
+            let body = ev.body.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let _ = plat.show_system_notification(&title, &body);
+            });
         }
         let _ = self.app.emit("app://notice", ev);
     }

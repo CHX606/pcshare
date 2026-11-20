@@ -9,10 +9,12 @@ import {
   type DesktopInputEvent,
   type Device,
   type DeviceId,
+  type EditSyncPrompt,
   type FsCacheHit,
   type FsEntry,
   type LanPeer,
   type LinkKind,
+  type PairRequest,
   type ProcInfo,
   type Settings,
   type TaskKind,
@@ -88,6 +90,8 @@ export function createMockBackend(): Backend & { debug: MockDebug } {
   const procs = new Map<DeviceId, ProcInfo[]>()
   const tasks = new Map<string, RunningTask>()
   const cache = new Map<string, FsCacheHit>()
+  const pendingPairs = new Map<string, PairRequest>()
+  const pendingEdits = new Map<string, EditSyncPrompt>()
   const desktopSessions = new Map<number, MockDesktopSession>()
   let desktopSeq = 0
   let settings: Settings = {
@@ -211,7 +215,13 @@ export function createMockBackend(): Backend & { debug: MockDebug } {
       emit('device-status', pub(d))
     },
     pairRequest() {
-      emit('pair-request', { requestId: `r${++seq}`, deviceId: 'c4e8b2d6f0a4c8e2b6d0f4a8c2e6b0d4f8a2c6e0b4d8f2a6c0e4b8d2f6a0c4e8', deviceName: '客厅电脑' })
+      const req: PairRequest = {
+        requestId: `r${++seq}`,
+        deviceId: 'c4e8b2d6f0a4c8e2b6d0f4a8c2e6b0d4f8a2c6e0b4d8f2a6c0e4b8d2f6a0c4e8',
+        deviceName: '客厅电脑',
+      }
+      pendingPairs.set(req.requestId, req)
+      emit('pair-request', req)
     },
   }
 
@@ -230,7 +240,7 @@ export function createMockBackend(): Backend & { debug: MockDebug } {
     debug,
 
     async selfInfo() {
-      return { id: MOCK_SELF_ID, name: settings.deviceName, version: '0.3.0（界面预览）' }
+      return { id: MOCK_SELF_ID, name: settings.deviceName, version: '0.4.1（界面预览）' }
     },
     async getSettings() {
       return { ...settings }
@@ -326,7 +336,8 @@ export function createMockBackend(): Backend & { debug: MockDebug } {
       emit('device-status', pub(d))
       return pub(d)
     },
-    async pairRespond(_requestId, allow, permissions) {
+    async pairRespond(requestId, allow, permissions) {
+      pendingPairs.delete(requestId)
       if (offer?.timer) clearTimeout(offer.timer)
       offer = null
       if (!allow) return
@@ -345,6 +356,9 @@ export function createMockBackend(): Backend & { debug: MockDebug } {
       fss.set(d.id, new MockFs(d.user, d.drives))
       emit('device-status', pub(d))
     },
+    async pairPendingList() {
+      return [...pendingPairs.values()]
+    },
 
     async fsRoots(device) {
       return (await reach(device)).roots
@@ -355,8 +369,23 @@ export function createMockBackend(): Backend & { debug: MockDebug } {
     async fsList(device, path) {
       const fs = await reach(device, 4)
       const listing = fs.list(path)
-      await sleep(listing.entries.length / 400)
       const entries = listing.entries.map((e) => ({ ...e }))
+      if (entries.length > 500) {
+        const batchSize = 500
+        for (let i = 0; i < entries.length; i += batchSize) {
+          const slice = entries.slice(i, i + batchSize)
+          emit('fs-list-batch', {
+            device,
+            path: listing.path,
+            entries: slice,
+            totalHint: entries.length,
+            done: i + batchSize >= entries.length,
+          })
+          await sleep(16)
+        }
+      } else {
+        await sleep(entries.length / 400)
+      }
       cache.set(`${device}|${listing.path.toLowerCase()}`, {
         path: listing.path,
         entries,
@@ -421,6 +450,9 @@ export function createMockBackend(): Backend & { debug: MockDebug } {
       emit('task-progress', { ...t.p })
       tasks.delete(taskId)
     },
+    async taskList() {
+      return [...tasks.values()].map((t) => ({ ...t.p }))
+    },
     async getSpeedLimit() {
       return speedLimitBps
     },
@@ -429,14 +461,18 @@ export function createMockBackend(): Backend & { debug: MockDebug } {
     },
     async pickLocalFiles() {
       await sleep(200)
-      return ['C:\\Users\\Administrator\\Downloads\\' + fss.get(SELF_ID)!.list('C:\\Users\\Administrator\\Downloads').entries.filter((e) => !e.dir)[0].name]
+      const firstFile = fss
+        .get(SELF_ID)
+        ?.list('C:\\Users\\Administrator\\Downloads')
+        .entries.find((e) => !e.dir)
+      return firstFile ? [`C:\\Users\\Administrator\\Downloads\\${firstFile.name}`] : []
     },
     async pickLocalDir() {
       await sleep(200)
       return 'C:\\Users\\Administrator\\Downloads'
     },
 
-    async appList(device) {
+    async appList(device, _force) {
       await reach(device, 40)
       return mockApps()
     },
@@ -475,7 +511,7 @@ export function createMockBackend(): Backend & { debug: MockDebug } {
 
     async diagSummary() {
       return {
-        appVersion: '0.2.0',
+        appVersion: '0.4.1',
         endpointId: MOCK_SELF_ID,
         deviceName: settings.deviceName,
         os: 'windows',
@@ -582,8 +618,12 @@ export function createMockBackend(): Backend & { debug: MockDebug } {
         fileName: baseName(path),
       }
     },
-    async fsEditSyncBack() {
+    async fsEditSyncBack(sessionId) {
+      pendingEdits.delete(sessionId)
       return { conflict: false, bytesWritten: 128 }
+    },
+    async editPendingList() {
+      return [...pendingEdits.values()]
     },
     async fsDragOut() {
       return true

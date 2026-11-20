@@ -1,4 +1,5 @@
 import type { ShotTransform } from '../api/types'
+import { mapPointToRemotePixel } from './desktop'
 
 export interface RenderedBox {
   left: number
@@ -9,7 +10,7 @@ export interface RenderedBox {
 
 /**
  * 将网页中渲染后的截图 `<img />` 点击位置 `(clientX, clientY)` 还原为远端真实虚拟桌面坐标（任务 3.3）。
- * 兼容多显示器负坐标、DPI 缩放以及 `max_width` 等比压缩后的图像尺寸。
+ * 复用实时桌面的物理像素换算逻辑，兼容多显示器负坐标、DPI 缩放并防止最右/最下 1px 边线越界。
  */
 export function mapClientPointToRemoteScreen(
   clientX: number,
@@ -20,19 +21,8 @@ export function mapClientPointToRemoteScreen(
     'originX' | 'originY' | 'sourceWidth' | 'sourceHeight' | 'imageWidth' | 'imageHeight'
   >,
 ): { screenX: number; screenY: number } {
-  const safeW = Math.max(1, rect.width)
-  const safeH = Math.max(1, rect.height)
-  const ratioX = Math.max(0, Math.min(1, (clientX - rect.left) / safeW))
-  const ratioY = Math.max(0, Math.min(1, (clientY - rect.top) / safeH))
-
-  const imgX = ratioX * transform.imageWidth
-  const imgY = ratioY * transform.imageHeight
-  const iw = Math.max(1, transform.imageWidth)
-  const ih = Math.max(1, transform.imageHeight)
-
-  const screenX = Math.round(transform.originX + (imgX * transform.sourceWidth) / iw)
-  const screenY = Math.round(transform.originY + (imgY * transform.sourceHeight) / ih)
-  return { screenX, screenY }
+  const { x, y } = mapPointToRemotePixel(clientX, clientY, rect, transform)
+  return { screenX: x, screenY: y }
 }
 
 export interface QuickDeviceLite {

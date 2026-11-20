@@ -52,6 +52,7 @@ const PATHS = {
 export type IconName = keyof typeof PATHS
 
 export function Icon({ name, size = 16, ...rest }: { name: IconName; size?: number } & SVGProps<SVGSVGElement>) {
+  const labeled = Boolean(rest['aria-label'] || rest['aria-labelledby'])
   return (
     <svg
       width={size}
@@ -62,7 +63,8 @@ export function Icon({ name, size = 16, ...rest }: { name: IconName; size?: numb
       strokeWidth={1.8}
       strokeLinecap="round"
       strokeLinejoin="round"
-      aria-hidden="true"
+      role={labeled ? 'img' : undefined}
+      aria-hidden={labeled ? undefined : true}
       focusable="false"
       {...rest}
     >

@@ -6,6 +6,10 @@ use crate::error::FrameError;
 
 /// 单帧最大长度：16 MB（见总体方案 6.1 节）。
 pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+/// 匿名首帧（配对、直传握手等）允许的最大帧长度：64 KB。
+pub const MAX_HANDSHAKE_FRAME_SIZE: usize = 64 * 1024;
+/// 分块读取帧体时的单次缓冲上限：64 KB，避免读完 4 字节长度头即按声明长度预分配大内存。
+const FRAME_READ_CHUNK_SIZE: usize = 64 * 1024;
 
 /// 写入一帧原始字节（4 字节大端长度 + 正文）。
 pub async fn write_raw_frame<W>(writer: &mut W, payload: &[u8]) -> Result<(), FrameError>
@@ -47,9 +51,13 @@ where
     Ok(())
 }
 
-/// 读取一帧。如果流在帧边界处干净结束（0 字节可读），返回 `Ok(None)`；
+/// 读取一帧（带单帧大小上限）。如果流在帧边界处干净结束（0 字节可读），返回 `Ok(None)`；
 /// 如果读到一半断流，立即返回 `Err(FrameError::TruncatedFrame)`。
-pub async fn read_optional_frame<R, T>(reader: &mut R) -> Result<Option<T>, FrameError>
+/// 帧体采用分块按需扩容读取，避免恶意长度头触发一次性 16 MB 内存分配。
+pub async fn read_optional_frame_limited<R, T>(
+    reader: &mut R,
+    max_size: usize,
+) -> Result<Option<T>, FrameError>
 where
     R: AsyncRead + Unpin + ?Sized,
     T: DeserializeOwned,
@@ -70,29 +78,56 @@ where
         header_read += n;
     }
 
+    let effective_max = max_size.min(MAX_FRAME_SIZE);
     let len = u32::from_be_bytes(header) as usize;
-    if len > MAX_FRAME_SIZE {
+    if len > effective_max {
         return Err(FrameError::FrameTooLarge {
             size: len,
-            max: MAX_FRAME_SIZE,
+            max: effective_max,
         });
     }
 
-    let mut body = vec![0u8; len];
-    let mut body_read = 0usize;
-    while body_read < len {
-        let n = reader.read(&mut body[body_read..]).await?;
-        if n == 0 {
-            return Err(FrameError::TruncatedFrame {
-                expected: len,
-                got: body_read,
-            });
+    let initial_cap = len.min(FRAME_READ_CHUNK_SIZE);
+    let mut body = Vec::with_capacity(initial_cap);
+    if len > 0 {
+        let mut chunk = vec![0u8; initial_cap];
+        while body.len() < len {
+            let to_read = (len - body.len()).min(chunk.len());
+            let n = reader.read(&mut chunk[..to_read]).await?;
+            if n == 0 {
+                return Err(FrameError::TruncatedFrame {
+                    expected: len,
+                    got: body.len(),
+                });
+            }
+            body.extend_from_slice(&chunk[..n]);
         }
-        body_read += n;
     }
 
     let decoded = serde_json::from_slice(&body)?;
     Ok(Some(decoded))
+}
+
+/// 读取一帧。如果流在帧边界处干净结束（0 字节可读），返回 `Ok(None)`；
+/// 如果读到一半断流，立即返回 `Err(FrameError::TruncatedFrame)`。
+pub async fn read_optional_frame<R, T>(reader: &mut R) -> Result<Option<T>, FrameError>
+where
+    R: AsyncRead + Unpin + ?Sized,
+    T: DeserializeOwned,
+{
+    read_optional_frame_limited(reader, MAX_FRAME_SIZE).await
+}
+
+/// 读取必有的一帧（带单帧大小上限）；如果对方一字节没发就关闭流，返回 `FrameError::UnexpectedEof`。
+pub async fn read_frame_limited<R, T>(reader: &mut R, max_size: usize) -> Result<T, FrameError>
+where
+    R: AsyncRead + Unpin + ?Sized,
+    T: DeserializeOwned,
+{
+    match read_optional_frame_limited(reader, max_size).await? {
+        Some(frame) => Ok(frame),
+        None => Err(FrameError::UnexpectedEof),
+    }
 }
 
 /// 读取必有的一帧；如果对方一字节没发就关闭流，返回 `FrameError::UnexpectedEof`。
@@ -101,8 +136,5 @@ where
     R: AsyncRead + Unpin + ?Sized,
     T: DeserializeOwned,
 {
-    match read_optional_frame(reader).await? {
-        Some(frame) => Ok(frame),
-        None => Err(FrameError::UnexpectedEof),
-    }
+    read_frame_limited(reader, MAX_FRAME_SIZE).await
 }

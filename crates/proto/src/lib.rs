@@ -25,5 +25,8 @@ pub const SMALL_FILE_BATCH_THRESHOLD: u64 = 256 * 1024;
 pub const TRANSFER_CHUNK_SIZE: usize = 64 * 1024;
 
 pub use error::{ErrorCode, FrameError, RpcError};
-pub use frame::{MAX_FRAME_SIZE, read_frame, read_optional_frame, write_frame, write_raw_frame};
+pub use frame::{
+    MAX_FRAME_SIZE, MAX_HANDSHAKE_FRAME_SIZE, read_frame, read_frame_limited, read_optional_frame,
+    read_optional_frame_limited, write_frame, write_raw_frame,
+};
 pub use messages::*;

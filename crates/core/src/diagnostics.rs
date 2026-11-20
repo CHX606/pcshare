@@ -1,10 +1,11 @@
 //! 任务 2.11：内置网络体检（移植自 `probe`）、按天滚动运行日志、连接线路汇总与诊断包导出。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Local, NaiveDate, Utc};
@@ -37,6 +38,8 @@ pub struct NetcheckReport {
     pub udp_v4: bool,
     pub udp_v6: bool,
     pub nat_status: String,
+    #[serde(default)]
+    pub mapping_varies_by_dest_ip: Option<bool>,
     pub masked_global_v4: Option<String>,
     pub masked_global_v6: Option<String>,
     pub captive_portal: bool,
@@ -65,18 +68,40 @@ pub struct DiagnosticSummary {
     pub audit_count: usize,
 }
 
+static RUNTIME_LOG_PRUNE_DAY: OnceLock<Mutex<HashMap<PathBuf, NaiveDate>>> = OnceLock::new();
+
 pub fn append_runtime_log(logs_dir: &Path, level: &str, msg: &str) {
     let _ = fs::create_dir_all(logs_dir);
-    let today = Local::now().format("%Y-%m-%d").to_string();
+    let now = Local::now();
+    let today_date = now.date_naive();
+    let today = today_date.format("%Y-%m-%d");
     let path = logs_dir.join(format!("{RUNTIME_LOG_PREFIX}{today}.log"));
-    let ts = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+    let ts = now.format("%Y-%m-%d %H:%M:%S%.3f");
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
         let _ = writeln!(f, "[{ts}] [{level}] {msg}");
     }
-    prune_old_runtime_logs(logs_dir);
+    let should_prune = {
+        let cache = RUNTIME_LOG_PRUNE_DAY.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if map.get(logs_dir).copied() == Some(today_date) {
+            false
+        } else {
+            if map.len() >= 32 {
+                map.clear();
+            }
+            map.insert(logs_dir.to_path_buf(), today_date);
+            true
+        }
+    };
+    if should_prune {
+        prune_old_runtime_logs(logs_dir);
+    }
 }
 
 pub fn read_recent_runtime_logs(logs_dir: &Path, limit: usize) -> Vec<String> {
+    if limit == 0 {
+        return Vec::new();
+    }
     let Ok(rd) = fs::read_dir(logs_dir) else {
         return Vec::new();
     };
@@ -91,13 +116,21 @@ pub fn read_recent_runtime_logs(logs_dir: &Path, limit: usize) -> Vec<String> {
         .collect();
     files.sort();
 
-    let mut lines = Vec::new();
+    let mut lines = Vec::with_capacity(limit.min(1024));
     for p in files.into_iter().rev() {
+        let need = limit.saturating_sub(lines.len());
+        if need == 0 {
+            break;
+        }
         if let Ok(f) = fs::File::open(&p) {
-            let mut file_lines: Vec<String> =
-                BufReader::new(f).lines().map_while(Result::ok).collect();
-            file_lines.reverse();
-            for line in file_lines {
+            let mut ring: VecDeque<String> = VecDeque::with_capacity(need.min(1024));
+            for line in BufReader::new(f).lines().map_while(Result::ok) {
+                if ring.len() == need {
+                    ring.pop_front();
+                }
+                ring.push_back(line);
+            }
+            for line in ring.into_iter().rev() {
                 lines.push(line);
                 if lines.len() >= limit {
                     lines.reverse();
@@ -163,6 +196,7 @@ pub async fn run_netcheck(custom_relay_urls: &[String]) -> Result<NetcheckReport
             udp_v4: false,
             udp_v6: false,
             nat_status: "未能完成探测".to_string(),
+            mapping_varies_by_dest_ip: None,
             masked_global_v4: None,
             masked_global_v6: None,
             captive_portal: false,
@@ -228,6 +262,7 @@ pub async fn run_netcheck(custom_relay_urls: &[String]) -> Result<NetcheckReport
         udp_v4: report.udp_v4,
         udp_v6: report.udp_v6,
         nat_status,
+        mapping_varies_by_dest_ip: report.mapping_varies_by_dest_ipv4,
         masked_global_v4,
         masked_global_v6,
         captive_portal,

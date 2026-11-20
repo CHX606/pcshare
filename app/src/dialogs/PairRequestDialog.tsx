@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { backend } from '../api'
 import { humanError } from '../api/errors'
 import { DEFAULT_PERMISSIONS, type Permissions } from '../api/types'
@@ -11,30 +11,44 @@ import { PermissionsEditor } from './PermissionsEditor'
 /** 有设备请求配对：必须由坐在这台电脑前的人允许，并选择权限档。 */
 export function PairRequestDialog() {
   const req = useDevices((s) => s.pairRequests[0])
-  const shift = useDevices((s) => s.shiftPairRequest)
+  const removePairRequest = useDevices((s) => s.removePairRequest)
   const [perms, setPerms] = useState<Permissions>(DEFAULT_PERMISSIONS)
   const [busy, setBusy] = useState(false)
+  const busyRef = useRef(false)
 
   const respond = async (allow: boolean) => {
-    if (!req) return
+    const target = req
+    if (!target || busyRef.current) return
+    busyRef.current = true
     setBusy(true)
     try {
-      await backend.pairRespond(req.requestId, allow, perms)
+      await backend.pairRespond(target.requestId, allow, perms)
       if (allow) {
-        toast.success(`已允许“${req.deviceName}”配对`)
+        toast.success(`已允许“${target.deviceName}”配对`)
         useUi.getState().openAddDevice(false)
-      } else toast.info(`已拒绝“${req.deviceName}”的配对请求`)
+      } else {
+        toast.info(`已拒绝“${target.deviceName}”的配对请求`)
+      }
     } catch (e) {
       toast.error(humanError(e))
     } finally {
+      busyRef.current = false
       setBusy(false)
       setPerms(DEFAULT_PERMISSIONS)
-      shift()
+      removePairRequest(target.requestId)
     }
   }
 
   return (
-    <Modal open={!!req} onClose={() => void respond(false)} title="有设备请求配对" width={480}>
+    <Modal
+      open={!!req}
+      dismissible={!busy}
+      onClose={() => {
+        if (!busyRef.current) void respond(false)
+      }}
+      title="有设备请求配对"
+      width={480}
+    >
       {req && (
         <div className="flex flex-col gap-4 text-sm">
           <div className="rounded-lg bg-hover p-3">

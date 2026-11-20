@@ -482,3 +482,57 @@ async fn roundtrip_all_stage3_commands_permissions_and_frames() {
     let got_out: TermServerFrame = read_frame(&mut client).await.unwrap();
     assert_eq!(got_out, term_out);
 }
+
+#[tokio::test]
+async fn read_frame_limited_enforces_handshake_cap_and_reads_chunked_frames() {
+    // 1. Handshake limit rejects frame claiming > MAX_HANDSHAKE_FRAME_SIZE immediately
+    {
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
+        let claimed = (MAX_HANDSHAKE_FRAME_SIZE as u32) + 1;
+        writer.write_all(&claimed.to_be_bytes()).await.unwrap();
+        let err = read_frame_limited::<_, serde_json::Value>(&mut reader, MAX_HANDSHAKE_FRAME_SIZE)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            FrameError::FrameTooLarge {
+                size,
+                max
+            } if size == MAX_HANDSHAKE_FRAME_SIZE + 1 && max == MAX_HANDSHAKE_FRAME_SIZE
+        ));
+    }
+
+    // 2. Claiming 16 MB then closing after 16 bytes returns TruncatedFrame without 16 MB allocation
+    {
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
+        writer
+            .write_all(&(MAX_FRAME_SIZE as u32).to_be_bytes())
+            .await
+            .unwrap();
+        writer.write_all(b"0123456789abcdef").await.unwrap();
+        drop(writer);
+        let err = read_optional_frame::<_, serde_json::Value>(&mut reader)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            FrameError::TruncatedFrame {
+                expected,
+                got
+            } if expected == MAX_FRAME_SIZE && got == 16
+        ));
+    }
+
+    // 3. Valid multi-chunk frame (> 64 KB) decodes cleanly via incremental chunked reader
+    {
+        let (mut writer, mut reader) = tokio::io::duplex(256 * 1024);
+        let large_text = "a".repeat(150 * 1024);
+        let payload = json!({ "blob": large_text });
+        let write_task = tokio::spawn(async move {
+            write_frame(&mut writer, &payload).await.unwrap();
+        });
+        let decoded: serde_json::Value = read_frame(&mut reader).await.unwrap();
+        write_task.await.unwrap();
+        assert_eq!(decoded["blob"].as_str().unwrap().len(), 150 * 1024);
+    }
+}

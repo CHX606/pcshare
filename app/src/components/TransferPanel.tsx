@@ -1,7 +1,7 @@
 import type { CSSProperties } from 'react'
 import type { TaskProgress } from '../api/types'
 import { formatDuration, formatSize, formatSpeed } from '../lib/format'
-import { deviceName } from '../store/devices'
+import { useDeviceName } from '../store/devices'
 import { useTasks } from '../store/tasks'
 import { Icon, type IconName } from './Icon'
 
@@ -109,10 +109,10 @@ function TaskRow({
   const running = t.state === 'running'
   const paused = t.state === 'paused'
   const isTransfer = t.kind === 'upload' || t.kind === 'download' || t.kind === 'relay'
+  const srcName = useDeviceName(t.srcDevice)
+  const dstName = useDeviceName(t.dstDevice)
   const route =
-    t.srcDevice === t.dstDevice
-      ? `在“${deviceName(t.srcDevice)}”上`
-      : `${deviceName(t.srcDevice)} → ${deviceName(t.dstDevice)}`
+    t.srcDevice === t.dstDevice ? `在“${srcName}”上` : `${srcName} → ${dstName}`
   const remain = running && t.speed > 0 ? formatDuration((t.bytesTotal - t.bytesDone) / t.speed) : ''
 
   const barColor =

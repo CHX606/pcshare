@@ -8,11 +8,21 @@ interface ModalProps {
   children: ReactNode
   /** any：点外面也关；closerequest：只有 Esc 和按钮能关 */
   closedBy?: 'any' | 'closerequest'
+  /** false 时禁用关闭按钮与 Esc / 外部关闭（如提交请求进行中）。 */
+  dismissible?: boolean
   width?: number
 }
 
 /** 原生 <dialog> 的模态框：浏览器负责焦点、Esc、背景不可操作。 */
-export function Modal({ open, onClose, title, children, closedBy = 'closerequest', width = 460 }: ModalProps) {
+export function Modal({
+  open,
+  onClose,
+  title,
+  children,
+  closedBy = 'closerequest',
+  dismissible = true,
+  width = 460,
+}: ModalProps) {
   const ref = useRef<HTMLDialogElement>(null)
   const titleId = useId()
 
@@ -30,7 +40,7 @@ export function Modal({ open, onClose, title, children, closedBy = 'closerequest
   // 兼容尚不支持原生 closedby="any" 的内核：按对话框外框坐标判断按下与抬起均在外部时关闭
   useEffect(() => {
     const d = ref.current
-    if (!d || !open || closedBy !== 'any') return
+    if (!d || !open || closedBy !== 'any' || !dismissible) return
     if ('closedBy' in HTMLDialogElement.prototype) return
     const outside = (e: PointerEvent) => {
       const r = d.getBoundingClientRect()
@@ -49,14 +59,21 @@ export function Modal({ open, onClose, title, children, closedBy = 'closerequest
       d.removeEventListener('pointerdown', onDown)
       d.removeEventListener('pointerup', onUp)
     }
-  }, [open, closedBy])
+  }, [open, closedBy, dismissible])
+
+  const effectiveClosedBy = dismissible ? closedBy : 'none'
 
   return (
     <dialog
       ref={ref}
       aria-labelledby={titleId}
-      onClose={() => open && onClose()}
-      {...({ closedby: closedBy } as object)}
+      onCancel={(e) => {
+        if (!dismissible) e.preventDefault()
+      }}
+      onClose={() => {
+        if (open && dismissible) onClose()
+      }}
+      {...({ closedby: effectiveClosedBy } as object)}
       style={{ width }}
     >
       {open && (
@@ -68,8 +85,9 @@ export function Modal({ open, onClose, title, children, closedBy = 'closerequest
             <button
               type="button"
               aria-label="关闭"
-              className="rounded p-1 text-muted hover:bg-hover hover:text-fg"
-              onClick={onClose}
+              disabled={!dismissible}
+              className="rounded p-1 text-muted hover:bg-hover hover:text-fg disabled:cursor-not-allowed disabled:opacity-40"
+              onClick={() => dismissible && onClose()}
             >
               <Icon name="x" />
             </button>

@@ -4,9 +4,9 @@ import { createMockBackend } from './mock'
 import { createTauriBackend } from './tauri'
 
 function pick(): Backend {
-  if (isTauri()) return createTauriBackend()
+  if (isTauri() || import.meta.env.PROD) return createTauriBackend()
   const mock = createMockBackend()
-  ;(window as unknown as { __pcshareMock: unknown }).__pcshareMock = mock.debug
+  ;(window as unknown as { __pcshareMock?: unknown }).__pcshareMock = mock.debug
   return mock
 }
 

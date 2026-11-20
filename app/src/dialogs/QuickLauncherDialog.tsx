@@ -1,18 +1,20 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useId, useState } from 'react'
 import { backend } from '../api'
 import { humanError } from '../api/errors'
-import type { QuickHit } from '../api/types'
+import { SELF_ID, type QuickHit } from '../api/types'
 import { Icon } from '../components/Icon'
 import { Modal } from '../components/Modal'
+import { isImeComposing, shouldSkipGlobalShortcut } from '../lib/keyboard'
 import { parseQuickInputHint } from '../lib/stage3'
 import { isOnline, useDevices } from '../store/devices'
 import { useFiles } from '../store/files'
 import { toast } from '../store/toasts'
 import { useUi } from '../store/ui'
 
-/** 任务 3.1：全局快捷搜索框（默认 Alt+Space 呼出，输入“设备名 关键字”，回车立即远端启动并收起）。 */
+/** 任务 3.1：全局快捷搜索框（默认热键呼出，输入“设备名 关键字”，回车立即远端启动并收起）。 */
 export function QuickLauncherDialog() {
   const open = useUi((s) => s.launcherOpen)
+  const quickHotkey = useUi((s) => s.quickHotkey)
   const openLauncher = useUi((s) => s.openLauncher)
   const selectDevice = useDevices((s) => s.select)
   const devices = useDevices((s) => s.devices)
@@ -21,28 +23,37 @@ export function QuickLauncherDialog() {
   const [query, setQuery] = useState('')
   const [hits, setHits] = useState<QuickHit[]>([])
   const [activeIndex, setActiveIndex] = useState(0)
+  const listId = useId()
 
   // 订阅后端全局热键事件（launcher://toggle）并在启动时消费托盘唤醒挂起标记
   useEffect(() => {
-    void backend
-      .launcherConsumePending()
-      .then((pending) => {
-        if (pending) useUi.getState().openLauncher(true)
-      })
-      .catch(() => {})
+    let active = true
+    let toggledByEvent = false
 
     const off = backend.on('launcher-toggle', () => {
+      toggledByEvent = true
       useUi.getState().toggleLauncher()
     })
 
+    void backend
+      .launcherConsumePending()
+      .then((pending) => {
+        if (active && pending && !toggledByEvent) {
+          useUi.getState().openLauncher(true)
+        }
+      })
+      .catch(() => {})
+
     const onWindowKey = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+      if (shouldSkipGlobalShortcut(e)) return
+      if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'k') {
         e.preventDefault()
         useUi.getState().toggleLauncher()
       }
     }
     window.addEventListener('keydown', onWindowKey)
     return () => {
+      active = false
       off()
       window.removeEventListener('keydown', onWindowKey)
     }
@@ -65,6 +76,11 @@ export function QuickLauncherDialog() {
     }
   }, [open, query])
 
+  useEffect(() => {
+    if (!open || hits.length === 0) return
+    document.getElementById(`${listId}-${activeIndex}`)?.scrollIntoView({ block: 'nearest' })
+  }, [open, activeIndex, hits.length, listId])
+
   const hint = parseQuickInputHint(
     query,
     devices.map((d) => ({ id: d.id, name: d.name, online: isOnline(d) })),
@@ -77,13 +93,26 @@ export function QuickLauncherDialog() {
     if (hit.kind === 'folder') {
       selectDevice(hit.peerId)
       setTab('files')
-      useFiles.getState().open(hit.peerId, hit.target)
+      useFiles.getState().open(hit.peerId, hit.target, 'push', 'left')
       return
     }
+    const where = hit.peerId === SELF_ID ? '本机' : `「${hit.peerName}」`
     void backend
       .quickLaunch(hit.peerId, hit.target, hit.launchKind)
-      .then(() => {
-        toast.success(`已在「${hit.peerName}」启动 ${hit.title}`)
+      .then((r) => {
+        if (r.elevationPrompt) {
+          toast.warn(
+            `「${hit.title}」需要管理员权限，${where}的屏幕上弹出了确认框，需要有人在那台电脑前点“是”。也可以在对方的设置里打开“以管理员权限随登录启动”`,
+          )
+        } else if (r.desktop.place === 'locked') {
+          toast.warn(`已在${where}启动「${hit.title}」，但对方现在是锁屏状态，屏幕上看不到`)
+        } else if (r.desktop.place !== 'normal') {
+          toast.warn(`已在${where}启动「${hit.title}」，但对方现在没有可见的桌面`)
+        } else if (r.newWindows.length === 0) {
+          toast.info(`已在${where}打开「${hit.title}」，没检测到新窗口，可能本来就开着`)
+        } else {
+          toast.success(`已在${where}启动「${hit.title}」`)
+        }
       })
       .catch((err) => {
         toast.error(humanError(err))
@@ -91,6 +120,7 @@ export function QuickLauncherDialog() {
   }
 
   const onInputKeyDown = (e: React.KeyboardEvent) => {
+    if (isImeComposing(e)) return
     if (e.key === 'ArrowDown') {
       e.preventDefault()
       if (hits.length) setActiveIndex((i) => (i + 1) % hits.length)
@@ -104,11 +134,13 @@ export function QuickLauncherDialog() {
     }
   }
 
+  const hotkeyLabel = quickHotkey || 'Ctrl+K'
+
   return (
     <Modal
       open={open}
       onClose={() => openLauncher(false)}
-      title="快捷启动（Alt+Space）"
+      title={`快捷启动（${hotkeyLabel}）`}
       closedBy="any"
       width={540}
     >
@@ -141,6 +173,7 @@ export function QuickLauncherDialog() {
         </div>
 
         <ul
+          id={listId}
           role="listbox"
           aria-label="快捷搜索结果"
           className="scroll-thin max-h-72 overflow-y-auto rounded-lg border border-line"
@@ -153,7 +186,12 @@ export function QuickLauncherDialog() {
             hits.map((h, i) => {
               const selected = i === activeIndex
               return (
-                <li key={`${h.peerId}|${h.kind}|${h.target}`} role="option" aria-selected={selected}>
+                <li
+                  key={`${h.peerId}|${h.kind}|${h.target}`}
+                  id={`${listId}-${i}`}
+                  role="option"
+                  aria-selected={selected}
+                >
                   <button
                     type="button"
                     onMouseEnter={() => setActiveIndex(i)}

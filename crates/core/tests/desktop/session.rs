@@ -64,6 +64,17 @@ async fn old_peer_waits_for_refresh_and_close_cancels_pending_frame() {
         .storage()
         .update_peer_hello_meta(&pair.id, vec!["shot.v1".into()], vec![])
         .unwrap();
+
+    // 在无显示器/空桌面测试环境下启动一个可见测试窗口，保障按需截图回退可采到画面
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let host_plat = pair.host.platform().clone();
+    let win_handle = tokio::spawn(async move {
+        let _ = host_plat
+            .show_power_countdown("桌面会话测试窗口", "集成测试", 10, cancel_rx)
+            .await;
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
     let session = Arc::new(
         DesktopSession::open(&pair.client, &pair.id, Source::Monitor(0))
             .await
@@ -87,6 +98,8 @@ async fn old_peer_waits_for_refresh_and_close_cancels_pending_frame() {
         waiting.await.unwrap(),
         Err(pcshare_core::CoreError::Cancelled)
     ));
+    let _ = cancel_tx.send(true);
+    let _ = win_handle.await;
     drop(session);
     pair.finish().await;
 }

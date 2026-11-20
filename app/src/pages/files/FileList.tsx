@@ -1,5 +1,6 @@
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { backend } from '../../api'
 import { humanError } from '../../api/errors'
 import { SELF_ID, type DeviceId, type FsEntry } from '../../api/types'
@@ -9,42 +10,39 @@ import { formatSize, formatTime, typeName } from '../../lib/format'
 import { joinPath } from '../../lib/path'
 import { typeaheadIndex, type SortKey } from '../../lib/sort'
 import { deviceName } from '../../store/devices'
-import { useFiles, viewOf } from '../../store/files'
+import { keyOf, useFiles, viewOf, type PaneSide } from '../../store/files'
 import { toast } from '../../store/toasts'
 import { EntryIcon, RenameInput } from './RenameInput'
 
 const ROW = 30
 const COLS = 'grid grid-cols-[minmax(0,1fr)_140px_104px_88px] gap-2.5'
-const INTERNAL_DRAG_MIME = 'application/x-pcshare-items'
-
-interface InternalDragPayload {
-  srcDevice: DeviceId
-  srcDir: string
-  names: string[]
-}
 
 interface Props {
   device: DeviceId
+  side: PaneSide
   entries: FsEntry[]
   /** 设备离线时只读显示 */
   readOnly: boolean
 }
 
-export function FileList({ device, entries, readOnly }: Props) {
+export function FileList({ device, side, entries, readOnly }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null)
+  const dragCleanupRef = useRef<(() => void) | null>(null)
   const listId = useId()
-  const view = useFiles((s) => viewOf(s, device))
+  const view = useFiles((s) => viewOf(s, device, side))
   const sort = useFiles((s) => s.sort)
   const clipboard = useFiles((s) => s.clipboard)
-  const renaming = useFiles((s) => (s.renaming?.device === device ? s.renaming.name : null))
+  const renaming = useFiles((s) =>
+    s.renaming?.side === side && s.renaming.device === device ? s.renaming.name : null,
+  )
   const act = useFiles.getState
   const [menu, setMenu] = useState<MenuState | null>(null)
-  const [dragOver, setDragOver] = useState(false)
   const [pointerDrag, setPointerDrag] = useState<{
     names: string[]
     x: number
     y: number
     targetDevice: DeviceId | null
+    targetSide: PaneSide | null
   } | null>(null)
   const closeMenu = useCallback(() => setMenu(null), [])
   const typeBuf = useRef({ text: '', at: 0 })
@@ -54,6 +52,7 @@ export function FileList({ device, entries, readOnly }: Props) {
   const focusIdx = view.focus != null ? (indexOf.get(view.focus) ?? -1) : -1
   const selectedNames = () => names.filter((n) => view.selected.has(n))
 
+  // oxlint-disable-next-line react/incompatible-library
   const virt = useVirtualizer({
     count: entries.length,
     getScrollElement: () => scrollRef.current,
@@ -76,9 +75,17 @@ export function FileList({ device, entries, readOnly }: Props) {
     wasRenaming.current = !!renaming
   }, [renaming])
 
+  // 组件卸载时确保移除残留的 window 指针监听
+  useEffect(() => {
+    return () => {
+      dragCleanupRef.current?.()
+      dragCleanupRef.current = null
+    }
+  }, [])
+
   const selectOnly = (i: number) => {
     const n = names[i]
-    act().select(device, new Set([n]), n, n)
+    act().select(device, new Set([n]), n, n, side)
   }
 
   const moveTo = (i: number, e: { shiftKey: boolean; ctrlKey: boolean }) => {
@@ -88,25 +95,36 @@ export function FileList({ device, entries, readOnly }: Props) {
     if (e.shiftKey) {
       const a = view.anchor != null ? (indexOf.get(view.anchor) ?? idx) : idx
       const [lo, hi] = a < idx ? [a, idx] : [idx, a]
-      act().select(device, new Set(names.slice(lo, hi + 1)), n)
+      act().select(device, new Set(names.slice(lo, hi + 1)), n, undefined, side)
     } else if (e.ctrlKey) {
-      act().select(device, view.selected, n)
+      act().select(device, view.selected, n, undefined, side)
     } else selectOnly(idx)
   }
 
-  // 任务 2.5：双栏间指针拖拽（兼容 Windows WebView2 原生拖放拦截器）
+  // 任务 2.5：双栏间自定义指针拖拽（移除原生 draggable，兼容同设备双栏与 WebView2）
   const startRowPointerTrack = (rowIndex: number, ev: React.PointerEvent) => {
     if (ev.button !== 0 || readOnly || renaming) return
+    dragCleanupRef.current?.()
     const rowName = names[rowIndex]
     const startX = ev.clientX
     const startY = ev.clientY
+    const srcDir = view.path
     let dragging = false
     let dragTargets: string[] = []
 
-    const findPaneDeviceAt = (x: number, y: number): DeviceId | null => {
-      const el = document.elementFromPoint(x, y)?.closest<HTMLElement>('[data-pane-device]')
-      const dst = el?.dataset.paneDevice ?? null
-      return dst && dst !== device ? dst : null
+    const findPaneTargetAt = (x: number, y: number): { device: DeviceId; side: PaneSide } | null => {
+      const el = document.elementFromPoint(x, y)?.closest<HTMLElement>('[data-pane-side][data-pane-device]')
+      const dstDevice = el?.dataset.paneDevice
+      const dstSide = el?.dataset.paneSide as PaneSide | undefined
+      if (!dstDevice || !dstSide || dstSide === side) return null
+      return { device: dstDevice, side: dstSide }
+    }
+
+    const cleanup = () => {
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      window.removeEventListener('pointercancel', onCancel)
+      if (dragCleanupRef.current === cleanup) dragCleanupRef.current = null
     }
 
     const onMove = (me: PointerEvent) => {
@@ -114,36 +132,42 @@ export function FileList({ device, entries, readOnly }: Props) {
       const dy = me.clientY - startY
       if (!dragging && Math.hypot(dx, dy) >= 7) {
         dragging = true
-        const curSel = viewOf(act(), device).selected
+        const curSel = viewOf(act(), device, side).selected
         dragTargets = curSel.has(rowName) ? names.filter((n) => curSel.has(n)) : [rowName]
       }
       if (dragging) {
+        const hit = findPaneTargetAt(me.clientX, me.clientY)
         setPointerDrag({
           names: dragTargets,
           x: me.clientX,
           y: me.clientY,
-          targetDevice: findPaneDeviceAt(me.clientX, me.clientY),
+          targetDevice: hit?.device ?? null,
+          targetSide: hit?.side ?? null,
         })
       }
     }
 
     const onUp = (ue: PointerEvent) => {
-      window.removeEventListener('pointermove', onMove)
-      window.removeEventListener('pointerup', onUp)
-      window.removeEventListener('pointercancel', onUp)
+      cleanup()
       if (dragging) {
-        const dstDev = findPaneDeviceAt(ue.clientX, ue.clientY)
+        const hit = findPaneTargetAt(ue.clientX, ue.clientY)
         setPointerDrag(null)
-        if (dstDev && dragTargets.length) {
-          const dstPath = viewOf(act(), dstDev).path
-          void act().dropBetweenPanes(device, view.path, dragTargets, dstDev, dstPath)
+        if (hit && dragTargets.length) {
+          const dstPath = viewOf(act(), hit.device, hit.side).path
+          void act().dropBetweenPanes(device, srcDir, dragTargets, hit.device, dstPath)
         }
       }
     }
 
+    const onCancel = () => {
+      cleanup()
+      if (dragging) setPointerDrag(null)
+    }
+
+    dragCleanupRef.current = cleanup
     window.addEventListener('pointermove', onMove)
     window.addEventListener('pointerup', onUp)
-    window.addEventListener('pointercancel', onUp)
+    window.addEventListener('pointercancel', onCancel)
   }
 
   const onRowClick = (i: number, e: React.MouseEvent) => {
@@ -153,7 +177,7 @@ export function FileList({ device, entries, readOnly }: Props) {
       const next = new Set(view.selected)
       if (next.has(n)) next.delete(n)
       else next.add(n)
-      return act().select(device, next, n, n)
+      return act().select(device, next, n, n, side)
     }
     selectOnly(i)
   }
@@ -171,37 +195,82 @@ export function FileList({ device, entries, readOnly }: Props) {
       }
     }
     const dragOutToShell = async () => {
+      if (device !== SELF_ID) {
+        toast.info(
+          targets.length === 1
+            ? `正在拉取「${targets[0]}」准备拖出，请稍候…`
+            : `正在拉取 ${targets.length} 项文件准备拖出，请稍候…`,
+        )
+      }
       try {
-        await backend.fsDragOut(device, fullTargets)
+        const ok = await backend.fsDragOut(device, fullTargets)
+        if (ok) toast.success('已将文件拖出到目标位置')
+        else toast.info('已取消拖出')
       } catch (err) {
         toast.error(humanError(err))
       }
     }
+    const copyFullPath = async () => {
+      if (!one) return
+      try {
+        await navigator.clipboard.writeText(joinPath(view.path, one.name))
+        toast.success('已复制路径')
+      } catch {
+        toast.error('复制路径失败')
+      }
+    }
+    const openLabel = one?.dir ? '打开' : device === SELF_ID ? '打开' : '在对方电脑上打开'
     return [
-      { label: one?.dir ? '打开' : '在对方电脑上打开', icon: 'play', hint: 'Enter', disabled: !one || readOnly, onSelect: () => one && void act().openEntry(device, one) },
-      { label: '取回本机打开（保存可回传）', icon: 'pencil', disabled: !one || !!one.dir || readOnly || device === SELF_ID, onSelect: () => void openLocalEdit() },
-      { label: one?.dir ? '在新标签页打开' : '在新标签页浏览此目录', icon: 'plus', disabled: !one?.dir || readOnly, onSelect: () => one?.dir && act().newTab(device, `${view.path.replace(/\\$/, '')}\\${one.name}`) },
-      { label: '下载到本机…', icon: 'download', disabled: readOnly || device === SELF_ID, onSelect: () => void act().download(device, targets) },
-      { label: '拖出到系统桌面 / 外部…', icon: 'transfer', disabled: readOnly || !targets.length, onSelect: () => void dragOutToShell() },
+      {
+        label: openLabel,
+        icon: 'play',
+        hint: 'Enter',
+        disabled: !one || readOnly,
+        onSelect: () => one && void act().openEntry(device, one, side),
+      },
+      {
+        label: '取回本机打开（保存可回传）',
+        icon: 'pencil',
+        disabled: !one || !!one.dir || readOnly || device === SELF_ID,
+        onSelect: () => void openLocalEdit(),
+      },
+      {
+        label: one?.dir ? '在新标签页打开' : '在新标签页浏览此目录',
+        icon: 'plus',
+        disabled: !one?.dir || readOnly,
+        onSelect: () => one?.dir && act().newTab(device, joinPath(view.path, one.name), side),
+      },
+      {
+        label: '下载到本机…',
+        icon: 'download',
+        disabled: readOnly || device === SELF_ID,
+        onSelect: () => void act().download(device, targets, side),
+      },
+      {
+        label: '拖出到系统桌面 / 外部…',
+        icon: 'transfer',
+        disabled: readOnly || !targets.length,
+        onSelect: () => void dragOutToShell(),
+      },
       'sep',
-      { label: '复制', icon: 'copy', hint: 'Ctrl+C', disabled: readOnly, onSelect: () => act().copy(device, targets, false) },
-      { label: '剪切', icon: 'cut', hint: 'Ctrl+X', disabled: readOnly, onSelect: () => act().copy(device, targets, true) },
-      { label: '粘贴', icon: 'paste', hint: 'Ctrl+V', disabled: readOnly || !clipboard, onSelect: () => void act().paste(device) },
+      { label: '复制', icon: 'copy', hint: 'Ctrl+C', disabled: readOnly, onSelect: () => act().copy(device, targets, false, side) },
+      { label: '剪切', icon: 'cut', hint: 'Ctrl+X', disabled: readOnly, onSelect: () => act().copy(device, targets, true, side) },
+      { label: '粘贴', icon: 'paste', hint: 'Ctrl+V', disabled: readOnly || !clipboard, onSelect: () => void act().paste(device, side) },
       'sep',
-      { label: '重命名', icon: 'pencil', hint: 'F2', disabled: !one || readOnly, onSelect: () => one && act().startRename(device, one.name) },
-      { label: '复制路径', icon: 'clipboard', disabled: !one, onSelect: () => one && void navigator.clipboard.writeText(`${view.path.replace(/\\$/, '')}\\${one.name}`) },
+      { label: '重命名', icon: 'pencil', hint: 'F2', disabled: !one || readOnly, onSelect: () => one && act().startRename(device, one.name, side) },
+      { label: '复制路径', icon: 'clipboard', disabled: !one, onSelect: () => void copyFullPath() },
       'sep',
-      { label: '删除', icon: 'trash', hint: 'Delete', danger: true, disabled: readOnly, onSelect: () => void act().remove(device, targets, false) },
+      { label: '删除', icon: 'trash', hint: 'Delete', danger: true, disabled: readOnly, onSelect: () => void act().remove(device, targets, false, side) },
     ]
   }
 
   const blankMenu = (): MenuItem[] => [
-    { label: '新建文件夹', icon: 'folderPlus', hint: 'Ctrl+Shift+N', disabled: readOnly, onSelect: () => void act().newFolder(device) },
-    { label: '粘贴', icon: 'paste', hint: 'Ctrl+V', disabled: readOnly || !clipboard, onSelect: () => void act().paste(device) },
-    { label: '从本机上传文件…', icon: 'upload', disabled: readOnly || device === SELF_ID, onSelect: () => void act().upload(device) },
-    { label: '从本机上传文件夹…', icon: 'folder', disabled: readOnly || device === SELF_ID, onSelect: () => void act().uploadFolder(device) },
+    { label: '新建文件夹', icon: 'folderPlus', hint: 'Ctrl+Shift+N', disabled: readOnly, onSelect: () => void act().newFolder(device, side) },
+    { label: '粘贴', icon: 'paste', hint: 'Ctrl+V', disabled: readOnly || !clipboard, onSelect: () => void act().paste(device, side) },
+    { label: '从本机上传文件…', icon: 'upload', disabled: readOnly || device === SELF_ID, onSelect: () => void act().upload(device, side) },
+    { label: '从本机上传文件夹…', icon: 'folder', disabled: readOnly || device === SELF_ID, onSelect: () => void act().uploadFolder(device, side) },
     'sep',
-    { label: '刷新', icon: 'refresh', hint: 'F5', onSelect: () => act().refresh(device) },
+    { label: '刷新', icon: 'refresh', hint: 'F5', onSelect: () => act().refresh(device, side) },
   ]
 
   const onContextMenu = (e: React.MouseEvent, i: number | null) => {
@@ -233,17 +302,17 @@ export function FileList({ device, entries, readOnly }: Props) {
       const next = new Set(view.selected)
       if (next.has(names[cur])) next.delete(names[cur])
       else next.add(names[cur])
-      return act().select(device, next, names[cur], names[cur])
+      return act().select(device, next, names[cur], names[cur], side)
     }
-    if (k === 'Enter' && cur >= 0 && !readOnly) return handled(), void act().openEntry(device, entries[cur])
-    if (k === 'Escape' && view.selected.size) return handled(), act().select(device, new Set(), view.focus)
-    if (k === 'F2' && cur >= 0 && !readOnly) return handled(), act().startRename(device, names[cur])
-    if (k === 'Delete' && view.selected.size && !readOnly) return handled(), void act().remove(device, selectedNames(), e.shiftKey)
-    if (ctrl && k.toLowerCase() === 'a') return handled(), act().select(device, new Set(names), view.focus)
-    if (ctrl && k.toLowerCase() === 'c' && !readOnly) return handled(), act().copy(device, selectedNames(), false)
-    if (ctrl && k.toLowerCase() === 'x' && !readOnly) return handled(), act().copy(device, selectedNames(), true)
-    if (ctrl && k.toLowerCase() === 'v' && !readOnly) return handled(), void act().paste(device)
-    if (ctrl && e.shiftKey && k.toLowerCase() === 'n' && !readOnly) return handled(), void act().newFolder(device)
+    if (k === 'Enter' && cur >= 0 && !readOnly) return handled(), void act().openEntry(device, entries[cur], side)
+    if (k === 'Escape' && view.selected.size) return handled(), act().select(device, new Set(), view.focus, undefined, side)
+    if (k === 'F2' && cur >= 0 && !readOnly) return handled(), act().startRename(device, names[cur], side)
+    if (k === 'Delete' && view.selected.size && !readOnly) return handled(), void act().remove(device, selectedNames(), e.shiftKey, side)
+    if (ctrl && k.toLowerCase() === 'a') return handled(), act().select(device, new Set(names), view.focus, undefined, side)
+    if (ctrl && k.toLowerCase() === 'c' && !readOnly) return handled(), act().copy(device, selectedNames(), false, side)
+    if (ctrl && k.toLowerCase() === 'x' && !readOnly) return handled(), act().copy(device, selectedNames(), true, side)
+    if (ctrl && k.toLowerCase() === 'v' && !readOnly) return handled(), void act().paste(device, side)
+    if (ctrl && e.shiftKey && k.toLowerCase() === 'n' && !readOnly) return handled(), void act().newFolder(device, side)
     if (k === 'ContextMenu' || (e.shiftKey && k === 'F10')) {
       handled()
       const r = scrollRef.current!.getBoundingClientRect()
@@ -277,28 +346,7 @@ export function FileList({ device, entries, readOnly }: Props) {
   const activeId = focusIdx >= 0 ? `${listId}-${focusIdx}` : undefined
 
   return (
-    <div
-      onDragOver={(e) => {
-        if (!readOnly && e.dataTransfer.types.includes(INTERNAL_DRAG_MIME)) {
-          e.preventDefault()
-          setDragOver(true)
-        }
-      }}
-      onDragLeave={() => setDragOver(false)}
-      onDrop={(e) => {
-        setDragOver(false)
-        const raw = e.dataTransfer.getData(INTERNAL_DRAG_MIME)
-        if (!raw || readOnly) return
-        e.preventDefault()
-        try {
-          const parsed = JSON.parse(raw) as InternalDragPayload
-          void act().dropBetweenPanes(parsed.srcDevice, parsed.srcDir, parsed.names, device, view.path)
-        } catch {
-          // 忽略格式不匹配的拖放载荷
-        }
-      }}
-      className={`flex min-h-0 flex-1 flex-col ${readOnly ? 'opacity-60' : ''} ${dragOver ? 'ring-2 ring-accent/70 ring-inset' : ''}`}
-    >
+    <div className={`flex min-h-0 flex-1 flex-col ${readOnly ? 'opacity-60' : ''}`}>
       <div className={`${COLS} border-b border-line px-4 py-0.5 text-xs text-muted`}>
         {header('name', '名称')}
         {header('mtime', '修改时间')}
@@ -316,7 +364,7 @@ export function FileList({ device, entries, readOnly }: Props) {
         onKeyDown={onKeyDown}
         onContextMenu={(e) => onContextMenu(e, null)}
         onMouseDown={(e) => {
-          if (e.target === e.currentTarget) act().select(device, new Set(), null)
+          if (e.target === e.currentTarget) act().select(device, new Set(), null, undefined, side)
         }}
         className="scroll-thin relative min-h-0 flex-1 overflow-y-auto outline-none"
       >
@@ -334,28 +382,23 @@ export function FileList({ device, entries, readOnly }: Props) {
                 aria-selected={selected}
                 aria-posinset={row.index + 1}
                 aria-setsize={entries.length}
-                draggable={!readOnly && !renaming}
-                onDragStart={(ev) => {
-                  const targets = view.selected.has(e.name) ? selectedNames() : [e.name]
-                  const payload: InternalDragPayload = { srcDevice: device, srcDir: view.path, names: targets }
-                  ev.dataTransfer.setData(INTERNAL_DRAG_MIME, JSON.stringify(payload))
-                  ev.dataTransfer.effectAllowed = 'copy'
-                }}
                 onPointerDown={(ev) => startRowPointerTrack(row.index, ev)}
                 onMouseDown={(ev) => ev.button === 0 && onRowClick(row.index, ev)}
-                onDoubleClick={() => !readOnly && void act().openEntry(device, e)}
+                onDoubleClick={() => !readOnly && void act().openEntry(device, e, side)}
                 onContextMenu={(ev) => onContextMenu(ev, row.index)}
                 style={{ height: ROW, transform: `translateY(${row.start}px)` }}
                 className={`${COLS} absolute inset-x-0 top-0 mx-1 items-center rounded px-3 text-sm ${
                   selected ? 'bg-accent-soft' : 'hover:bg-hover'
-                } ${focused ? 'ring-1 ring-accent/60 ring-inset' : ''} ${clipboard?.cut && clipboard.device === device && clipboard.dir === view.path && clipboard.names.includes(e.name) ? 'opacity-50' : ''}`}
+                } ${focused ? 'ring-1 ring-accent/60 ring-inset' : ''} ${clipboard?.cut && keyOf(clipboard.device, clipboard.dir) === keyOf(device, view.path) && clipboard.names.includes(e.name) ? 'opacity-50' : ''}`}
               >
                 <span className="flex min-w-0 items-center gap-2">
                   <EntryIcon entry={e} />
                   {renaming === e.name ? (
                     <RenameInput
                       entry={e}
-                      onDone={(name) => (name == null ? act().cancelRename() : act().commitRename(device, e.name, name))}
+                      onDone={(name) =>
+                        name == null ? act().cancelRename() : act().commitRename(device, e.name, name, side)
+                      }
                     />
                   ) : (
                     <span className="truncate">{e.name}</span>
@@ -370,18 +413,22 @@ export function FileList({ device, entries, readOnly }: Props) {
         </div>
       </div>
 
-      {pointerDrag && (
-        <div
-          style={{ left: pointerDrag.x + 12, top: pointerDrag.y + 12 }}
-          className="pointer-events-none fixed z-50 flex items-center gap-2 rounded-lg border border-accent bg-panel px-3 py-1.5 text-xs shadow-lg"
-        >
-          <Icon name="transfer" size={14} className="text-accent" />
-          <span>
-            {pointerDrag.names.length === 1 ? pointerDrag.names[0] : `${pointerDrag.names.length} 项`}
-            {pointerDrag.targetDevice ? ` → 传到“${deviceName(pointerDrag.targetDevice)}”` : '（拖到另一栏松手即传）'}
-          </span>
-        </div>
-      )}
+      {pointerDrag &&
+        createPortal(
+          <div
+            style={{ left: pointerDrag.x + 12, top: pointerDrag.y + 12 }}
+            className="pointer-events-none fixed z-50 flex items-center gap-2 rounded-lg border border-accent bg-panel px-3 py-1.5 text-xs shadow-lg"
+          >
+            <Icon name="transfer" size={14} className="text-accent" />
+            <span>
+              {pointerDrag.names.length === 1 ? pointerDrag.names[0] : `${pointerDrag.names.length} 项`}
+              {pointerDrag.targetDevice
+                ? ` → 传到“${deviceName(pointerDrag.targetDevice)}”${pointerDrag.targetSide === 'right' ? '（右栏）' : '（左栏）'}`
+                : '（拖到另一栏松手即传）'}
+            </span>
+          </div>,
+          document.body,
+        )}
 
       <ContextMenu menu={menu} onClose={closeMenu} label="文件操作" />
     </div>

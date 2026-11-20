@@ -207,7 +207,7 @@ pub trait PtySession: Send + Sync {
 pub type PtyOpenResult = Result<
     (
         Box<dyn PtySession>,
-        tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+        tokio::sync::mpsc::Receiver<Vec<u8>>,
     ),
     PlatformError,
 >;

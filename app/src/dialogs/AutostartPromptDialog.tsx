@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { backend } from '../api'
 import { humanError } from '../api/errors'
 import type { Settings } from '../api/types'
@@ -12,6 +12,7 @@ import { toast } from '../store/toasts'
 export function AutostartPromptDialog() {
   const [pending, setPending] = useState<Settings | null>(null)
   const [busy, setBusy] = useState(false)
+  const busyRef = useRef(false)
 
   useEffect(() => {
     let alive = true
@@ -29,7 +30,8 @@ export function AutostartPromptDialog() {
   }, [])
 
   const choose = async (enableAutostart: boolean) => {
-    if (!pending) return
+    if (!pending || busyRef.current) return
+    busyRef.current = true
     setBusy(true)
     try {
       await backend.setSettings({
@@ -44,12 +46,21 @@ export function AutostartPromptDialog() {
     } catch (e) {
       toast.error(humanError(e))
     } finally {
+      busyRef.current = false
       setBusy(false)
     }
   }
 
   return (
-    <Modal open={!!pending} onClose={() => void choose(false)} title="需要开机后在后台待命吗？" width={460}>
+    <Modal
+      open={!!pending}
+      dismissible={!busy}
+      onClose={() => {
+        if (!busyRef.current) void choose(false)
+      }}
+      title="需要开机后在后台待命吗？"
+      width={460}
+    >
       <div className="flex flex-col gap-4 text-sm">
         <p className="leading-relaxed text-muted">
           开启后，电脑登录系统时会在右下角托盘静默运行（不弹窗口、不启动浏览器内核，后台内存低于 50 MB），方便你随时从另一台已配对的电脑连过来取文件。

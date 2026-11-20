@@ -1,6 +1,5 @@
 //! 文件搜索服务（任务 3.9：被控端遍历、边搜边回、可中途取消）。
 
-use std::collections::VecDeque;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,7 +28,7 @@ impl FsService {
         perms: &Permissions,
         args: FsSearchArgs,
         send: &mut SendStream,
-    ) -> Result<(), CoreError> {
+    ) -> Result<bool, CoreError> {
         if !perms.fs_read {
             write_frame(
                 send,
@@ -39,14 +38,14 @@ impl FsService {
                 ),
             )
             .await?;
-            return Ok(());
+            return Ok(false);
         }
 
         let (root_clean, _root_fs) = match resolve_authorized_path(&args.path, perms) {
             Ok(p) => p,
             Err(rpc_err) => {
                 write_frame(send, &ResponseEnvelope::<FsSearchBatch>::Err(rpc_err)).await?;
-                return Ok(());
+                return Ok(false);
             }
         };
 
@@ -61,7 +60,7 @@ impl FsService {
                 }),
             )
             .await?;
-            return Ok(());
+            return Ok(true);
         }
 
         let max_results = args.max_results.unwrap_or(DEFAULT_MAX_RESULTS).clamp(1, 5000);
@@ -95,7 +94,7 @@ impl FsService {
             }
         }
         cancel.cancel();
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -106,22 +105,39 @@ pub(crate) fn run_search_traversal(
     cancel: CancellationToken,
     tx: mpsc::Sender<FsSearchBatch>,
 ) {
-    let mut queue = VecDeque::new();
-    queue.push_back(root_clean);
+    // 改用深度优先栈避免宽深目录树 BFS 队列内存积压
+    let mut stack = Vec::with_capacity(64);
+    stack.push(root_clean);
     let mut scanned_dirs = 0u64;
+    let mut last_reported_dirs = 0u64;
     let mut total_found = 0usize;
     let mut pending = Vec::with_capacity(SEARCH_BATCH_SIZE);
     let mut last_flush = Instant::now();
+    const PROGRESS_REPORT_INTERVAL: Duration = Duration::from_millis(250);
 
-    while let Some(dir_clean) = queue.pop_front() {
+    while let Some(dir_clean) = stack.pop() {
         if cancel.is_cancelled() || total_found >= max_results {
             break;
         }
         scanned_dirs += 1;
         let Ok(rd) = fs::read_dir(to_fs_path(&dir_clean)) else {
+            if last_flush.elapsed() >= PROGRESS_REPORT_INTERVAL && scanned_dirs > last_reported_dirs
+            {
+                let batch = FsSearchBatch {
+                    entries: std::mem::take(&mut pending),
+                    scanned_dirs,
+                    done: false,
+                };
+                if tx.blocking_send(batch).is_err() {
+                    return;
+                }
+                last_reported_dirs = scanned_dirs;
+                last_flush = Instant::now();
+            }
             continue;
         };
 
+        let mut child_dirs = Vec::new();
         for item in rd.flatten() {
             if cancel.is_cancelled() || total_found >= max_results {
                 break;
@@ -132,7 +148,7 @@ pub(crate) fn run_search_traversal(
             };
             let entry_clean = dir_clean.join(&name);
             if ft.is_dir() && !ft.is_symlink() {
-                queue.push_back(entry_clean.clone());
+                child_dirs.push(entry_clean.clone());
             }
 
             if match_rank(&name, &query).is_some() {
@@ -148,10 +164,20 @@ pub(crate) fn run_search_traversal(
                     name,
                     path: to_display_path(&entry_clean),
                     kind,
-                    size: meta_opt.as_ref().map_or(0, |m| if kind == EntryKind::File { m.len() } else { 0 }),
-                    modified_ms: meta_opt.as_ref().and_then(|m| m.modified().ok()).and_then(system_time_to_ms),
-                    created_ms: meta_opt.as_ref().and_then(|m| m.created().ok()).and_then(system_time_to_ms),
-                    readonly: meta_opt.as_ref().is_some_and(|m| m.permissions().readonly()),
+                    size: meta_opt
+                        .as_ref()
+                        .map_or(0, |m| if kind == EntryKind::File { m.len() } else { 0 }),
+                    modified_ms: meta_opt
+                        .as_ref()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(system_time_to_ms),
+                    created_ms: meta_opt
+                        .as_ref()
+                        .and_then(|m| m.created().ok())
+                        .and_then(system_time_to_ms),
+                    readonly: meta_opt
+                        .as_ref()
+                        .is_some_and(|m| m.permissions().readonly()),
                 });
                 total_found += 1;
 
@@ -166,9 +192,30 @@ pub(crate) fn run_search_traversal(
                     if tx.blocking_send(batch).is_err() {
                         return;
                     }
+                    last_reported_dirs = scanned_dirs;
                     last_flush = Instant::now();
                 }
             }
+        }
+        // 逆序压栈以保持按读目录顺序优先遍历前序子目录
+        for sub in child_dirs.into_iter().rev() {
+            stack.push(sub);
+        }
+
+        // 无命中期间也定期回报扫描进度，避免前端长时间停在 0
+        if last_flush.elapsed() >= PROGRESS_REPORT_INTERVAL
+            && (!pending.is_empty() || scanned_dirs > last_reported_dirs)
+        {
+            let batch = FsSearchBatch {
+                entries: std::mem::take(&mut pending),
+                scanned_dirs,
+                done: false,
+            };
+            if tx.blocking_send(batch).is_err() {
+                return;
+            }
+            last_reported_dirs = scanned_dirs;
+            last_flush = Instant::now();
         }
     }
 

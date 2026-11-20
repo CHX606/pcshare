@@ -22,17 +22,20 @@ export function Toolbar({ label, className = '', children, ...rest }: ToolbarPro
         (el) => !el.hasAttribute('disabled'),
       )
 
-    const initRoving = () => {
+    const syncRoving = () => {
       const items = getItems()
       if (!items.length) return
-      const hasZero = items.some((el) => el.tabIndex === 0)
-      if (!hasZero) {
-        items.forEach((el, i) => {
-          el.tabIndex = i === 0 ? 0 : -1
-        })
-      }
+      const active = document.activeElement as HTMLElement | null
+      const zeroItems = items.filter((el) => el.tabIndex === 0)
+      // 只有恰好 1 个可聚焦停靠点时才无需调整；原生 button/select 默认全为 0，必须收敛为单一停靠点
+      if (zeroItems.length === 1) return
+      const keep = (active && items.includes(active) ? active : zeroItems[0]) ?? items[0]
+      items.forEach((el) => {
+        el.tabIndex = el === keep ? 0 : -1
+      })
     }
-    initRoving()
+
+    syncRoving()
 
     const onFocusIn = (e: FocusEvent) => {
       const target = e.target as HTMLElement | null
@@ -72,13 +75,22 @@ export function Toolbar({ label, className = '', children, ...rest }: ToolbarPro
       }
     }
 
+    const obs = new MutationObserver(syncRoving)
+    obs.observe(bar, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['disabled'],
+    })
+
     bar.addEventListener('focusin', onFocusIn)
     bar.addEventListener('keydown', onKeyDown)
     return () => {
+      obs.disconnect()
       bar.removeEventListener('focusin', onFocusIn)
       bar.removeEventListener('keydown', onKeyDown)
     }
-  }, [children])
+  }, [])
 
   return (
     <div

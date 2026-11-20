@@ -11,7 +11,7 @@ struct RpcStream<'a> {
     peer: &'a str,
     record: &'a PeerRecord,
     send: &'a mut SendStream,
-    recv: &'a mut RecvStream,
+    recv: Option<RecvStream>,
 }
 impl RpcStream<'_> {
     fn audit(&self, action: &str, detail: &str, ok: bool) {
@@ -32,6 +32,10 @@ impl CoreNode {
             let err = RpcError::new(ErrorCode::Unauthorized, "设备配对已解除");
             return reject(&mut send, err).await;
         };
+        if !peer_rec.allow_incoming {
+            let err = RpcError::new(ErrorCode::Unauthorized, "对方已关闭允许此设备入站控制");
+            return reject(&mut send, err).await;
+        }
 
         let env: RequestEnvelope = read_frame(&mut recv).await?;
         if matches!(
@@ -49,7 +53,7 @@ impl CoreNode {
             peer: peer_id,
             record: &peer_rec,
             send: &mut send,
-            recv: &mut recv,
+            recv: Some(recv),
         };
         stream.dispatch_system(cmd).await?;
         let _ = send.finish();

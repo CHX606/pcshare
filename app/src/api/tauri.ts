@@ -59,6 +59,7 @@ export function createTauriBackend(): Backend {
     pairConnect: (target, code) => call('pair_connect', { target, code }),
     pairRespond: (requestId, allow, permissions) =>
       call('pair_respond', { requestId, allow, permissions }),
+    pairPendingList: () => call('pair_pending_list'),
 
     fsRoots: (device) => call('fs_roots', { device }),
     fsCacheGet: (device, path) => call('fs_cache_get', { device, path }),
@@ -78,12 +79,13 @@ export function createTauriBackend(): Backend {
     pauseTask: (taskId) => call('task_pause', { taskId }),
     resumeTask: (taskId) => call('task_resume', { taskId }),
     cancelTask: (taskId) => call('task_cancel', { taskId }),
+    taskList: () => call('task_list'),
     getSpeedLimit: () => call('transfer_get_speed_limit'),
     setSpeedLimit: (bytesPerSec) => call('transfer_set_speed_limit', { bytesPerSec }),
     pickLocalFiles: () => call('pick_local_files'),
     pickLocalDir: () => call('pick_local_dir'),
 
-    appList: (device) => call('app_list', { device }),
+    appList: (device, force = false) => call('app_list', { device, force: Boolean(force) }),
     appIcon: (device, appId) => call('app_icon', { device, appId }),
     appLaunch: (device, target, args) => call('app_launch', { device, target, args: args ?? null }),
     procList: (device) => call('proc_list', { device }),
@@ -105,6 +107,7 @@ export function createTauriBackend(): Backend {
       call('fs_open_local_edit', { device, path, launchApp }),
     fsEditSyncBack: (sessionId, autoSync, forceOverwrite) =>
       call('fs_edit_sync_back', { sessionId, autoSync, forceOverwrite }),
+    editPendingList: () => call('edit_pending_list'),
     fsDragOut: (device, paths) => call('fs_drag_out', { device, paths }),
 
     shotMonitors: (device) => call('shot_monitors', { device }),

@@ -302,10 +302,10 @@ impl CoreNode {
                 let res = run_single_batch_item(&node, &pid, cmd).await;
                 let elapsed_ms = started.elapsed().as_millis() as u64;
                 let item = match res {
-                    Ok((summary, output)) => BatchDeviceResult {
+                    Ok((ok, summary, output)) => BatchDeviceResult {
                         peer_id: pid,
                         peer_name,
-                        ok: true,
+                        ok,
                         summary,
                         output,
                         elapsed_ms,
@@ -341,7 +341,7 @@ async fn run_single_batch_item(
     node: &Arc<CoreNode>,
     peer_id: &str,
     cmd: BatchCommand,
-) -> Result<(String, Option<String>), CoreError> {
+) -> Result<(bool, String, Option<String>), CoreError> {
     match cmd {
         BatchCommand::LaunchApp { target, kind, args } => {
             let req = AppLaunchArgs {
@@ -355,7 +355,7 @@ async fn run_single_batch_item(
             } else {
                 node.remote_launch(peer_id, req).await?;
             }
-            Ok((format!("已发送打开指令：{target}"), None))
+            Ok((true, format!("已发送打开指令：{target}"), None))
         }
         BatchCommand::Power {
             action,
@@ -373,9 +373,14 @@ async fn run_single_batch_item(
                 )
                 .await?;
             if reply.cancelled_by_host_user {
-                Ok(("对方屏幕前用户取消了本次电源操作".to_string(), None))
+                Ok((
+                    true,
+                    "对方屏幕前用户取消了本次电源操作".to_string(),
+                    None,
+                ))
             } else {
                 Ok((
+                    true,
                     reply.message.unwrap_or_else(|| "电源指令已执行".to_string()),
                     None,
                 ))
@@ -398,26 +403,63 @@ async fn run_single_batch_item(
                 node.open_remote_terminal(peer_id, open_args).await?
             };
 
-            let script = format!("{command}\r\nexit\r\n");
+            let script = match shell {
+                TermShell::PowerShell => format!(
+                    "$global:LASTEXITCODE = 0\r\n{command}\r\n$__pcshare_ok = $?\r\n$__pcshare_ec = $LASTEXITCODE\r\nif (-not $__pcshare_ok -and $__pcshare_ec -eq 0) {{ $__pcshare_ec = 1 }}\r\nexit $__pcshare_ec\r\n"
+                ),
+                TermShell::Cmd => format!("{command}\r\nexit %ERRORLEVEL%\r\n"),
+            };
             term.send_input(script.as_bytes()).await?;
 
             let mut buf = Vec::new();
-            let deadline = Instant::now() + Duration::from_secs(timeout_secs.clamp(2, 120));
-            while Instant::now() < deadline {
-                match tokio::time::timeout(Duration::from_millis(300), term.output_rx.recv()).await
-                {
+            let effective_timeout = timeout_secs.clamp(2, 120);
+            let deadline = Instant::now() + Duration::from_secs(effective_timeout);
+            let mut exited = false;
+            let mut exit_code: Option<i32> = None;
+
+            while let Some(rem) = deadline.checked_duration_since(Instant::now()) {
+                if rem.is_zero() {
+                    break;
+                }
+                let step = rem.min(Duration::from_millis(300));
+                match tokio::time::timeout(step, term.output_rx.recv()).await {
                     Ok(Some(TerminalStreamEvent::Output(chunk))) => {
                         if buf.len() < 32 * 1024 {
-                            buf.extend_from_slice(&chunk);
+                            let take = (32 * 1024 - buf.len()).min(chunk.len());
+                            buf.extend_from_slice(&chunk[..take]);
                         }
                     }
-                    Ok(Some(TerminalStreamEvent::Exited(_))) | Ok(None) => break,
+                    Ok(Some(TerminalStreamEvent::Exited(code))) => {
+                        exited = true;
+                        exit_code = code;
+                        break;
+                    }
+                    Ok(None) => {
+                        exited = true;
+                        break;
+                    }
                     Err(_) => {}
                 }
             }
             let _ = term.close().await;
             let text = strip_ansi_escapes(&String::from_utf8_lossy(&buf));
-            Ok(("命令执行完成".to_string(), Some(text)))
+            if !exited {
+                return Ok((
+                    false,
+                    format!("命令执行超时（超过 {effective_timeout} 秒）"),
+                    Some(text),
+                ));
+            }
+            if let Some(code) = exit_code
+                && code != 0
+            {
+                return Ok((
+                    false,
+                    format!("命令执行失败（退出码 {code}）"),
+                    Some(text),
+                ));
+            }
+            Ok((true, "命令执行完成".to_string(), Some(text)))
         }
     }
 }

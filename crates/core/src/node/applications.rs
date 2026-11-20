@@ -84,13 +84,13 @@ impl CoreNode {
     }
 
     fn disconnect_for_retry(&self, peer_id: &str) {
-        if let Some(cancel) = self
+        if let Some(entry) = self
             .peer_workers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(peer_id)
         {
-            cancel.cancel();
+            entry.cancel.cancel();
         }
         if let Some(conn) = self
             .active_conns

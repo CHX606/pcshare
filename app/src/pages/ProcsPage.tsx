@@ -17,12 +17,14 @@ export function ProcsPage({ device }: { device: DeviceId }) {
   const [sort, setSort] = useState<{ key: Key; asc: boolean }>({ key: 'memory', asc: false })
   const [filter, setFilter] = useState('')
 
-  // 页面可见且设备在线时，每 3 秒刷新一次（第 2 阶段改为对方主动推送）
+  // 页面可见且设备在线时，每 3 秒刷新一次；若上一次请求仍在途中则跳过避免堆积
   useEffect(() => {
     if (!online) return
     void loadProcs(device)
     const t = window.setInterval(() => {
-      if (document.visibilityState === 'visible') void loadProcs(device)
+      if (document.visibilityState !== 'visible') return
+      if (useRemote.getState().procs[device]?.loading) return
+      void loadProcs(device)
     }, REFRESH_MS)
     return () => window.clearInterval(t)
   }, [device, online, loadProcs])

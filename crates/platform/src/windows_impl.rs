@@ -1,13 +1,15 @@
-use std::collections::HashMap;
-use std::ffi::{OsStr, c_void};
-use std::os::windows::ffi::OsStrExt;
+use std::collections::{HashMap, VecDeque};
+use std::ffi::c_void;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::{Semaphore, watch};
 use windows::Win32::Foundation::{
-    CloseHandle, FILETIME, HANDLE, HLOCAL, HWND, LPARAM, LocalFree, SIZE,
+    ERROR_ACCESS_DENIED, ERROR_GEN_FAILURE, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER,
+    FILETIME, HANDLE, HLOCAL, HWND, LPARAM, LocalFree, SIZE,
 };
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC,
@@ -16,16 +18,10 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::Security::Cryptography::{
     CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
 };
-use windows::Win32::Security::{
-    GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
-};
 use windows::Win32::Storage::FileSystem::{
-    GetDiskFreeSpaceExW, GetLogicalDrives, GetVolumeInformationW,
+    GetDiskFreeSpaceExW, GetLogicalDrives, GetShortPathNameW, GetVolumeInformationW,
 };
-use windows::Win32::System::Com::{
-    CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoCreateInstance,
-    CoInitializeEx, CoTaskMemFree, CoUninitialize, IBindCtx,
-};
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, IBindCtx};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
@@ -33,31 +29,32 @@ use windows::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEM
 use windows::Win32::System::RemoteDesktop::{
     ProcessIdToSessionId, WTSGetActiveConsoleSessionId,
 };
-use windows::Win32::System::StationsAndDesktops::{
-    CloseDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS, GetUserObjectInformationW,
-    OpenInputDesktop, UOI_NAME,
-};
 use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentProcessId, GetProcessTimes, GetSystemTimes, OpenProcess,
-    OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, TerminateProcess,
+    GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess, GetProcessTimes, GetSystemTimes,
+    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    QueryFullProcessImageNameW, TerminateProcess,
 };
 use windows::Win32::UI::Shell::{
-    BHID_EnumItems, FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT,
-    FOLDERID_AppsFolder, FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads,
-    FOLDERID_Profile, FOS_ALLOWMULTISELECT, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM,
-    FOS_PICKFOLDERS, FileOpenDialog, IEnumShellItems, IFileOpenDialog, IShellItem,
-    IShellItemImageFactory, KF_FLAG_DEFAULT, SHCreateItemFromParsingName, SHFILEOPSTRUCTW,
-    SHFileOperationW, SHGetKnownFolderItem, SHGetKnownFolderPath, SIGDN_FILESYSPATH,
-    SIGDN_NORMALDISPLAY, SIGDN_PARENTRELATIVEPARSING, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
-    ShellExecuteW,
+    BHID_EnumItems, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT,
+    FOFX_ADDUNDORECORD, FOFX_RECYCLEONDELETE, FOLDERID_AppsFolder, FOLDERID_Desktop,
+    FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_Profile, FOS_ALLOWMULTISELECT,
+    FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, FileOpenDialog, FileOperation,
+    IEnumShellItems, IFileOpenDialog, IFileOperation, IFileOperationProgressSink, IShellItem,
+    IShellItemImageFactory, KF_FLAG_DEFAULT, SHCreateItemFromParsingName, SHGetKnownFolderItem,
+    SHGetKnownFolderPath, SIGDN_FILESYSPATH, SIGDN_NORMALDISPLAY, SIGDN_PARENTRELATIVEPARSING,
+    SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
     SW_SHOWNORMAL,
 };
-use windows::core::{BOOL, GUID, PCWSTR};
+use windows::core::{BOOL, GUID, PCWSTR, PWSTR};
 
+use crate::win_util::{
+    ComGuard, OwnedHandle, current_input_desktop, is_elevated, is_win32_error,
+    pwstr_to_string_and_free, strip_verbatim_prefix, to_verbatim_path, wide_null, zeroize_bytes,
+};
 use crate::{
     AutostartState, BoxFuture, CapturableWindowInfo, CapturedImage, ClipboardData,
     DesktopEnvironment, DriveInfo, InputOutcome, InstalledAppInfo, Platform, PlatformError,
@@ -67,7 +64,10 @@ use crate::{
 };
 
 const APP_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const MAX_ICON_CACHE_ENTRIES: usize = 512;
+const MAX_CONCURRENT_ICON_WORKERS: usize = 4;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const STILL_ACTIVE_CODE: u32 = 259;
 const RUN_REG_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_REG_VALUE: &str = "PcShare";
 const SCHTASK_NAME: &str = "PcShareAutostart";
@@ -77,9 +77,71 @@ struct CpuSample {
     proc_times_100ns: HashMap<u32, u64>,
 }
 
+/// 有上限的图标内存缓存（不缓存瞬态 `None`，超过上限按 FIFO 淘汰最旧条目）。
+#[derive(Default)]
+struct IconCache {
+    entries: HashMap<String, Vec<u8>>,
+    order: VecDeque<String>,
+}
+
+impl IconCache {
+    fn get(&self, id: &str) -> Option<Vec<u8>> {
+        self.entries.get(id).cloned()
+    }
+
+    fn insert(&mut self, id: String, png: Vec<u8>) {
+        if let Some(existing) = self.entries.get_mut(&id) {
+            *existing = png;
+            return;
+        }
+        while self.entries.len() >= MAX_ICON_CACHE_ENTRIES {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+        self.order.push_back(id.clone());
+        self.entries.insert(id, png);
+    }
+}
+
+type IconInflightMap = HashMap<String, watch::Receiver<Option<Option<Vec<u8>>>>>;
+
+struct IconInflightGuard {
+    map: Arc<Mutex<IconInflightMap>>,
+    id: String,
+    tx: Option<watch::Sender<Option<Option<Vec<u8>>>>>,
+}
+
+impl IconInflightGuard {
+    fn complete(mut self, result: Option<Vec<u8>>) {
+        self.map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(Some(result));
+        }
+    }
+}
+
+impl Drop for IconInflightGuard {
+    fn drop(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            self.map
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.id);
+            let _ = tx.send(Some(None));
+        }
+    }
+}
+
 pub struct WindowsPlatform {
     apps_cache: tokio::sync::Mutex<Option<(Instant, u64, Vec<InstalledAppInfo>)>>,
-    icons_cache: Mutex<HashMap<String, Option<Vec<u8>>>>,
+    icons_cache: Mutex<IconCache>,
+    icon_inflight: Arc<Mutex<IconInflightMap>>,
+    icon_sem: Arc<Semaphore>,
     cpu_sample: Mutex<Option<CpuSample>>,
     hotkey_ctrl: win_sys_pty::HotkeyController,
 }
@@ -94,33 +156,24 @@ impl WindowsPlatform {
     pub fn new() -> Self {
         Self {
             apps_cache: tokio::sync::Mutex::new(None),
-            icons_cache: Mutex::new(HashMap::new()),
+            icons_cache: Mutex::new(IconCache::default()),
+            icon_inflight: Arc::new(Mutex::new(HashMap::new())),
+            icon_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_ICON_WORKERS)),
             cpu_sample: Mutex::new(None),
             hotkey_ctrl: win_sys_pty::HotkeyController::default(),
         }
     }
 }
 
-fn wide_null(s: &str) -> Vec<u16> {
-    OsStr::new(s)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect()
-}
-
-fn strip_verbatim_prefix(path: &Path) -> String {
-    let text = path.to_string_lossy();
-    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{rest}")
-    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
-        rest.to_string()
-    } else {
-        text.into_owned()
-    }
-}
-
 fn filetime_to_u64(ft: FILETIME) -> u64 {
     ((ft.dwHighDateTime as u64) << 32) | (ft.dwLowDateTime as u64)
+}
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn is_critical_process_name(pid: u32, name: &str, self_pid: u32) -> bool {
@@ -141,46 +194,6 @@ fn is_critical_process_name(pid: u32, name: &str, self_pid: u32) -> bool {
             | "fontdrvhost.exe"
             | "memory compression"
     )
-}
-
-fn is_elevated() -> bool {
-    unsafe {
-        let mut token = Default::default();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
-            return false;
-        }
-        let mut elevation = TOKEN_ELEVATION::default();
-        let mut ret_len = 0u32;
-        let res = GetTokenInformation(
-            token,
-            TokenElevation,
-            Some(&mut elevation as *mut TOKEN_ELEVATION as *mut c_void),
-            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
-            &mut ret_len,
-        );
-        let _ = CloseHandle(token);
-        res.is_ok() && elevation.TokenIsElevated != 0
-    }
-}
-
-fn current_input_desktop() -> Option<String> {
-    unsafe {
-        let desktop =
-            OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS).ok()?;
-        let mut buf = [0u16; 256];
-        let mut needed = 0u32;
-        let ok = GetUserObjectInformationW(
-            HANDLE(desktop.0),
-            UOI_NAME,
-            Some(buf.as_mut_ptr() as *mut c_void),
-            std::mem::size_of_val(&buf) as u32,
-            Some(&mut needed),
-        );
-        let _ = CloseDesktop(desktop);
-        ok.ok()?;
-        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-        Some(String::from_utf16_lossy(&buf[..len]))
-    }
 }
 
 unsafe extern "system" fn collect_visible_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
@@ -212,14 +225,12 @@ unsafe extern "system" fn collect_visible_window(hwnd: HWND, lparam: LPARAM) -> 
 fn known_folder_path(folder_id: &GUID) -> Option<PathBuf> {
     unsafe {
         let pwstr = SHGetKnownFolderPath(folder_id, KF_FLAG_DEFAULT, None).ok()?;
-        let mut len = 0usize;
-        while *pwstr.0.add(len) != 0 {
-            len += 1;
+        let path_str = pwstr_to_string_and_free(pwstr);
+        if path_str.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(path_str))
         }
-        let slice = std::slice::from_raw_parts(pwstr.0, len);
-        let path_str = String::from_utf16_lossy(slice);
-        CoTaskMemFree(Some(pwstr.0 as *const c_void));
-        Some(PathBuf::from(path_str))
     }
 }
 
@@ -231,7 +242,7 @@ fn shell_execute_blocking(target: String, args: Option<String>) -> Result<(), Pl
         .as_ref()
         .map_or(PCWSTR::null(), |p| PCWSTR(p.as_ptr()));
 
-    let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
+    let _com = ComGuard::init_sta();
     let instance = unsafe {
         ShellExecuteW(
             None,
@@ -242,9 +253,6 @@ fn shell_execute_blocking(target: String, args: Option<String>) -> Result<(), Pl
             SW_SHOWNORMAL,
         )
     };
-    if hr.is_ok() {
-        unsafe { CoUninitialize() };
-    }
 
     let code = instance.0 as isize;
     if code > 32 {
@@ -260,7 +268,9 @@ fn shell_execute_blocking(target: String, args: Option<String>) -> Result<(), Pl
         5 => Err(PlatformError::ElevationRequired(
             "打开该程序需要管理员权限，或系统拒绝访问".to_string(),
         )),
-        8 => Err(PlatformError::System("对方电脑内存不足，无法启动程序".to_string())),
+        8 => Err(PlatformError::System(
+            "对方电脑内存不足，无法启动程序".to_string(),
+        )),
         26 | 28 | 29 | 30 => Err(PlatformError::Busy("系统正忙，暂时打不开".to_string())),
         27 | 31 => Err(PlatformError::InvalidInput(
             "这种文件在对方电脑上没有关联的打开方式".to_string(),
@@ -287,14 +297,17 @@ fn system_and_proc_times() -> (u64, HashMap<u32, (String, u64, u64)>) {
 
     let mut procs = HashMap::new();
     unsafe {
-        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+        let Ok(snapshot_raw) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return (sys_total, procs);
+        };
+        let Some(snapshot) = OwnedHandle::new(snapshot_raw) else {
             return (sys_total, procs);
         };
         let mut entry = PROCESSENTRY32W {
             dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
             ..Default::default()
         };
-        if Process32FirstW(snapshot, &mut entry).is_ok() {
+        if Process32FirstW(snapshot.raw(), &mut entry).is_ok() {
             loop {
                 let pid = entry.th32ProcessID;
                 let name_len = entry
@@ -307,14 +320,15 @@ fn system_and_proc_times() -> (u64, HashMap<u32, (String, u64, u64)>) {
                 let mut mem_bytes = 0u64;
                 let mut proc_time = 0u64;
                 if pid > 0
-                    && let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+                    && let Ok(handle_raw) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+                    && let Some(handle) = OwnedHandle::new(handle_raw)
                 {
                     let mut pmc = PROCESS_MEMORY_COUNTERS {
                         cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
                         ..Default::default()
                     };
                     if K32GetProcessMemoryInfo(
-                        handle,
+                        handle.raw(),
                         &mut pmc,
                         std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
                     )
@@ -327,80 +341,113 @@ fn system_and_proc_times() -> (u64, HashMap<u32, (String, u64, u64)>) {
                     let mut exit = FILETIME::default();
                     let mut ktime = FILETIME::default();
                     let mut utime = FILETIME::default();
-                    if GetProcessTimes(handle, &mut create, &mut exit, &mut ktime, &mut utime)
-                        .is_ok()
+                    if GetProcessTimes(
+                        handle.raw(),
+                        &mut create,
+                        &mut exit,
+                        &mut ktime,
+                        &mut utime,
+                    )
+                    .is_ok()
                     {
                         proc_time = filetime_to_u64(ktime).saturating_add(filetime_to_u64(utime));
                     }
-                    let _ = CloseHandle(handle);
                 }
                 procs.insert(pid, (name, mem_bytes, proc_time));
 
-                if Process32NextW(snapshot, &mut entry).is_err() {
+                if Process32NextW(snapshot.raw(), &mut entry).is_err() {
                     break;
                 }
             }
         }
-        let _ = CloseHandle(snapshot);
     }
     (sys_total, procs)
 }
 
-fn enumerate_start_apps_native_sta() -> Result<Vec<InstalledAppInfo>, PlatformError> {
-    unsafe {
-        let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-        let need_uninit = hr.is_ok();
-        let res = (|| -> Result<Vec<InstalledAppInfo>, PlatformError> {
-            let folder: IShellItem =
-                SHGetKnownFolderItem(&FOLDERID_AppsFolder, KF_FLAG_DEFAULT, None)
-                    .map_err(|e| PlatformError::System(format!("无法打开系统应用程序目录：{e}")))?;
-            let enumerator: IEnumShellItems = folder
-                .BindToHandler(None::<&IBindCtx>, &BHID_EnumItems)
-                .map_err(|e| PlatformError::System(format!("无法枚举已安装软件：{e}")))?;
+/// 在同一进程句柄上通过 `QueryFullProcessImageNameW` 查询可执行文件名，消除 PID 复用 TOCTOU。
+fn query_process_exe_name(handle: HANDLE, pid: u32) -> Result<String, PlatformError> {
+    let mut cap = 512usize;
+    loop {
+        let mut buf = vec![0u16; cap];
+        let mut len = buf.len() as u32;
+        match unsafe {
+            QueryFullProcessImageNameW(
+                handle,
+                PROCESS_NAME_WIN32,
+                PWSTR(buf.as_mut_ptr()),
+                &mut len,
+            )
+        } {
+            Ok(()) => {
+                let full = String::from_utf16_lossy(&buf[..len as usize]);
+                let name = full
+                    .rsplit(['\\', '/'])
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(&full)
+                    .to_string();
+                return Ok(name);
+            }
+            Err(err) if is_win32_error(&err, ERROR_INSUFFICIENT_BUFFER) && cap < 4096 => {
+                cap *= 2;
+            }
+            Err(err) if is_win32_error(&err, ERROR_GEN_FAILURE) => {
+                return Err(PlatformError::NotFound(format!(
+                    "找不到进程（PID {pid}），它可能已经退出"
+                )));
+            }
+            Err(err) => {
+                return Err(PlatformError::System(format!(
+                    "查询目标进程名称失败：{err}"
+                )));
+            }
+        }
+    }
+}
 
-            let mut seen = std::collections::HashSet::new();
-            let mut apps = Vec::with_capacity(256);
-            loop {
-                let mut batch: [Option<IShellItem>; 32] = Default::default();
-                let mut fetched = 0u32;
-                let _ = enumerator.Next(&mut batch, Some(&mut fetched));
-                if fetched == 0 {
-                    break;
-                }
-                for item in batch.into_iter().take(fetched as usize).flatten() {
-                    let name_pw = item.GetDisplayName(SIGDN_NORMALDISPLAY);
-                    let id_pw = item.GetDisplayName(SIGDN_PARENTRELATIVEPARSING);
-                    let name = if let Ok(pw) = name_pw {
-                        let s = pw.to_string().unwrap_or_default();
-                        CoTaskMemFree(Some(pw.0 as *const c_void));
-                        s
-                    } else {
-                        String::new()
-                    };
-                    let app_id = if let Ok(pw) = id_pw {
-                        let s = pw.to_string().unwrap_or_default();
-                        CoTaskMemFree(Some(pw.0 as *const c_void));
-                        s
-                    } else {
-                        String::new()
-                    };
-                    let name_trim = name.trim();
-                    let id_trim = app_id.trim();
-                    if !name_trim.is_empty() && !id_trim.is_empty() && seen.insert(id_trim.to_string()) {
-                        apps.push(InstalledAppInfo {
-                            name: name_trim.to_string(),
-                            app_id: id_trim.to_string(),
-                        });
-                    }
+fn enumerate_start_apps_native_sta() -> Result<Vec<InstalledAppInfo>, PlatformError> {
+    let _com = ComGuard::init_sta();
+    unsafe {
+        let folder: IShellItem =
+            SHGetKnownFolderItem(&FOLDERID_AppsFolder, KF_FLAG_DEFAULT, None)
+                .map_err(|e| PlatformError::System(format!("无法打开系统应用程序目录：{e}")))?;
+        let enumerator: IEnumShellItems = folder
+            .BindToHandler(None::<&IBindCtx>, &BHID_EnumItems)
+            .map_err(|e| PlatformError::System(format!("无法枚举已安装软件：{e}")))?;
+
+        let mut seen = std::collections::HashSet::new();
+        let mut apps = Vec::with_capacity(256);
+        loop {
+            let mut batch: [Option<IShellItem>; 32] = Default::default();
+            let mut fetched = 0u32;
+            let _ = enumerator.Next(&mut batch, Some(&mut fetched));
+            if fetched == 0 {
+                break;
+            }
+            for item in batch.into_iter().take(fetched as usize).flatten() {
+                let name = match item.GetDisplayName(SIGDN_NORMALDISPLAY) {
+                    Ok(pw) => pwstr_to_string_and_free(pw),
+                    Err(_) => String::new(),
+                };
+                let app_id = match item.GetDisplayName(SIGDN_PARENTRELATIVEPARSING) {
+                    Ok(pw) => pwstr_to_string_and_free(pw),
+                    Err(_) => String::new(),
+                };
+                let name_trim = name.trim();
+                let id_trim = app_id.trim();
+                if !name_trim.is_empty()
+                    && !id_trim.is_empty()
+                    && seen.insert(id_trim.to_string())
+                {
+                    apps.push(InstalledAppInfo {
+                        name: name_trim.to_string(),
+                        app_id: id_trim.to_string(),
+                    });
                 }
             }
-            apps.sort_by_key(|a| a.name.to_lowercase());
-            Ok(apps)
-        })();
-        if need_uninit {
-            CoUninitialize();
         }
-        res
+        apps.sort_by_key(|a| a.name.to_lowercase());
+        Ok(apps)
     }
 }
 
@@ -415,7 +462,9 @@ fn compute_installed_apps_fingerprint() -> u64 {
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-        *h = h.wrapping_mul(1099511628211).wrapping_add(mtime ^ 0x9e3779b97f4a7c15);
+        *h = h
+            .wrapping_mul(1099511628211)
+            .wrapping_add(mtime ^ 0x9e3779b97f4a7c15);
         if depth == 0 {
             return;
         }
@@ -458,6 +507,8 @@ fn compute_installed_apps_fingerprint() -> u64 {
 #[derive(Serialize, Deserialize)]
 struct PersistedAppsIndex {
     fingerprint: u64,
+    #[serde(default)]
+    updated_at_unix_secs: u64,
     apps: Vec<InstalledAppInfo>,
 }
 
@@ -469,91 +520,130 @@ fn apps_index_cache_path() -> PathBuf {
         .join("apps_index_v2.json")
 }
 
+fn read_persisted_apps_index(
+    cache_path: &Path,
+    expected_fp: u64,
+    now_secs: u64,
+) -> Option<Vec<InstalledAppInfo>> {
+    let raw = std::fs::read_to_string(cache_path).ok()?;
+    let parsed = serde_json::from_str::<PersistedAppsIndex>(&raw).ok()?;
+    let fresh = parsed.updated_at_unix_secs > 0
+        && now_secs.saturating_sub(parsed.updated_at_unix_secs) < APP_CACHE_TTL.as_secs();
+    if parsed.fingerprint == expected_fp && fresh && !parsed.apps.is_empty() {
+        Some(parsed.apps)
+    } else {
+        None
+    }
+}
+
+fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(parent)?;
+    let tmp = parent.join(format!(
+        "{}.{}.{}.tmp",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("cache"),
+        std::process::id(),
+        fastrand::u64(..)
+    ));
+    let write_res = (|| -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })();
+    if write_res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    write_res
+}
+
 fn extract_app_icon_png_sta(app_id: &str) -> Option<Vec<u8>> {
+    let _com = ComGuard::init_sta();
     unsafe {
-        let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-        let need_uninit = hr.is_ok();
-        let out = (|| -> Option<Vec<u8>> {
-            let parsing = wide_null(&format!(r"shell:AppsFolder\{app_id}"));
-            let factory: IShellItemImageFactory =
-                SHCreateItemFromParsingName(PCWSTR(parsing.as_ptr()), None::<&IBindCtx>).ok()?;
-            let hbm = factory
-                .GetImage(
-                    SIZE { cx: 32, cy: 32 },
-                    SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK,
-                )
-                .ok()?;
+        let parsing = wide_null(&format!(r"shell:AppsFolder\{app_id}"));
+        let factory: IShellItemImageFactory =
+            SHCreateItemFromParsingName(PCWSTR(parsing.as_ptr()), None::<&IBindCtx>).ok()?;
+        let hbm = factory
+            .GetImage(
+                SIZE { cx: 32, cy: 32 },
+                SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK,
+            )
+            .ok()?;
 
-            let mut bm = BITMAP::default();
-            let got_obj = GetObjectW(
-                HGDIOBJ(hbm.0),
-                std::mem::size_of::<BITMAP>() as i32,
-                Some(&mut bm as *mut _ as *mut c_void),
-            );
-            if got_obj == 0 || bm.bmWidth <= 0 || bm.bmHeight <= 0 {
-                let _ = DeleteObject(HGDIOBJ(hbm.0));
-                return None;
-            }
-            let w = bm.bmWidth as usize;
-            let h = bm.bmHeight.unsigned_abs() as usize;
-
-            let hdc = CreateCompatibleDC(None);
-            if hdc.is_invalid() {
-                let _ = DeleteObject(HGDIOBJ(hbm.0));
-                return None;
-            }
-
-            let mut bmi = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: w as i32,
-                    biHeight: -(h as i32), // top-down DIB
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB.0,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            let mut pixels = vec![0u8; w * h * 4];
-            let lines = GetDIBits(
-                hdc,
-                hbm,
-                0,
-                h as u32,
-                Some(pixels.as_mut_ptr() as *mut c_void),
-                &mut bmi,
-                DIB_RGB_COLORS,
-            );
-            let _ = DeleteDC(hdc);
+        let mut bm = BITMAP::default();
+        let got_obj = GetObjectW(
+            HGDIOBJ(hbm.0),
+            std::mem::size_of::<BITMAP>() as i32,
+            Some(&mut bm as *mut _ as *mut c_void),
+        );
+        if got_obj == 0 || bm.bmWidth <= 0 || bm.bmHeight <= 0 {
             let _ = DeleteObject(HGDIOBJ(hbm.0));
-            if lines == 0 {
-                return None;
-            }
-
-            // BGRA -> RGBA（若全图 alpha 均为 0，说明是传统 24 位图标转成 32 位，补不透明 alpha=255）
-            let any_alpha = pixels.as_chunks::<4>().0.iter().any(|px| px[3] != 0);
-            for px in pixels.as_chunks_mut::<4>().0 {
-                px.swap(0, 2);
-                if !any_alpha {
-                    px[3] = 255;
-                }
-            }
-
-            let mut png_bytes = Vec::with_capacity(2048);
-            {
-                let mut encoder = png::Encoder::new(&mut png_bytes, w as u32, h as u32);
-                encoder.set_color(png::ColorType::Rgba);
-                encoder.set_depth(png::BitDepth::Eight);
-                let mut writer = encoder.write_header().ok()?;
-                writer.write_image_data(&pixels).ok()?;
-            }
-            Some(png_bytes)
-        })();
-        if need_uninit {
-            CoUninitialize();
+            return None;
         }
-        out
+        let w = bm.bmWidth as usize;
+        let h = bm.bmHeight.unsigned_abs() as usize;
+        let byte_len = w.checked_mul(h).and_then(|px| px.checked_mul(4))?;
+
+        let hdc = CreateCompatibleDC(None);
+        if hdc.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ(hbm.0));
+            return None;
+        }
+
+        let mut bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w as i32,
+                biHeight: -(h as i32), // top-down DIB
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut pixels = vec![0u8; byte_len];
+        let lines = GetDIBits(
+            hdc,
+            hbm,
+            0,
+            h as u32,
+            Some(pixels.as_mut_ptr() as *mut c_void),
+            &mut bmi,
+            DIB_RGB_COLORS,
+        );
+        let _ = DeleteDC(hdc);
+        let _ = DeleteObject(HGDIOBJ(hbm.0));
+        if lines == 0 {
+            return None;
+        }
+
+        // BGRA -> RGBA（若全图 alpha 均为 0，说明是传统 24 位图标转成 32 位，补不透明 alpha=255）
+        let any_alpha = pixels.as_chunks::<4>().0.iter().any(|px| px[3] != 0);
+        for px in pixels.as_chunks_mut::<4>().0 {
+            px.swap(0, 2);
+            if !any_alpha {
+                px[3] = 255;
+            }
+        }
+
+        let mut png_bytes = Vec::with_capacity(2048);
+        {
+            let mut encoder = png::Encoder::new(&mut png_bytes, w as u32, h as u32);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().ok()?;
+            writer.write_image_data(&pixels).ok()?;
+        }
+        Some(png_bytes)
     }
 }
 
@@ -562,13 +652,16 @@ async fn query_start_apps(
     allow_disk_index: bool,
 ) -> Result<Vec<InstalledAppInfo>, PlatformError> {
     let cache_path = apps_index_cache_path();
-    if allow_disk_index
-        && let Ok(raw) = std::fs::read_to_string(&cache_path)
-        && let Ok(parsed) = serde_json::from_str::<PersistedAppsIndex>(&raw)
-        && parsed.fingerprint == expected_fp
-        && !parsed.apps.is_empty()
-    {
-        return Ok(parsed.apps);
+    if allow_disk_index {
+        let path_for_read = cache_path.clone();
+        let now_secs = now_unix_secs();
+        if let Ok(Some(cached)) = tokio::task::spawn_blocking(move || {
+            read_persisted_apps_index(&path_for_read, expected_fp, now_secs)
+        })
+        .await
+        {
+            return Ok(cached);
+        }
     }
 
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -579,16 +672,166 @@ async fn query_start_apps(
         .await
         .map_err(|_| PlatformError::System("枚举已安装软件的后台线程意外中止".to_string()))??;
 
-    if let Some(parent) = cache_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-        if let Ok(json) = serde_json::to_string(&PersistedAppsIndex {
+    let apps_for_disk = apps.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Ok(json) = serde_json::to_vec(&PersistedAppsIndex {
             fingerprint: expected_fp,
-            apps: apps.clone(),
+            updated_at_unix_secs: now_unix_secs(),
+            apps: apps_for_disk,
         }) {
-            let _ = std::fs::write(&cache_path, json);
+            let _ = write_atomic_bytes(&cache_path, &json);
+        }
+    })
+    .await;
+
+    Ok(apps)
+}
+
+/// 在独立 STA 线程中调用现代 `IFileOperation` 移入回收站，兼容超长路径与损坏符号链接。
+fn move_to_trash_sta(paths: Vec<PathBuf>) -> Result<(), PlatformError> {
+    let _com = ComGuard::init_sta();
+    unsafe {
+        let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER)
+            .map_err(|e| PlatformError::System(format!("初始化系统回收站组件失败：{e}")))?;
+        op.SetOperationFlags(
+            FOF_ALLOWUNDO
+                | FOF_NOCONFIRMATION
+                | FOF_NOERRORUI
+                | FOF_SILENT
+                | FOFX_RECYCLEONDELETE
+                | FOFX_ADDUNDORECORD,
+        )
+        .map_err(|e| PlatformError::System(format!("配置系统回收站选项失败：{e}")))?;
+
+        for p in &paths {
+            let item = create_shell_item_for_trash(p)?;
+            op.DeleteItem(&item, None::<&IFileOperationProgressSink>)
+                .map_err(|e| {
+                    PlatformError::System(format!(
+                        "添加待回收项目失败（{}）：{e}",
+                        p.display()
+                    ))
+                })?;
+        }
+
+        op.PerformOperations()
+            .map_err(|e| PlatformError::System(format!("无法将文件移入回收站：{e}")))?;
+        if op
+            .GetAnyOperationsAborted()
+            .map(|b| b.as_bool())
+            .unwrap_or(false)
+        {
+            return Err(PlatformError::System("移入回收站的操作被系统中止".to_string()));
+        }
+        Ok(())
+    }
+}
+
+unsafe fn create_shell_item_for_trash(path: &Path) -> Result<IShellItem, PlatformError> {
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let clean = strip_verbatim_prefix(&abs);
+    let clean_w = wide_null(&clean);
+    if let Ok(item) = unsafe {
+        SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(clean_w.as_ptr()), None::<&IBindCtx>)
+    } {
+        return Ok(item);
+    }
+
+    // 超长路径（>260 字符）：先尝试 verbatim 前缀，再尝试 8.3 短路径
+    let verbatim = to_verbatim_path(&abs);
+    let verbatim_w = wide_null(&verbatim);
+    if let Ok(item) = unsafe {
+        SHCreateItemFromParsingName::<_, _, IShellItem>(
+            PCWSTR(verbatim_w.as_ptr()),
+            None::<&IBindCtx>,
+        )
+    } {
+        return Ok(item);
+    }
+
+    let needed = unsafe { GetShortPathNameW(PCWSTR(verbatim_w.as_ptr()), None) };
+    if needed > 0 {
+        let mut short_buf = vec![0u16; needed as usize + 1];
+        let written =
+            unsafe { GetShortPathNameW(PCWSTR(verbatim_w.as_ptr()), Some(&mut short_buf)) };
+        if written > 0 && (written as usize) < short_buf.len() {
+            let short_str = String::from_utf16_lossy(&short_buf[..written as usize]);
+            let short_clean = strip_verbatim_prefix(Path::new(&short_str));
+            let short_w = wide_null(&short_clean);
+            if let Ok(item) = unsafe {
+                SHCreateItemFromParsingName::<_, _, IShellItem>(
+                    PCWSTR(short_w.as_ptr()),
+                    None::<&IBindCtx>,
+                )
+            } {
+                return Ok(item);
+            }
         }
     }
-    Ok(apps)
+
+    Err(PlatformError::System(format!(
+        "无法为路径创建系统回收站外壳项：{}",
+        path.display()
+    )))
+}
+
+struct ZeroizeVec(Vec<u8>);
+impl Drop for ZeroizeVec {
+    fn drop(&mut self) {
+        zeroize_bytes(&mut self.0);
+    }
+}
+
+struct LocalBlobGuard {
+    ptr: *mut u8,
+    len: usize,
+    zeroize: bool,
+}
+
+impl Drop for LocalBlobGuard {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe {
+                if self.zeroize && self.len > 0 {
+                    zeroize_bytes(std::slice::from_raw_parts_mut(self.ptr, self.len));
+                }
+                let _ = LocalFree(Some(HLOCAL(self.ptr as *mut c_void)));
+            }
+        }
+    }
+}
+
+fn schtask_exists() -> bool {
+    use std::os::windows::process::CommandExt;
+    std::process::Command::new("schtasks.exe")
+        .args(["/Query", "/TN", SCHTASK_NAME])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
+fn delete_schtask_if_exists() -> Result<(), PlatformError> {
+    use std::os::windows::process::CommandExt;
+    if !schtask_exists() {
+        return Ok(());
+    }
+    let out = std::process::Command::new("schtasks.exe")
+        .args(["/Delete", "/TN", SCHTASK_NAME, "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|err| PlatformError::System(format!("无法调用系统计划任务工具：{err}")))?;
+    if !out.status.success() {
+        return Err(PlatformError::PermissionDenied(
+            "取消或降级“以管理员权限开机自启”需要先以管理员身份运行本程序".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn remove_run_reg_value() {
+    if let Ok(key) = windows_registry::CURRENT_USER.create(RUN_REG_PATH) {
+        let _ = key.remove_value(RUN_REG_VALUE);
+    }
 }
 
 impl Platform for WindowsPlatform {
@@ -673,9 +916,8 @@ impl Platform for WindowsPlatform {
             ..Default::default()
         };
         unsafe {
-            GlobalMemoryStatusEx(&mut status).map_err(|err| {
-                PlatformError::System(format!("读取系统内存信息失败：{err}"))
-            })?;
+            GlobalMemoryStatusEx(&mut status)
+                .map_err(|err| PlatformError::System(format!("读取系统内存信息失败：{err}")))?;
         }
         Ok(SystemMemory {
             total_bytes: status.ullTotalPhys,
@@ -734,7 +976,9 @@ impl Platform for WindowsPlatform {
             match tokio::time::timeout(Duration::from_millis(2500), &mut rx).await {
                 Ok(Ok(Ok(()))) => Ok(ShellOpenOutcome::Launched),
                 Ok(Ok(Err(err))) => Err(err),
-                Ok(Err(_)) => Err(PlatformError::System("打开目标的后台线程意外退出".to_string())),
+                Ok(Err(_)) => Err(PlatformError::System(
+                    "打开目标的后台线程意外退出".to_string(),
+                )),
                 Err(_) => {
                     let now_env = self.desktop_environment();
                     if !before_env.elevated
@@ -746,9 +990,9 @@ impl Platform for WindowsPlatform {
                     match tokio::time::timeout(Duration::from_secs(8), rx).await {
                         Ok(Ok(Ok(()))) => Ok(ShellOpenOutcome::Launched),
                         Ok(Ok(Err(err))) => Err(err),
-                        Ok(Err(_)) => {
-                            Err(PlatformError::System("打开目标的后台线程意外退出".to_string()))
-                        }
+                        Ok(Err(_)) => Err(PlatformError::System(
+                            "打开目标的后台线程意外退出".to_string(),
+                        )),
                         Err(_) => Ok(ShellOpenOutcome::SuspectedUacPrompt),
                     }
                 }
@@ -770,42 +1014,25 @@ impl Platform for WindowsPlatform {
         if paths.is_empty() {
             return Ok(());
         }
-        // SHFileOperationW 要求完整的绝对路径（不带 \\?\ 前缀），并以双 NUL 结尾。
-        let mut double_null_buf: Vec<u16> = Vec::new();
+        // 使用 symlink_metadata 检查路径本身是否存在，兼容悬空/损坏符号链接
         for p in paths {
-            if !p.exists() {
-                return Err(PlatformError::NotFound(format!(
-                    "找不到要删除的文件或文件夹：{}",
+            if let Err(err) = std::fs::symlink_metadata(p) {
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    return Err(PlatformError::NotFound(format!(
+                        "找不到要删除的文件或文件夹：{}",
+                        p.display()
+                    )));
+                }
+                return Err(PlatformError::System(format!(
+                    "无法读取待删除路径信息（{}）：{err}",
                     p.display()
                 )));
             }
-            let canonical = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
-            let clean = strip_verbatim_prefix(&canonical);
-            double_null_buf.extend(OsStr::new(&clean).encode_wide());
-            double_null_buf.push(0);
         }
-        double_null_buf.push(0);
-
-        let mut file_op = SHFILEOPSTRUCTW {
-            hwnd: HWND::default(),
-            wFunc: FO_DELETE,
-            pFrom: PCWSTR(double_null_buf.as_ptr()),
-            pTo: PCWSTR::null(),
-            fFlags: (FOF_ALLOWUNDO.0 | FOF_NOCONFIRMATION.0 | FOF_NOERRORUI.0 | FOF_SILENT.0)
-                as u16,
-            ..Default::default()
-        };
-
-        let code = unsafe { SHFileOperationW(&mut file_op) };
-        if code != 0 {
-            return Err(PlatformError::System(format!(
-                "无法将文件移入回收站（系统错误码 {code}）"
-            )));
-        }
-        if file_op.fAnyOperationsAborted.as_bool() {
-            return Err(PlatformError::System("移入回收站的操作被系统中止".to_string()));
-        }
-        Ok(())
+        let owned = paths.to_vec();
+        std::thread::spawn(move || move_to_trash_sta(owned))
+            .join()
+            .map_err(|_| PlatformError::System("移入回收站的后台线程异常中止".to_string()))?
     }
 
     fn installed_apps(
@@ -814,14 +1041,15 @@ impl Platform for WindowsPlatform {
     ) -> BoxFuture<'_, Result<Vec<InstalledAppInfo>, PlatformError>> {
         Box::pin(async move {
             let mut guard = self.apps_cache.lock().await;
-            let live_fp = compute_installed_apps_fingerprint();
-            if let Some((cached_at, cached_fp, list)) = guard.as_ref() {
-                if !force_refresh && cached_at.elapsed() < APP_CACHE_TTL && *cached_fp == live_fp {
-                    return Ok(list.clone());
-                }
-                if force_refresh && *cached_fp == live_fp {
-                    return Ok(list.clone());
-                }
+            let live_fp = tokio::task::spawn_blocking(compute_installed_apps_fingerprint)
+                .await
+                .map_err(|e| PlatformError::System(format!("计算软件列表指纹失败：{e}")))?;
+            if !force_refresh
+                && let Some((cached_at, cached_fp, list)) = guard.as_ref()
+                && cached_at.elapsed() < APP_CACHE_TTL
+                && *cached_fp == live_fp
+            {
+                return Ok(list.clone());
             }
             let apps = query_start_apps(live_fp, !force_refresh).await?;
             *guard = Some((Instant::now(), live_fp, apps.clone()));
@@ -840,20 +1068,61 @@ impl Platform for WindowsPlatform {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(&id)
-                .cloned()
             {
-                return Ok(cached);
+                return Ok(Some(cached));
             }
+
+            // 合并同一 app_id 的并发提取请求，避免重复开 STA 线程
+            enum IconAction {
+                Wait(watch::Receiver<Option<Option<Vec<u8>>>>),
+                Run(IconInflightGuard),
+            }
+            let action = {
+                let mut inflight = self.icon_inflight.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(rx) = inflight.get(&id).cloned() {
+                    IconAction::Wait(rx)
+                } else {
+                    let (tx, rx) = watch::channel(None);
+                    inflight.insert(id.clone(), rx);
+                    IconAction::Run(IconInflightGuard {
+                        map: self.icon_inflight.clone(),
+                        id: id.clone(),
+                        tx: Some(tx),
+                    })
+                }
+            };
+            let guard = match action {
+                IconAction::Wait(mut rx) => {
+                    let res = rx
+                        .wait_for(|v| v.is_some())
+                        .await
+                        .ok()
+                        .and_then(|v| v.clone().flatten());
+                    return Ok(res);
+                }
+                IconAction::Run(guard) => guard,
+            };
+
+            // 限制并发 STA 图标提取线程上限，防止一次打开软件页触发线程风暴
+            let _permit = self
+                .icon_sem
+                .acquire()
+                .await
+                .map_err(|_| PlatformError::System("图标提取并发调度器已关闭".to_string()))?;
+
             let id_clone = id.clone();
             let (tx, rx) = tokio::sync::oneshot::channel();
             std::thread::spawn(move || {
                 let _ = tx.send(extract_app_icon_png_sta(&id_clone));
             });
             let png = rx.await.unwrap_or(None);
-            self.icons_cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(id, png.clone());
+            if let Some(ref bytes) = png {
+                self.icons_cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(id, bytes.clone());
+            }
+            guard.complete(png.clone());
             Ok(png)
         })
     }
@@ -882,7 +1151,7 @@ impl Platform for WindowsPlatform {
             window_titles.entry(win.pid).or_insert(win.title);
         }
 
-        let (mut sys_total, mut snap) = system_and_proc_times_wrapper();
+        let (mut sys_total, mut snap) = system_and_proc_times();
         let mut prev_guard = self.cpu_sample.lock().unwrap_or_else(|e| e.into_inner());
         if prev_guard.is_none() {
             let first_proc_times = snap
@@ -894,7 +1163,7 @@ impl Platform for WindowsPlatform {
                 proc_times_100ns: first_proc_times,
             });
             std::thread::sleep(Duration::from_millis(60));
-            let second = system_and_proc_times_wrapper();
+            let second = system_and_proc_times();
             sys_total = second.0;
             snap = second.1;
         }
@@ -942,39 +1211,63 @@ impl Platform for WindowsPlatform {
             ));
         }
 
-        let (_, snap) = system_and_proc_times_wrapper();
-        let Some((name, _, _)) = snap.get(&pid).cloned() else {
+        // 单句柄打开目标进程并在同一句柄上校验进程名再结束，消除全量遍历开销与 PID 复用 TOCTOU
+        let handle_raw = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+                false,
+                pid,
+            )
+        }
+        .map_err(|err| {
+            if is_win32_error(&err, ERROR_INVALID_PARAMETER) {
+                PlatformError::NotFound(format!("找不到进程（PID {pid}），它可能已经退出"))
+            } else if is_win32_error(&err, ERROR_ACCESS_DENIED) {
+                PlatformError::PermissionDenied(format!(
+                    "没有权限结束进程（PID {pid}）：{err}"
+                ))
+            } else {
+                PlatformError::PermissionDenied(format!("无法打开目标进程（PID {pid}）：{err}"))
+            }
+        })?;
+        let handle = OwnedHandle::new(handle_raw)
+            .ok_or_else(|| PlatformError::NotFound(format!("找不到进程（PID {pid}）")))?;
+
+        // 已退出但外部仍持有句柄的僵尸进程 OpenProcess 仍会成功，先检查退出码避免误报系统错
+        let mut exit_code = 0u32;
+        if unsafe { GetExitCodeProcess(handle.raw(), &mut exit_code) }.is_ok()
+            && exit_code != STILL_ACTIVE_CODE
+        {
             return Err(PlatformError::NotFound(format!(
                 "找不到进程（PID {pid}），它可能已经退出"
             )));
-        };
+        }
 
+        let name = query_process_exe_name(handle.raw(), pid)?;
         if is_critical_process_name(pid, &name, self_pid) {
             return Err(PlatformError::PermissionDenied(format!(
                 "“{name}”是系统关键进程，为防止电脑蓝屏或死机，不允许结束"
             )));
         }
 
-        unsafe {
-            let handle = OpenProcess(PROCESS_TERMINATE, false, pid).map_err(|err| {
-                PlatformError::PermissionDenied(format!(
-                    "没有权限结束进程“{name}”（PID {pid}）：{err}"
-                ))
-            })?;
-            let term_res = TerminateProcess(handle, 1);
-            let _ = CloseHandle(handle);
-            term_res.map_err(|err| {
-                PlatformError::PermissionDenied(format!("结束进程“{name}”失败：{err}"))
-            })?;
-        }
+        unsafe { TerminateProcess(handle.raw(), 1) }
+            .map_err(|err| PlatformError::PermissionDenied(format!("结束进程“{name}”失败：{err}")))?;
         Ok(name)
     }
 
     fn protect_secret(&self, plaintext: &[u8]) -> Result<Vec<u8>, PlatformError> {
-        let mut input = plaintext.to_vec();
+        let mut input = ZeroizeVec(plaintext.to_vec());
+        let cb_data = u32::try_from(input.0.len())
+            .map_err(|_| PlatformError::InvalidInput("待保护密钥长度超出上限".to_string()))?;
+        // Windows CryptProtectData 在 cbData == 0 时仍要求 pbData 非空，否则返回 E_INVALIDARG
+        let mut empty_sentinel = 0u8;
         let in_blob = CRYPT_INTEGER_BLOB {
-            cbData: input.len() as u32,
-            pbData: input.as_mut_ptr(),
+            cbData: cb_data,
+            pbData: if input.0.is_empty() {
+                &mut empty_sentinel
+            } else {
+                input.0.as_mut_ptr()
+            },
         };
         let mut out_blob = CRYPT_INTEGER_BLOB::default();
         unsafe {
@@ -989,10 +1282,18 @@ impl Platform for WindowsPlatform {
             )
             .map_err(|err| PlatformError::System(format!("加密保护密钥失败：{err}")))?;
 
-            let encrypted =
-                std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec();
-            let _ = LocalFree(Some(HLOCAL(out_blob.pbData as *mut c_void)));
-            Ok(encrypted)
+            let _out_guard = LocalBlobGuard {
+                ptr: out_blob.pbData,
+                len: out_blob.cbData as usize,
+                zeroize: false,
+            };
+            if out_blob.cbData == 0 {
+                return Ok(Vec::new());
+            }
+            if out_blob.pbData.is_null() {
+                return Err(PlatformError::System("系统加密输出指针为空".to_string()));
+            }
+            Ok(std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec())
         }
     }
 
@@ -1001,8 +1302,10 @@ impl Platform for WindowsPlatform {
             return Err(PlatformError::System("密钥密文为空".to_string()));
         }
         let mut input = ciphertext.to_vec();
+        let cb_data = u32::try_from(input.len())
+            .map_err(|_| PlatformError::InvalidInput("密钥密文长度超出上限".to_string()))?;
         let in_blob = CRYPT_INTEGER_BLOB {
-            cbData: input.len() as u32,
+            cbData: cb_data,
             pbData: input.as_mut_ptr(),
         };
         let mut out_blob = CRYPT_INTEGER_BLOB::default();
@@ -1016,25 +1319,28 @@ impl Platform for WindowsPlatform {
                 CRYPTPROTECT_UI_FORBIDDEN,
                 &mut out_blob,
             )
-            .map_err(|err| PlatformError::System(format!("解密密钥失败（文件可能已损坏）：{err}")))?;
+            .map_err(|err| {
+                PlatformError::System(format!("解密密钥失败（文件可能已损坏）：{err}"))
+            })?;
 
-            let decrypted =
-                std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec();
-            let _ = LocalFree(Some(HLOCAL(out_blob.pbData as *mut c_void)));
-            Ok(decrypted)
+            // 解密出的临时明文在释放 LocalFree 前自动清零
+            let _out_guard = LocalBlobGuard {
+                ptr: out_blob.pbData,
+                len: out_blob.cbData as usize,
+                zeroize: true,
+            };
+            if out_blob.cbData == 0 {
+                return Ok(Vec::new());
+            }
+            if out_blob.pbData.is_null() {
+                return Err(PlatformError::System("系统解密输出指针为空".to_string()));
+            }
+            Ok(std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec())
         }
     }
 
     fn get_autostart(&self) -> Result<AutostartState, PlatformError> {
-        use std::os::windows::process::CommandExt;
-
-        // 先检查计划任务（管理员权限自启）
-        if let Ok(output) = std::process::Command::new("schtasks.exe")
-            .args(["/Query", "/TN", SCHTASK_NAME])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            && output.status.success()
-        {
+        if schtask_exists() {
             return Ok(AutostartState {
                 enabled: true,
                 elevated: true,
@@ -1059,22 +1365,17 @@ impl Platform for WindowsPlatform {
     ) -> Result<(), PlatformError> {
         use std::os::windows::process::CommandExt;
 
-        // 先清理旧的注册表项和计划任务，避免重复启动
-        if let Ok(key) = windows_registry::CURRENT_USER.create(RUN_REG_PATH) {
-            let _ = key.remove_value(RUN_REG_VALUE);
-        }
-        let _ = std::process::Command::new("schtasks.exe")
-            .args(["/Delete", "/TN", SCHTASK_NAME, "/F"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
-
         if !enabled {
+            // 若管理员自启计划任务存在但无权限删除，直接报错而不返回假成功
+            delete_schtask_if_exists()?;
+            remove_run_reg_value();
             return Ok(());
         }
 
         let clean_exe = strip_verbatim_prefix(exe_path);
         let quoted_cmd = format!("\"{clean_exe}\" --background");
         if elevated {
+            // 先创建管理员计划任务，成功后再清理旧注册表自启项，失败时保留原有自启
             let out = std::process::Command::new("schtasks.exe")
                 .args([
                     "/Create",
@@ -1098,12 +1399,18 @@ impl Platform for WindowsPlatform {
                     "设置“以管理员权限开机自启”需要先以管理员身份运行本程序".to_string(),
                 ));
             }
+            remove_run_reg_value();
         } else {
+            // 先校验注册表可打开，再删除旧高权限计划任务（若无权删除则报错且不写入重复项），最后写入普通自启
             let key = windows_registry::CURRENT_USER
                 .create(RUN_REG_PATH)
-                .map_err(|err| PlatformError::System(format!("打开自启动注册表项失败：{err}")))?;
-            key.set_string(RUN_REG_VALUE, &quoted_cmd)
-                .map_err(|err| PlatformError::System(format!("写入自启动注册表项失败：{err}")))?;
+                .map_err(|err| {
+                    PlatformError::System(format!("打开自启动注册表项失败：{err}"))
+                })?;
+            delete_schtask_if_exists()?;
+            key.set_string(RUN_REG_VALUE, &quoted_cmd).map_err(|err| {
+                PlatformError::System(format!("写入自启动注册表项失败：{err}"))
+            })?;
         }
         Ok(())
     }
@@ -1272,22 +1579,21 @@ impl Platform for WindowsPlatform {
 fn shell_item_to_path(item: &IShellItem) -> Option<PathBuf> {
     unsafe {
         let pwstr = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
-        let mut len = 0usize;
-        while *pwstr.0.add(len) != 0 {
-            len += 1;
+        let text = pwstr_to_string_and_free(pwstr);
+        if text.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(text))
         }
-        let slice = std::slice::from_raw_parts(pwstr.0, len);
-        let text = String::from_utf16_lossy(slice);
-        CoTaskMemFree(Some(pwstr.0 as *const c_void));
-        Some(PathBuf::from(text))
     }
 }
 
 fn run_file_dialog_sta(pick_folder: bool) -> Result<Vec<PathBuf>, PlatformError> {
     const HRESULT_CANCELLED: i32 = 0x800704C7u32 as i32; // ERROR_CANCELLED (1223)
 
-    let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
-    let res = unsafe {
+    // RAII 守卫确保任何提前 `?` 返回都会先释放 COM 接口再调用 CoUninitialize
+    let _com = ComGuard::init_sta();
+    unsafe {
         let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)
             .map_err(|e| PlatformError::System(format!("创建文件选择对话框失败：{e}")))?;
 
@@ -1331,13 +1637,60 @@ fn run_file_dialog_sta(pick_folder: bool) -> Result<Vec<PathBuf>, PlatformError>
             Err(err) if err.code().0 == HRESULT_CANCELLED => Ok(Vec::new()),
             Err(err) => Err(PlatformError::System(format!("显示文件选择框失败：{err}"))),
         }
-    };
-    if hr.is_ok() {
-        unsafe { CoUninitialize() };
     }
-    res
 }
 
-fn system_and_proc_times_wrapper() -> (u64, HashMap<u32, (String, u64, u64)>) {
-    system_and_proc_times()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn icon_cache_enforces_capacity_limit_and_evicts_oldest() {
+        let mut cache = IconCache::default();
+        for i in 0..(MAX_ICON_CACHE_ENTRIES + 10) {
+            cache.insert(format!("app-{i}"), vec![i as u8]);
+        }
+        assert_eq!(cache.entries.len(), MAX_ICON_CACHE_ENTRIES);
+        assert!(cache.get("app-0").is_none(), "oldest entry should be evicted");
+        assert!(
+            cache.get(&format!("app-{}", MAX_ICON_CACHE_ENTRIES + 9)).is_some(),
+            "newest entry should remain cached"
+        );
+    }
+
+    #[test]
+    fn persisted_apps_index_checks_ttl_and_atomic_write() {
+        let dir = std::env::temp_dir().join(format!(
+            "pcshare_apps_cache_test_{}_{}",
+            std::process::id(),
+            fastrand::u64(..)
+        ));
+        let path = dir.join("apps_index_v2.json");
+        let now = 1_700_000_000u64;
+        let sample = vec![InstalledAppInfo {
+            name: "记事本".to_string(),
+            app_id: "notepad".to_string(),
+        }];
+
+        let fresh_json = serde_json::to_vec(&PersistedAppsIndex {
+            fingerprint: 42,
+            updated_at_unix_secs: now - 10,
+            apps: sample.clone(),
+        })
+        .unwrap();
+        write_atomic_bytes(&path, &fresh_json).expect("atomic write should succeed");
+        assert_eq!(
+            read_persisted_apps_index(&path, 42, now),
+            Some(sample.clone())
+        );
+        // 超过 5 分钟 TTL 必须失效
+        assert_eq!(
+            read_persisted_apps_index(&path, 42, now + APP_CACHE_TTL.as_secs()),
+            None
+        );
+        // 指纹不一致必须失效
+        assert_eq!(read_persisted_apps_index(&path, 99, now), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

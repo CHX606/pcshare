@@ -2,29 +2,35 @@
 //! 快捷搜索与全局热键、流式文件搜索、看一眼与截图点按、远端文件本地编辑与回传冲突检测、
 //! 电源与网络唤醒、交互式伪终端、剪贴板互通、批量操作、拖出到系统桌面。
 
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::{Duration, SystemTime};
 
 use base64::Engine as _;
 use pcshare_core::error::map_platform_to_rpc;
 use pcshare_core::path_guard::to_display_path;
 use pcshare_core::{
-    BatchCommand, CapturedShot, CoreError, EditSyncOutcome, QuickHitKind, TerminalStreamEvent,
+    BatchCommand, BatchDeviceResult, CapturedShot, CoreError, EditSyncOutcome, InputResult,
+    QuickHitKind, RemoteClipboardData, TerminalStreamEvent,
 };
 use pcshare_platform::ClipboardContent;
 use pcshare_proto::{
-    ClipKind, ConflictPolicy, EntryKind, InputClickArgs, InputKeyArgs, LaunchKind, MouseBtn,
-    PowerAction, PowerExecArgs, ShotRefreshSpec, ShotScreenArgs, ShotWindowArgs, TermOpenArgs,
-    TermShell,
+    ClipKind, ConflictPolicy, EntryKind, ErrorCode, InputClickArgs, InputKeyArgs, LaunchKind,
+    MouseBtn, PowerAction, PowerExecArgs, ShotRefreshSpec, ShotScreenArgs, ShotWindowArgs,
+    TermOpenArgs, TermShell,
 };
 use serde::{Deserialize, Serialize};
-use tokio_util::sync::CancellationToken;
 
 use crate::bridge::{
     BridgeState, Reply, SELF_ID, UiDesktopState, UiErrorCode, UiLaunchResult,
     convert_desktop_status, convert_launch_reply,
 };
+
+const TERM_BATCH_MAX_BYTES: usize = 16 * 1024;
+const TERM_BATCH_WINDOW: Duration = Duration::from_millis(16);
+const DRAG_OUT_STALE_AGE: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -253,14 +259,26 @@ fn convert_captured_shot(shot: CapturedShot) -> UiCapturedShot {
     }
 }
 
+fn parse_optional_hwnd(raw: Option<String>, label: &str) -> Result<Option<u64>, String> {
+    let Some(s) = raw else {
+        return Ok(None);
+    };
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    match trimmed.parse::<u64>() {
+        Ok(h) if h > 0 => Ok(Some(h)),
+        _ => Err(format!("无效的{label}编号")),
+    }
+}
+
 fn build_refresh_spec(
     refresh_monitor: Option<u32>,
-    refresh_hwnd: Option<String>,
+    refresh_hwnd: Option<u64>,
     max_width: Option<u32>,
 ) -> Option<ShotRefreshSpec> {
-    if let Some(raw_hwnd) = refresh_hwnd
-        && let Ok(h) = raw_hwnd.parse::<u64>()
-    {
+    if let Some(h) = refresh_hwnd {
         return Some(ShotRefreshSpec {
             monitor_index: None,
             hwnd: Some(h),
@@ -276,12 +294,114 @@ fn build_refresh_spec(
     })
 }
 
+fn convert_input_outcome(r: InputResult) -> UiInputOutcome {
+    let refreshed_shot = r
+        .reply
+        .refreshed_shot
+        .zip(r.refreshed_jpeg)
+        .map(|(header, jpeg_bytes)| convert_captured_shot(CapturedShot { header, jpeg_bytes }));
+    UiInputOutcome {
+        uipi_blocked: r.reply.uipi_blocked,
+        warning: r.reply.warning,
+        refreshed_shot,
+    }
+}
+
+fn convert_remote_clipboard(d: RemoteClipboardData) -> UiClipboardPreview {
+    match d.header.kind {
+        ClipKind::Empty => UiClipboardPreview {
+            kind: "empty".to_string(),
+            text: None,
+            image_data_url: None,
+            width: None,
+            height: None,
+        },
+        ClipKind::Text => UiClipboardPreview {
+            kind: "text".to_string(),
+            text: d.header.text,
+            image_data_url: None,
+            width: None,
+            height: None,
+        },
+        ClipKind::ImagePng => {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&d.png_bytes);
+            UiClipboardPreview {
+                kind: "image_png".to_string(),
+                text: None,
+                image_data_url: Some(format!("data:image/png;base64,{b64}")),
+                width: d.header.image_width,
+                height: d.header.image_height,
+            }
+        }
+    }
+}
+
+fn convert_batch_result(r: BatchDeviceResult) -> UiBatchDeviceResult {
+    UiBatchDeviceResult {
+        peer_id: r.peer_id,
+        peer_name: r.peer_name,
+        ok: r.ok,
+        summary: r.summary,
+        output: r.output,
+        elapsed_ms: r.elapsed_ms,
+    }
+}
+
+/// 清理 `drag_out_staging/drag-*` 临时拖出目录。
+/// - `max_age == None`：清理全部 `drag-*` 子目录（用于启动与退出关停）；
+/// - `max_age == Some(age)`：仅清理早于 `age` 的过期目录（避免干扰刚刚拖出正在被系统粘贴的文件）。
+pub fn cleanup_drag_out_staging(data_dir: &Path, max_age: Option<Duration>) {
+    let root = data_dir.join("drag_out_staging");
+    let Ok(rd) = std::fs::read_dir(&root) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if !name_str.starts_with("drag-") {
+            continue;
+        }
+        let path = entry.path();
+        if let Some(age) = max_age {
+            let is_stale = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|mt| now.duration_since(mt).ok())
+                .is_some_and(|elapsed| elapsed >= age);
+            if !is_stale {
+                continue;
+            }
+        }
+        if path.is_dir() {
+            let _ = std::fs::remove_dir_all(&path);
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 impl BridgeState {
     // ────────────────────────── 任务 3.1：快捷搜索框与全局热键 ──────────────────────────
 
+    /// 处理全局快捷键呼出：
+    /// - 仅当主窗口当时不存在、本次需要冷启建窗（`cold_started == true`）时置位 `pending_launcher_open = true`，
+    ///   避免与前端启动消费抵消；
+    /// - 主窗口已存在（`cold_started == false`）时直接发送 `launcher://toggle` 且保持 `pending_launcher_open = false`。
+    pub fn on_launcher_hotkey(&self, cold_started: bool) {
+        if cold_started {
+            self.pending_launcher_open.store(true, Ordering::SeqCst);
+        } else {
+            self.pending_launcher_open.store(false, Ordering::SeqCst);
+            self.sink.emit_launcher_toggle();
+        }
+    }
+
     pub fn mark_launcher_pending(&self) {
-        self.pending_launcher_open.store(true, Ordering::SeqCst);
-        self.sink.emit_launcher_toggle();
+        self.on_launcher_hotkey(true);
     }
 
     pub fn launcher_consume_pending(&self) -> Reply<bool> {
@@ -345,7 +465,7 @@ impl BridgeState {
             return Reply::err(UiErrorCode::Invalid, "请输入要搜索的文件名关键字");
         }
         let search_id = format!("search-{}", self.next_seq());
-        let cancel = CancellationToken::new();
+        let cancel = self.shutdown.child_token();
         self.active_searches
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -468,13 +588,13 @@ impl BridgeState {
         max_width: Option<u32>,
         quality: Option<u8>,
     ) -> Reply<UiCapturedShot> {
-        let res = if let Some(raw_hwnd) = hwnd.filter(|s| !s.trim().is_empty()) {
-            let parsed_hwnd = match raw_hwnd.parse::<u64>() {
-                Ok(h) => h,
-                Err(_) => return Reply::err(UiErrorCode::Invalid, "无效的窗口句柄编号"),
-            };
+        let parsed_hwnd = match parse_optional_hwnd(hwnd, "窗口句柄") {
+            Ok(h) => h,
+            Err(msg) => return Reply::err(UiErrorCode::Invalid, msg),
+        };
+        let res = if let Some(h) = parsed_hwnd {
             let args = ShotWindowArgs {
-                hwnd: parsed_hwnd,
+                hwnd: h,
                 max_width,
                 quality,
             };
@@ -522,27 +642,28 @@ impl BridgeState {
             "middle" => MouseBtn::Middle,
             _ => MouseBtn::Left,
         };
-        let thwnd = target_hwnd.and_then(|s| s.parse::<u64>().ok());
+        let thwnd = match parse_optional_hwnd(target_hwnd, "目标窗口句柄") {
+            Ok(h) => h,
+            Err(msg) => return Reply::err(UiErrorCode::Invalid, msg),
+        };
+        let rhwnd = match parse_optional_hwnd(refresh_hwnd, "刷新窗口句柄") {
+            Ok(h) => h,
+            Err(msg) => return Reply::err(UiErrorCode::Invalid, msg),
+        };
         let args = InputClickArgs {
             screen_x,
             screen_y,
             button: btn,
             double,
             target_hwnd: thwnd,
-            refresh_shot: build_refresh_spec(refresh_monitor, refresh_hwnd, max_width),
+            refresh_shot: build_refresh_spec(refresh_monitor, rhwnd, max_width),
         };
-        Reply::from_core(self.node().remote_input_click(&device, args).await.map(|r| {
-            let refreshed_shot = r
-                .reply
-                .refreshed_shot
-                .zip(r.refreshed_jpeg)
-                .map(|(header, jpeg_bytes)| convert_captured_shot(CapturedShot { header, jpeg_bytes }));
-            UiInputOutcome {
-                uipi_blocked: r.reply.uipi_blocked,
-                warning: r.reply.warning,
-                refreshed_shot,
-            }
-        }))
+        Reply::from_core(
+            self.node()
+                .remote_input_click(&device, args)
+                .await
+                .map(convert_input_outcome),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -562,25 +683,26 @@ impl BridgeState {
                 "不能对本机自己的预览画面循环发送模拟按键",
             );
         }
-        let thwnd = target_hwnd.and_then(|s| s.parse::<u64>().ok());
+        let thwnd = match parse_optional_hwnd(target_hwnd, "目标窗口句柄") {
+            Ok(h) => h,
+            Err(msg) => return Reply::err(UiErrorCode::Invalid, msg),
+        };
+        let rhwnd = match parse_optional_hwnd(refresh_hwnd, "刷新窗口句柄") {
+            Ok(h) => h,
+            Err(msg) => return Reply::err(UiErrorCode::Invalid, msg),
+        };
         let args = InputKeyArgs {
             text,
             key_combo,
             target_hwnd: thwnd,
-            refresh_shot: build_refresh_spec(refresh_monitor, refresh_hwnd, max_width),
+            refresh_shot: build_refresh_spec(refresh_monitor, rhwnd, max_width),
         };
-        Reply::from_core(self.node().remote_input_key(&device, args).await.map(|r| {
-            let refreshed_shot = r
-                .reply
-                .refreshed_shot
-                .zip(r.refreshed_jpeg)
-                .map(|(header, jpeg_bytes)| convert_captured_shot(CapturedShot { header, jpeg_bytes }));
-            UiInputOutcome {
-                uipi_blocked: r.reply.uipi_blocked,
-                warning: r.reply.warning,
-                refreshed_shot,
-            }
-        }))
+        Reply::from_core(
+            self.node()
+                .remote_input_key(&device, args)
+                .await
+                .map(convert_input_outcome),
+        )
     }
 
     // ────────────────────────── 任务 3.4：远端文件两种打开方式与编辑回传 ──────────────────────────
@@ -631,21 +753,32 @@ impl BridgeState {
         auto_sync: bool,
         force_overwrite: bool,
     ) -> Reply<UiEditSyncResult> {
-        Reply::from_core(
-            self.node()
-                .sync_back_edited_file(&session_id, auto_sync, force_overwrite)
-                .await
-                .map(|outcome| match outcome {
-                    EditSyncOutcome::Uploaded { bytes_written, .. } => UiEditSyncResult {
-                        conflict: false,
-                        bytes_written,
-                    },
-                    EditSyncOutcome::ConflictDetected { .. } => UiEditSyncResult {
-                        conflict: true,
-                        bytes_written: 0,
-                    },
-                }),
-        )
+        let res = self
+            .node()
+            .sync_back_edited_file(&session_id, auto_sync, force_overwrite)
+            .await;
+        match &res {
+            Ok(EditSyncOutcome::Uploaded { .. }) => {
+                self.remove_pending_edit_prompt(&session_id);
+            }
+            Ok(EditSyncOutcome::ConflictDetected { .. }) => {
+                self.mark_pending_edit_conflict(&session_id);
+            }
+            Err(CoreError::Rpc(rpc)) if rpc.code == ErrorCode::NotFound => {
+                self.remove_pending_edit_prompt(&session_id);
+            }
+            _ => {}
+        }
+        Reply::from_core(res.map(|outcome| match outcome {
+            EditSyncOutcome::Uploaded { bytes_written, .. } => UiEditSyncResult {
+                conflict: false,
+                bytes_written,
+            },
+            EditSyncOutcome::ConflictDetected { .. } => UiEditSyncResult {
+                conflict: true,
+                bytes_written: 0,
+            },
+        }))
     }
 
     // ────────────────────────── 任务 3.5：电源操作与网络唤醒 ──────────────────────────
@@ -738,7 +871,7 @@ impl BridgeState {
                 let shell_name = handle.shell_name.clone();
                 let mut out_rx = std::mem::replace(
                     &mut handle.output_rx,
-                    tokio::sync::mpsc::unbounded_channel().1,
+                    tokio::sync::mpsc::channel(1).1,
                 );
                 let handle_arc = Arc::new(handle);
                 self.active_terminals
@@ -749,23 +882,88 @@ impl BridgeState {
                 let sink = self.sink.clone();
                 let sid = session_id.clone();
                 let bridge_weak = Arc::downgrade(self);
+                let shutdown = self.shutdown.clone();
                 tokio::spawn(async move {
-                    while let Some(ev) = out_rx.recv().await {
-                        match ev {
-                            TerminalStreamEvent::Output(bytes) => {
-                                let data_b64 =
-                                    base64::engine::general_purpose::STANDARD.encode(bytes);
-                                sink.emit_term_output(UiTermOutputEvent {
-                                    session_id: sid.clone(),
-                                    data_b64,
-                                });
+                    let mut buf: Vec<u8> = Vec::with_capacity(TERM_BATCH_MAX_BYTES);
+                    let mut flush_deadline: Option<tokio::time::Instant> = None;
+
+                    let flush = |buf: &mut Vec<u8>| {
+                        if !buf.is_empty() {
+                            let data_b64 = base64::engine::general_purpose::STANDARD.encode(&*buf);
+                            buf.clear();
+                            sink.emit_term_output(UiTermOutputEvent {
+                                session_id: sid.clone(),
+                                data_b64,
+                            });
+                        }
+                    };
+
+                    loop {
+                        if let Some(deadline) = flush_deadline {
+                            tokio::select! {
+                                biased;
+                                _ = shutdown.cancelled() => {
+                                    break;
+                                }
+                                _ = tokio::time::sleep_until(deadline) => {
+                                    flush(&mut buf);
+                                    flush_deadline = None;
+                                }
+                                ev = out_rx.recv() => {
+                                    match ev {
+                                        Some(TerminalStreamEvent::Output(bytes)) => {
+                                            if !bytes.is_empty() {
+                                                buf.extend_from_slice(&bytes);
+                                                if buf.len() >= TERM_BATCH_MAX_BYTES {
+                                                    flush(&mut buf);
+                                                    flush_deadline = None;
+                                                }
+                                            }
+                                        }
+                                        Some(TerminalStreamEvent::Exited(code)) => {
+                                            flush(&mut buf);
+                                            sink.emit_term_exit(UiTermExitEvent {
+                                                session_id: sid.clone(),
+                                                exit_code: code,
+                                            });
+                                            break;
+                                        }
+                                        None => {
+                                            flush(&mut buf);
+                                            break;
+                                        }
+                                    }
+                                }
                             }
-                            TerminalStreamEvent::Exited(code) => {
-                                sink.emit_term_exit(UiTermExitEvent {
-                                    session_id: sid.clone(),
-                                    exit_code: code,
-                                });
-                                break;
+                        } else {
+                            tokio::select! {
+                                biased;
+                                _ = shutdown.cancelled() => {
+                                    break;
+                                }
+                                ev = out_rx.recv() => {
+                                    match ev {
+                                        Some(TerminalStreamEvent::Output(bytes)) => {
+                                            if !bytes.is_empty() {
+                                                buf.extend_from_slice(&bytes);
+                                                if buf.len() >= TERM_BATCH_MAX_BYTES {
+                                                    flush(&mut buf);
+                                                } else {
+                                                    flush_deadline =
+                                                        Some(tokio::time::Instant::now() + TERM_BATCH_WINDOW);
+                                                }
+                                            }
+                                        }
+                                        Some(TerminalStreamEvent::Exited(code)) => {
+                                            sink.emit_term_exit(UiTermExitEvent {
+                                                session_id: sid.clone(),
+                                                exit_code: code,
+                                            });
+                                            break;
+                                        }
+                                        None => break,
+                                    }
+                                }
                             }
                         }
                     }
@@ -854,32 +1052,7 @@ impl BridgeState {
             self.node()
                 .pull_peer_clipboard_to_local(&device)
                 .await
-                .map(|d| match d.header.kind {
-                    ClipKind::Empty => UiClipboardPreview {
-                        kind: "empty".to_string(),
-                        text: None,
-                        image_data_url: None,
-                        width: None,
-                        height: None,
-                    },
-                    ClipKind::Text => UiClipboardPreview {
-                        kind: "text".to_string(),
-                        text: d.header.text,
-                        image_data_url: None,
-                        width: None,
-                        height: None,
-                    },
-                    ClipKind::ImagePng => {
-                        let b64 = base64::engine::general_purpose::STANDARD.encode(&d.png_bytes);
-                        UiClipboardPreview {
-                            kind: "image_png".to_string(),
-                            text: None,
-                            image_data_url: Some(format!("data:image/png;base64,{b64}")),
-                            width: d.header.image_width,
-                            height: d.header.image_height,
-                        }
-                    }
-                }),
+                .map(convert_remote_clipboard),
         )
     }
 
@@ -926,34 +1099,12 @@ impl BridgeState {
             }));
         }
 
-        Reply::from_core(self.node().remote_get_clipboard(&device).await.map(|d| {
-            match d.header.kind {
-                ClipKind::Empty => UiClipboardPreview {
-                    kind: "empty".to_string(),
-                    text: None,
-                    image_data_url: None,
-                    width: None,
-                    height: None,
-                },
-                ClipKind::Text => UiClipboardPreview {
-                    kind: "text".to_string(),
-                    text: d.header.text,
-                    image_data_url: None,
-                    width: None,
-                    height: None,
-                },
-                ClipKind::ImagePng => {
-                    let b64 = base64::engine::general_purpose::STANDARD.encode(&d.png_bytes);
-                    UiClipboardPreview {
-                        kind: "image_png".to_string(),
-                        text: None,
-                        image_data_url: Some(format!("data:image/png;base64,{b64}")),
-                        width: d.header.image_width,
-                        height: d.header.image_height,
-                    }
-                }
-            }
-        }))
+        Reply::from_core(
+            self.node()
+                .remote_get_clipboard(&device)
+                .await
+                .map(convert_remote_clipboard),
+        )
     }
 
     // ────────────────────────── 任务 3.8：多设备并发批量执行 ──────────────────────────
@@ -967,7 +1118,12 @@ impl BridgeState {
         command: Option<String>,
         shell: Option<String>,
     ) -> Reply<Vec<UiBatchDeviceResult>> {
-        if devices.is_empty() {
+        let mut seen = HashSet::with_capacity(devices.len());
+        let deduped_devices: Vec<String> = devices
+            .into_iter()
+            .filter(|id| !id.trim().is_empty() && seen.insert(id.clone()))
+            .collect();
+        if deduped_devices.is_empty() {
             return Reply::err(UiErrorCode::Invalid, "请至少勾选一台目标设备");
         }
         let batch_cmd = match op.as_str() {
@@ -1030,29 +1186,15 @@ impl BridgeState {
         let results = self
             .node()
             .execute_batch(
-                devices,
+                deduped_devices,
                 batch_cmd,
                 Some(Arc::new(move |r| {
-                    sink.emit_batch_item(UiBatchDeviceResult {
-                        peer_id: r.peer_id,
-                        peer_name: r.peer_name,
-                        ok: r.ok,
-                        summary: r.summary,
-                        output: r.output,
-                        elapsed_ms: r.elapsed_ms,
-                    });
+                    sink.emit_batch_item(convert_batch_result(r));
                 })),
             )
             .await
             .into_iter()
-            .map(|r| UiBatchDeviceResult {
-                peer_id: r.peer_id,
-                peer_name: r.peer_name,
-                ok: r.ok,
-                summary: r.summary,
-                output: r.output,
-                elapsed_ms: r.elapsed_ms,
-            })
+            .map(convert_batch_result)
             .collect();
         Reply::ok(results)
     }
@@ -1067,18 +1209,23 @@ impl BridgeState {
         if paths.is_empty() {
             return Reply::err(UiErrorCode::Invalid, "请先选择要拖出的文件");
         }
+        let mut created_staging: Option<PathBuf> = None;
         let local_paths: Vec<PathBuf> = if device == SELF_ID {
             paths.into_iter().map(PathBuf::from).collect()
         } else {
-            let staging = self
-                .node()
-                .storage()
-                .data_dir()
+            let data_dir = self.node().storage().data_dir().to_path_buf();
+            let cleanup_dir = data_dir.clone();
+            tokio::task::spawn_blocking(move || {
+                cleanup_drag_out_staging(&cleanup_dir, Some(DRAG_OUT_STALE_AGE));
+            });
+
+            let staging = data_dir
                 .join("drag_out_staging")
                 .join(format!("drag-{}", fastrand::u64(..)));
             if let Err(e) = tokio::fs::create_dir_all(&staging).await {
                 return Reply::err(UiErrorCode::Io, format!("创建临时拖出目录失败：{e}"));
             }
+            // speed_limit_bps 留空以自动读取并动态跟随全局 RateLimiter 限速
             let opts = pcshare_core::TransferQueueOptions {
                 conflict: ConflictPolicy::Overwrite,
                 concurrency: 4,
@@ -1091,7 +1238,7 @@ impl BridgeState {
                     &paths,
                     &staging,
                     opts,
-                    pcshare_core::TransferTaskControl::new(),
+                    pcshare_core::TransferTaskControl::from_token(self.shutdown.child_token()),
                     None,
                 )
                 .await
@@ -1100,17 +1247,28 @@ impl BridgeState {
                 return Reply::from_core(Err(err));
             }
             let mut staged = Vec::new();
-            if let Ok(rd) = std::fs::read_dir(&staging) {
-                for item in rd.flatten() {
+            if let Ok(mut rd) = tokio::fs::read_dir(&staging).await {
+                while let Ok(Some(item)) = rd.next_entry().await {
                     staged.push(item.path());
                 }
             }
+            created_staging = Some(staging);
             staged
         };
 
         match self.node().platform().start_file_drag_out(&local_paths).await {
-            Ok(dropped) => Reply::ok(dropped),
-            Err(pe) => Reply::from_rpc(Err(map_platform_to_rpc(&pe))),
+            Ok(dropped) => {
+                if !dropped && let Some(staging) = created_staging {
+                    let _ = tokio::fs::remove_dir_all(&staging).await;
+                }
+                Reply::ok(dropped)
+            }
+            Err(pe) => {
+                if let Some(staging) = created_staging {
+                    let _ = tokio::fs::remove_dir_all(&staging).await;
+                }
+                Reply::from_rpc(Err(map_platform_to_rpc(&pe)))
+            }
         }
     }
 }

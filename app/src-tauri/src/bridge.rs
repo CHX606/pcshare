@@ -30,10 +30,17 @@ use pcshare_proto::{
     RemoteEvent, RootKind, RpcError,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 pub const SELF_ID: &str = "self";
 const PROGRESS_THROTTLE: Duration = Duration::from_millis(100);
+const ICON_CACHE_MAX_ENTRIES: usize = 512;
+const PAIR_REQUEST_TTL: Duration = Duration::from_secs(300);
+const EDIT_PROMPT_TTL: Duration = Duration::from_secs(1800);
+const EDIT_PROMPT_MAX_ENTRIES: usize = 64;
+const STAT_CONCURRENCY: usize = 8;
 
 // ────────────────────────────── 与前端对齐的数据结构 ──────────────────────────────
 
@@ -501,12 +508,25 @@ pub trait EventSink: Send + Sync + 'static {
 
 #[derive(Clone)]
 struct TransferMeta {
+    seq: u64,
     kind: UiTaskKind,
     title: String,
     src_device: String,
     dst_device: String,
     bytes_done: Arc<AtomicU64>,
     bytes_total: Arc<AtomicU64>,
+    speed_bits: Arc<AtomicU64>,
+}
+
+#[derive(Clone)]
+struct FsTaskMeta {
+    seq: u64,
+    kind: UiTaskKind,
+    title: String,
+    device_id: String,
+    bytes_done: Arc<AtomicU64>,
+    bytes_total: Arc<AtomicU64>,
+    speed_bits: Arc<AtomicU64>,
 }
 
 enum CancellableTask {
@@ -514,11 +534,82 @@ enum CancellableTask {
         control: TransferTaskControl,
         meta: TransferMeta,
     },
-    LocalFsTask(String),
+    LocalFsTask {
+        raw_task_id: String,
+        meta: FsTaskMeta,
+    },
     RemoteFsTask {
         peer_id: String,
         remote_task_id: String,
+        meta: FsTaskMeta,
     },
+}
+
+/// 带上限（LRU 近似）的软件图标缓存：仅缓存成功的 data URL，不缓存瞬态 `None`。
+struct IconCache {
+    max_entries: usize,
+    seq: u64,
+    entries: HashMap<String, (String, u64)>,
+}
+
+impl IconCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries: max_entries.max(1),
+            seq: 0,
+            entries: HashMap::new(),
+        }
+    }
+
+    fn get(&mut self, key: &str) -> Option<String> {
+        let next_seq = self.seq.wrapping_add(1);
+        if let Some((val, last_used)) = self.entries.get_mut(key) {
+            self.seq = next_seq;
+            *last_used = next_seq;
+            Some(val.clone())
+        } else {
+            None
+        }
+    }
+
+    fn insert(&mut self, key: String, value: String) {
+        use std::collections::hash_map::Entry;
+        self.seq = self.seq.wrapping_add(1);
+        let stamp = self.seq;
+        let is_full = self.entries.len() >= self.max_entries;
+        let key = match self.entries.entry(key) {
+            Entry::Occupied(mut occ) => {
+                occ.insert((value, stamp));
+                return;
+            }
+            Entry::Vacant(vac) => {
+                if !is_full {
+                    vac.insert((value, stamp));
+                    return;
+                }
+                vac.into_key()
+            }
+        };
+        if let Some(oldest_key) = self
+            .entries
+            .iter()
+            .min_by_key(|(_, (_, ts))| *ts)
+            .map(|(k, _)| k.clone())
+        {
+            self.entries.remove(&oldest_key);
+        }
+        self.entries.insert(key, (value, stamp));
+    }
+
+    fn remove_device(&mut self, device: &str) {
+        let prefix = format!("{device}|");
+        self.entries.retain(|k, _| !k.starts_with(&prefix));
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 pub struct BridgeState {
@@ -528,15 +619,19 @@ pub struct BridgeState {
     active_tasks: Mutex<HashMap<String, CancellableTask>>,
     pub(crate) active_searches: Mutex<HashMap<String, CancellationToken>>,
     pub(crate) active_terminals: Mutex<HashMap<String, Arc<RemoteTerminalHandle>>>,
+    active_watches: Mutex<HashSet<(String, String)>>,
+    pending_pair_requests: Mutex<Vec<(UiPairRequest, Instant)>>,
+    pending_edit_prompts: Mutex<Vec<(UiEditSyncPrompt, Instant)>>,
     pub(crate) pending_launcher_open: AtomicBool,
     hotkey_trigger: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     last_online_map: Mutex<HashMap<String, bool>>,
-    icon_cache: Mutex<HashMap<String, Option<String>>>,
-    shutdown: CancellationToken,
+    icon_cache: Mutex<IconCache>,
+    pub(crate) shutdown: CancellationToken,
 }
 
 impl BridgeState {
     pub fn new(node: Arc<CoreNode>, sink: Arc<dyn EventSink>) -> Arc<Self> {
+        let data_dir = node.storage().data_dir().to_path_buf();
         let state = Arc::new(Self {
             node,
             sink,
@@ -544,13 +639,20 @@ impl BridgeState {
             active_tasks: Mutex::new(HashMap::new()),
             active_searches: Mutex::new(HashMap::new()),
             active_terminals: Mutex::new(HashMap::new()),
+            active_watches: Mutex::new(HashSet::new()),
+            pending_pair_requests: Mutex::new(Vec::new()),
+            pending_edit_prompts: Mutex::new(Vec::new()),
             pending_launcher_open: AtomicBool::new(false),
             hotkey_trigger: Mutex::new(None),
             last_online_map: Mutex::new(HashMap::new()),
-            icon_cache: Mutex::new(HashMap::new()),
+            icon_cache: Mutex::new(IconCache::new(ICON_CACHE_MAX_ENTRIES)),
             shutdown: CancellationToken::new(),
         });
         state.spawn_core_event_forwarder();
+        // 启动时在阻塞线程池清理上次异常退出遗留的拖出临时目录
+        tokio::task::spawn_blocking(move || {
+            crate::bridge_stage3::cleanup_drag_out_staging(&data_dir, None);
+        });
         // Warm local app list in background so Alt+Space quick search includes本机 apps immediately
         let node_bg = state.node.clone();
         tokio::spawn(async move {
@@ -575,6 +677,18 @@ impl BridgeState {
             .map_err(|e| e.to_string())
     }
 
+    fn restore_global_hotkey(&self, prev_hotkey: &str) {
+        if let Some(pcb) = self
+            .hotkey_trigger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            let prev_opt = Some(prev_hotkey).filter(|s| !s.trim().is_empty());
+            let _ = self.node.platform().set_global_hotkey(prev_opt, pcb);
+        }
+    }
+
     pub(crate) fn next_seq(&self) -> u64 {
         self.task_seq.fetch_add(1, Ordering::Relaxed)
     }
@@ -587,9 +701,22 @@ impl BridgeState {
         self.node.endpoint_id().to_string()
     }
 
-    pub async fn shutdown(&self) {
-        self.shutdown.cancel();
-        let _ = self.node.platform().set_global_hotkey(None, Arc::new(|| {}));
+    /// 主窗口销毁（关闭到托盘）时清理窗口级会话：活跃终端、文件搜索与目录监听，
+    /// 保留后台传输任务、被控服务与全局热键。
+    pub async fn on_main_window_destroyed(self: &Arc<Self>) {
+        self.pending_launcher_open.store(false, Ordering::SeqCst);
+
+        let searches: Vec<CancellationToken> = self
+            .active_searches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+            .map(|(_, tok)| tok)
+            .collect();
+        for tok in searches {
+            tok.cancel();
+        }
+
         let terms: Vec<Arc<RemoteTerminalHandle>> = self
             .active_terminals
             .lock()
@@ -600,7 +727,180 @@ impl BridgeState {
         for t in terms {
             let _ = t.close().await;
         }
+
+        let watches: Vec<(String, String)> = self
+            .active_watches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+            .collect();
+        self.node.fs_watch().unwatch_all_for_peer(SELF_ID);
+        for (device, path) in watches {
+            if device != SELF_ID {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    self.node.remote_unwatch(&device, &path),
+                )
+                .await;
+            }
+        }
+    }
+
+    pub async fn shutdown(&self) {
+        self.shutdown.cancel();
+        let _ = self.node.platform().set_global_hotkey(None, Arc::new(|| {}));
+
+        let searches: Vec<CancellationToken> = self
+            .active_searches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+            .map(|(_, tok)| tok)
+            .collect();
+        for tok in searches {
+            tok.cancel();
+        }
+
+        let tasks: Vec<CancellableTask> = self
+            .active_tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+            .map(|(_, t)| t)
+            .collect();
+        for task in tasks {
+            match task {
+                CancellableTask::Transfer { control, .. } => {
+                    control.cancel();
+                }
+                CancellableTask::LocalFsTask { raw_task_id, .. } => {
+                    let _ = self.node.fs_service().task_cancel(&raw_task_id);
+                }
+                CancellableTask::RemoteFsTask {
+                    peer_id,
+                    remote_task_id,
+                    ..
+                } => {
+                    let _ = tokio::time::timeout(
+                        Duration::from_millis(500),
+                        self.node.remote_task_cancel(&peer_id, &remote_task_id),
+                    )
+                    .await;
+                }
+            }
+        }
+
+        let terms: Vec<Arc<RemoteTerminalHandle>> = self
+            .active_terminals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+            .map(|(_, h)| h)
+            .collect();
+        for t in terms {
+            let _ = t.close().await;
+        }
+
+        self.active_watches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+
+        let data_dir = self.node.storage().data_dir().to_path_buf();
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::bridge_stage3::cleanup_drag_out_staging(&data_dir, None);
+        })
+        .await;
+
         self.node.shutdown().await;
+    }
+
+    pub(crate) fn record_pending_pair_request(&self, req: UiPairRequest) {
+        let now = Instant::now();
+        let mut guard = self
+            .pending_pair_requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.retain(|(_, ts)| now.duration_since(*ts) < PAIR_REQUEST_TTL);
+        if let Some((existing, ts)) = guard
+            .iter_mut()
+            .find(|(r, _)| r.request_id == req.request_id)
+        {
+            *existing = req;
+            *ts = now;
+        } else {
+            guard.push((req, now));
+        }
+    }
+
+    pub(crate) fn remove_pending_pair_request(&self, request_id: &str) {
+        self.pending_pair_requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(r, _)| r.request_id != request_id);
+    }
+
+    pub fn pair_pending_list(&self) -> Reply<Vec<UiPairRequest>> {
+        let now = Instant::now();
+        let mut guard = self
+            .pending_pair_requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.retain(|(_, ts)| now.duration_since(*ts) < PAIR_REQUEST_TTL);
+        Reply::ok(guard.iter().map(|(r, _)| r.clone()).collect())
+    }
+
+    pub(crate) fn record_pending_edit_prompt(&self, ev: UiEditSyncPrompt) {
+        let now = Instant::now();
+        let mut guard = self
+            .pending_edit_prompts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.retain(|(_, ts)| now.duration_since(*ts) < EDIT_PROMPT_TTL);
+        if let Some((existing, ts)) = guard
+            .iter_mut()
+            .find(|(p, _)| p.session_id == ev.session_id)
+        {
+            *existing = ev;
+            *ts = now;
+        } else {
+            if guard.len() >= EDIT_PROMPT_MAX_ENTRIES {
+                guard.remove(0);
+            }
+            guard.push((ev, now));
+        }
+    }
+
+    pub(crate) fn remove_pending_edit_prompt(&self, session_id: &str) {
+        self.pending_edit_prompts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(p, _)| p.session_id != session_id);
+    }
+
+    pub(crate) fn mark_pending_edit_conflict(&self, session_id: &str) {
+        let now = Instant::now();
+        let mut guard = self
+            .pending_edit_prompts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((existing, ts)) = guard
+            .iter_mut()
+            .find(|(p, _)| p.session_id == session_id)
+        {
+            existing.conflict = true;
+            *ts = now;
+        }
+    }
+
+    pub fn edit_pending_list(&self) -> Reply<Vec<UiEditSyncPrompt>> {
+        let now = Instant::now();
+        let mut guard = self
+            .pending_edit_prompts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.retain(|(_, ts)| now.duration_since(*ts) < EDIT_PROMPT_TTL);
+        Reply::ok(guard.iter().map(|(p, _)| p.clone()).collect())
     }
 
     fn spawn_core_event_forwarder(self: &Arc<Self>) {
@@ -665,19 +965,21 @@ impl BridgeState {
                             .emit_lan_changed(bridge.compute_unpaired_lan_peers());
                     }
                     CoreEvent::PairingApprovalNeeded(prompt) => {
+                        let req = UiPairRequest {
+                            request_id: prompt.request_id,
+                            device_id: prompt.peer_id,
+                            device_name: prompt.peer_name.clone(),
+                        };
+                        bridge.record_pending_pair_request(req.clone());
                         bridge.sink.emit_system_notice(UiSystemNotice {
                             title: "收到配对请求".to_string(),
                             body: format!("「{}」请求与这台电脑配对，请确认或拒绝", prompt.peer_name),
                             kind: "info".to_string(),
                         });
-                        bridge.sink.emit_pair_request(UiPairRequest {
-                            request_id: prompt.request_id,
-                            device_id: prompt.peer_id,
-                            device_name: prompt.peer_name,
-                        });
+                        bridge.sink.emit_pair_request(req);
                     }
                     CoreEvent::EditSyncPromptNeeded(p) => {
-                        bridge.sink.emit_edit_sync_prompt(UiEditSyncPrompt {
+                        let ev = UiEditSyncPrompt {
                             session_id: p.session_id,
                             peer_id: p.peer_id,
                             peer_name: p.peer_name,
@@ -685,7 +987,9 @@ impl BridgeState {
                             local_path: p.local_path,
                             file_name: p.file_name,
                             conflict: p.conflict,
-                        });
+                        };
+                        bridge.record_pending_edit_prompt(ev.clone());
+                        bridge.sink.emit_edit_sync_prompt(ev);
                     }
                     CoreEvent::RemoteDirChanged { peer_id, path } => {
                         bridge.node.dir_cache().invalidate(&peer_id, &path);
@@ -762,6 +1066,7 @@ impl BridgeState {
         }
         let prev = self.node.settings();
         let next_hotkey = next.quick_hotkey.trim().to_string();
+        let mut hotkey_changed = false;
         if next_hotkey != prev.quick_hotkey
             && let Some(cb) = self
                 .hotkey_trigger
@@ -771,18 +1076,10 @@ impl BridgeState {
         {
             let opt = Some(next_hotkey.as_str()).filter(|s| !s.is_empty());
             if let Err(pe) = self.node.platform().set_global_hotkey(opt, cb) {
-                // Restore previous hotkey on conflict/invalid input
-                let prev_cb = self
-                    .hotkey_trigger
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
-                if let Some(pcb) = prev_cb {
-                    let prev_opt = Some(prev.quick_hotkey.as_str()).filter(|s| !s.is_empty());
-                    let _ = self.node.platform().set_global_hotkey(prev_opt, pcb);
-                }
+                self.restore_global_hotkey(&prev.quick_hotkey);
                 return Reply::from_rpc(Err(map_platform_to_rpc(&pe)));
             }
+            hotkey_changed = true;
         }
         let (cur_enabled, cur_elevated) = match self.node.platform().get_autostart() {
             Ok(a) => (a.enabled, a.elevated),
@@ -794,11 +1091,15 @@ impl BridgeState {
 
         let want_elevated = next.autostart_elevated;
         let want_enabled = next.autostart_elevated || next.autostart;
+        let mut autostart_prev: Option<(PathBuf, bool, bool)> = None;
 
         if want_enabled != cur_enabled || (want_enabled && want_elevated != cur_elevated) {
             let exe = match std::env::current_exe() {
                 Ok(p) => p,
                 Err(e) => {
+                    if hotkey_changed {
+                        self.restore_global_hotkey(&prev.quick_hotkey);
+                    }
                     return Reply::err(UiErrorCode::Io, format!("无法定位当前程序路径：{e}"));
                 }
             };
@@ -807,8 +1108,12 @@ impl BridgeState {
                 .platform()
                 .set_autostart(&exe, want_enabled, want_elevated)
             {
+                if hotkey_changed {
+                    self.restore_global_hotkey(&prev.quick_hotkey);
+                }
                 return Reply::from_rpc(Err(map_platform_to_rpc(&pe)));
             }
+            autostart_prev = Some((exe, cur_enabled, cur_elevated));
         }
 
         let res = self.node.update_settings(|s| {
@@ -819,7 +1124,19 @@ impl BridgeState {
             s.quick_hotkey = next_hotkey;
             s.clipboard_auto_sync = next.clipboard_auto_sync;
         });
-        Reply::from_core(res.map(|_| ()))
+        if let Err(err) = res {
+            if let Some((exe, prev_enabled, prev_elevated)) = autostart_prev {
+                let _ = self
+                    .node
+                    .platform()
+                    .set_autostart(&exe, prev_enabled, prev_elevated);
+            }
+            if hotkey_changed {
+                self.restore_global_hotkey(&prev.quick_hotkey);
+            }
+            return Reply::from_core(Err(err));
+        }
+        Reply::ok(())
     }
 
     pub fn host_status(&self) -> Reply<UiHostStatus> {
@@ -860,14 +1177,7 @@ impl BridgeState {
             return Reply::err(UiErrorCode::Invalid, "设备名称不能为空");
         }
         match self.node.rename_peer(&id, trimmed) {
-            Ok(true) => {
-                if let Some(peer) = self.node.storage().get_peer(&id) {
-                    let st = self.node.peer_state(&id);
-                    self.sink
-                        .emit_device_status(to_ui_device(&peer, st.as_ref()));
-                }
-                Reply::ok(())
-            }
+            Ok(true) => Reply::ok(()),
             Ok(false) => Reply::err(UiErrorCode::NotFound, "找不到这台设备"),
             Err(e) => Reply::from_core(Err(e)),
         }
@@ -876,8 +1186,27 @@ impl BridgeState {
     pub fn device_remove(&self, id: String) -> Reply<()> {
         match self.node.remove_peer(&id) {
             Ok(_) => {
+                self.icon_cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove_device(&id);
+                self.last_online_map
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&id);
+                self.active_watches
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .retain(|(dev, _)| dev != &id);
+                self.pending_pair_requests
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .retain(|(r, _)| r.device_id != id);
+                self.pending_edit_prompts
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .retain(|(p, _)| p.peer_id != id);
                 self.sink.emit_device_removed(id);
-                self.sink.emit_lan_changed(self.compute_unpaired_lan_peers());
                 Reply::ok(())
             }
             Err(e) => Reply::from_core(Err(e)),
@@ -890,14 +1219,7 @@ impl BridgeState {
         };
         let proto_perms = permissions.to_proto(existing.permissions.allowed_roots);
         match self.node.update_peer_permissions(&id, proto_perms) {
-            Ok(true) => {
-                if let Some(peer) = self.node.storage().get_peer(&id) {
-                    let st = self.node.peer_state(&id);
-                    self.sink
-                        .emit_device_status(to_ui_device(&peer, st.as_ref()));
-                }
-                Reply::ok(())
-            }
+            Ok(true) => Reply::ok(()),
             Ok(false) => Reply::err(UiErrorCode::NotFound, "找不到这台设备"),
             Err(e) => Reply::from_core(Err(e)),
         }
@@ -920,6 +1242,10 @@ impl BridgeState {
 
     pub fn pair_cancel(&self) -> Reply<()> {
         self.node.cancel_pairing_session();
+        self.pending_pair_requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         Reply::ok(())
     }
 
@@ -987,7 +1313,17 @@ impl BridgeState {
         } else {
             PairingDecision::Reject
         };
-        Reply::from_core(self.node.respond_pairing(&request_id, decision))
+        let res = self.node.respond_pairing(&request_id, decision);
+        match &res {
+            Ok(()) => self.remove_pending_pair_request(&request_id),
+            Err(CoreError::Rpc(rpc))
+                if matches!(rpc.code, ErrorCode::NotFound | ErrorCode::Unauthorized) =>
+            {
+                self.remove_pending_pair_request(&request_id);
+            }
+            _ => {}
+        }
+        Reply::from_core(res)
     }
 
     // ────────────────────────── 文件缓存、监听、渐进浏览与操作 ──────────────────────────
@@ -1084,39 +1420,48 @@ impl BridgeState {
     }
 
     pub async fn fs_watch(self: &Arc<Self>, device: String, path: String) -> Reply<usize> {
-        if device == SELF_ID {
-            Reply::from_rpc(
-                self.node
-                    .fs_watch()
-                    .watch(SELF_ID, &Permissions::default(), &path)
-                    .map(|r| r.watched_count),
-            )
+        let res = if device == SELF_ID {
+            self.node
+                .fs_watch()
+                .watch(SELF_ID, &Permissions::default(), &path)
+                .map(|r| r.watched_count)
+                .map_err(CoreError::Rpc)
         } else {
-            Reply::from_core(
-                self.node
-                    .remote_watch(&device, &path)
-                    .await
-                    .map(|r| r.watched_count),
-            )
+            self.node
+                .remote_watch(&device, &path)
+                .await
+                .map(|r| r.watched_count)
+        };
+        if res.is_ok() {
+            self.active_watches
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert((device, path));
         }
+        Reply::from_core(res)
     }
 
     pub async fn fs_unwatch(self: &Arc<Self>, device: String, path: String) -> Reply<usize> {
-        if device == SELF_ID {
-            Reply::from_rpc(
-                self.node
-                    .fs_watch()
-                    .unwatch(SELF_ID, &Permissions::default(), &path)
-                    .map(|r| r.watched_count),
-            )
+        let res = if device == SELF_ID {
+            self.node
+                .fs_watch()
+                .unwatch(SELF_ID, &Permissions::default(), &path)
+                .map(|r| r.watched_count)
+                .map_err(CoreError::Rpc)
         } else {
-            Reply::from_core(
-                self.node
-                    .remote_unwatch(&device, &path)
-                    .await
-                    .map(|r| r.watched_count),
-            )
+            self.node
+                .remote_unwatch(&device, &path)
+                .await
+                .map(|r| r.watched_count)
+        };
+        if res.is_ok() {
+            let lower = path.to_lowercase();
+            self.active_watches
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|(d, p)| !(d == &device && (p == &path || p.to_lowercase() == lower)));
         }
+        Reply::from_core(res)
     }
 
     pub async fn fs_check_conflicts(
@@ -1128,12 +1473,11 @@ impl BridgeState {
         if names.is_empty() {
             return Reply::ok(Vec::new());
         }
-        let listing = match self.fs_list(device, dest_dir).await {
-            Reply::Ok { data } => data,
-            Reply::Err { err } => return Reply::Err { err },
+        let entries = match self.node.fs_list_readonly(&device, &dest_dir).await {
+            Ok(entries) => entries,
+            Err(e) => return Reply::from_core(Err(e)),
         };
-        let existing: HashSet<String> = listing
-            .entries
+        let existing: HashSet<String> = entries
             .into_iter()
             .map(|e| e.name.to_lowercase())
             .collect();
@@ -1236,20 +1580,32 @@ impl BridgeState {
                     Ok(r) => r,
                     Err(e) => return Reply::from_rpc(Err(e)),
                 };
-            let ui_task_id = self.next_task_id();
+            let (seq, ui_task_id) = self.next_task_id();
+            let meta = FsTaskMeta {
+                seq,
+                kind,
+                title: title.clone(),
+                device_id: SELF_ID.to_string(),
+                bytes_done: Arc::new(AtomicU64::new(0)),
+                bytes_total: Arc::new(AtomicU64::new(1)),
+                speed_bits: Arc::new(AtomicU64::new(0)),
+            };
             self.active_tasks
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(
                     ui_task_id.clone(),
-                    CancellableTask::LocalFsTask(task_reply.task_id.clone()),
+                    CancellableTask::LocalFsTask {
+                        raw_task_id: task_reply.task_id.clone(),
+                        meta: meta.clone(),
+                    },
                 );
 
             let bridge = self.clone();
             let tid = ui_task_id.clone();
             let raw_tid = task_reply.task_id;
             tokio::spawn(async move {
-                bridge.poll_local_fs_task(tid, raw_tid, kind, title).await;
+                bridge.poll_local_fs_task(tid, raw_tid, meta).await;
             });
             Reply::ok(ui_task_id)
         } else {
@@ -1262,7 +1618,16 @@ impl BridgeState {
                 Ok(r) => r,
                 Err(e) => return Reply::from_core(Err(e)),
             };
-            let ui_task_id = self.next_task_id();
+            let (seq, ui_task_id) = self.next_task_id();
+            let meta = FsTaskMeta {
+                seq,
+                kind,
+                title: title.clone(),
+                device_id: device.clone(),
+                bytes_done: Arc::new(AtomicU64::new(0)),
+                bytes_total: Arc::new(AtomicU64::new(1)),
+                speed_bits: Arc::new(AtomicU64::new(0)),
+            };
             self.active_tasks
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -1271,6 +1636,7 @@ impl BridgeState {
                     CancellableTask::RemoteFsTask {
                         peer_id: device.clone(),
                         remote_task_id: task_reply.task_id.clone(),
+                        meta: meta.clone(),
                     },
                 );
 
@@ -1279,7 +1645,7 @@ impl BridgeState {
             let raw_tid = task_reply.task_id;
             tokio::spawn(async move {
                 bridge
-                    .poll_remote_fs_task(tid, device, raw_tid, kind, title)
+                    .poll_remote_fs_task(tid, device, raw_tid, meta)
                     .await;
             });
             Reply::ok(ui_task_id)
@@ -1326,26 +1692,46 @@ impl BridgeState {
             );
         }
 
-        // 核验源路径存在并生成任务标题（阶段 2 原生支持文件与递归文件夹）
+        // 并发核验源路径存在并生成任务标题（阶段 2 原生支持文件与递归文件夹）
+        let sem = Arc::new(Semaphore::new(STAT_CONCURRENCY));
+        let mut join_set: JoinSet<(usize, Result<DirEntry, CoreError>)> = JoinSet::new();
+        for (idx, s) in sources.iter().cloned().enumerate() {
+            let node = self.node.clone();
+            let src_c = src.clone();
+            let sem_c = sem.clone();
+            join_set.spawn(async move {
+                let Ok(_permit) = sem_c.acquire_owned().await else {
+                    return (idx, Err(CoreError::Cancelled));
+                };
+                let res = if src_c == SELF_ID {
+                    node.fs_service()
+                        .stat(&Permissions::default(), FsStatArgs { path: s })
+                        .await
+                        .map(|r| r.entry)
+                        .map_err(CoreError::Rpc)
+                } else {
+                    node.remote_stat(&src_c, &s).await.map(|r| r.entry)
+                };
+                (idx, res)
+            });
+        }
+        let mut ordered: Vec<Option<DirEntry>> = (0..sources.len()).map(|_| None).collect();
+        while let Some(joined) = join_set.join_next().await {
+            match joined {
+                Ok((idx, Ok(entry))) => ordered[idx] = Some(entry),
+                Ok((_, Err(err))) => {
+                    join_set.abort_all();
+                    return Reply::from_core(Err(err));
+                }
+                Err(err) => {
+                    join_set.abort_all();
+                    return Reply::err(UiErrorCode::Internal, format!("核验源文件任务异常：{err}"));
+                }
+            }
+        }
         let mut names = Vec::with_capacity(sources.len());
         let mut initial_bytes = 0u64;
-        for s in &sources {
-            let entry: DirEntry = if src == SELF_ID {
-                match self
-                    .node
-                    .fs_service()
-                    .stat(&Permissions::default(), FsStatArgs { path: s.clone() })
-                    .await
-                {
-                    Ok(r) => r.entry,
-                    Err(e) => return Reply::from_rpc(Err(e)),
-                }
-            } else {
-                match self.node.remote_stat(&src, s).await {
-                    Ok(r) => r.entry,
-                    Err(e) => return Reply::from_core(Err(e)),
-                }
-            };
+        for entry in ordered.into_iter().flatten() {
             initial_bytes = initial_bytes.saturating_add(entry.size);
             names.push(entry.name);
         }
@@ -1363,17 +1749,20 @@ impl BridgeState {
             format!("{} 等 {} 项", names[0], names.len())
         };
 
-        let ui_task_id = self.next_task_id();
+        let (seq, ui_task_id) = self.next_task_id();
         let control = TransferTaskControl::new();
         let bytes_done = Arc::new(AtomicU64::new(0));
         let bytes_total = Arc::new(AtomicU64::new(initial_bytes.max(1)));
+        let speed_bits = Arc::new(AtomicU64::new(0));
         let meta = TransferMeta {
+            seq,
             kind,
             title: title.clone(),
             src_device: src.clone(),
             dst_device: dst.clone(),
             bytes_done: bytes_done.clone(),
             bytes_total: bytes_total.clone(),
+            speed_bits,
         };
 
         self.active_tasks
@@ -1419,10 +1808,72 @@ impl BridgeState {
         Reply::ok(ui_task_id)
     }
 
+    pub fn task_list(&self) -> Reply<Vec<UiTaskProgress>> {
+        let guard = self.active_tasks.lock().unwrap_or_else(|e| e.into_inner());
+        let mut items: Vec<(u64, UiTaskProgress)> = guard
+            .iter()
+            .map(|(id, task)| match task {
+                CancellableTask::Transfer { control, meta } => {
+                    let paused = control.is_paused();
+                    let bytes_total = meta.bytes_total.load(Ordering::Relaxed).max(1);
+                    let bytes_done = meta.bytes_done.load(Ordering::Relaxed).min(bytes_total);
+                    let speed = if paused {
+                        0.0
+                    } else {
+                        f64::from_bits(meta.speed_bits.load(Ordering::Relaxed))
+                    };
+                    (
+                        meta.seq,
+                        UiTaskProgress {
+                            id: id.clone(),
+                            kind: meta.kind,
+                            title: meta.title.clone(),
+                            src_device: meta.src_device.clone(),
+                            dst_device: meta.dst_device.clone(),
+                            bytes_done,
+                            bytes_total,
+                            speed,
+                            state: if paused {
+                                UiTaskState::Paused
+                            } else {
+                                UiTaskState::Running
+                            },
+                            error: None,
+                        },
+                    )
+                }
+                CancellableTask::LocalFsTask { meta, .. }
+                | CancellableTask::RemoteFsTask { meta, .. } => {
+                    let bytes_total = meta.bytes_total.load(Ordering::Relaxed).max(1);
+                    let bytes_done = meta.bytes_done.load(Ordering::Relaxed).min(bytes_total);
+                    let speed = f64::from_bits(meta.speed_bits.load(Ordering::Relaxed));
+                    (
+                        meta.seq,
+                        UiTaskProgress {
+                            id: id.clone(),
+                            kind: meta.kind,
+                            title: meta.title.clone(),
+                            src_device: meta.device_id.clone(),
+                            dst_device: meta.device_id.clone(),
+                            bytes_done,
+                            bytes_total,
+                            speed,
+                            state: UiTaskState::Running,
+                            error: None,
+                        },
+                    )
+                }
+            })
+            .collect();
+        items.sort_by_key(|(seq, _)| *seq);
+        Reply::ok(items.into_iter().map(|(_, p)| p).collect())
+    }
+
     pub fn task_pause(&self, task_id: String) -> Reply<()> {
         let guard = self.active_tasks.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(CancellableTask::Transfer { control, meta }) = guard.get(&task_id) {
             control.pause();
+            meta.speed_bits.store(0, Ordering::Relaxed);
             let p = UiTaskProgress {
                 id: task_id,
                 kind: meta.kind,
@@ -1474,13 +1925,14 @@ impl BridgeState {
                 control.cancel();
                 Reply::ok(())
             }
-            Some(CancellableTask::LocalFsTask(raw_id)) => {
-                let _ = self.node.fs_service().task_cancel(&raw_id);
+            Some(CancellableTask::LocalFsTask { raw_task_id, .. }) => {
+                let _ = self.node.fs_service().task_cancel(&raw_task_id);
                 Reply::ok(())
             }
             Some(CancellableTask::RemoteFsTask {
                 peer_id,
                 remote_task_id,
+                ..
             }) => {
                 let _ = self.node.remote_task_cancel(&peer_id, &remote_task_id).await;
                 Reply::ok(())
@@ -1514,11 +1966,15 @@ impl BridgeState {
 
     // ────────────────────────── 软件、图标与进程 ──────────────────────────
 
-    pub async fn app_list(self: &Arc<Self>, device: String) -> Reply<Vec<UiAppInfo>> {
+    pub async fn app_list(
+        self: &Arc<Self>,
+        device: String,
+        force: bool,
+    ) -> Reply<Vec<UiAppInfo>> {
         let res = if device == SELF_ID {
-            self.node.local_apps(false).await
+            self.node.local_apps(force).await
         } else {
-            self.node.remote_apps(&device, false).await
+            self.node.remote_apps(&device, force).await
         };
         Reply::from_core(res.map(|r| {
             r.apps
@@ -1542,9 +1998,8 @@ impl BridgeState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&cache_key)
-            .cloned()
         {
-            return Reply::ok(hit);
+            return Reply::ok(Some(hit));
         }
 
         let res = if device == SELF_ID {
@@ -1558,10 +2013,13 @@ impl BridgeState {
                     .png_base64
                     .filter(|s| !s.is_empty())
                     .map(|b64| format!("data:image/png;base64,{b64}"));
-                self.icon_cache
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(cache_key, data_url.clone());
+                // 仅缓存成功提取到的图标，不缓存瞬态 None
+                if let Some(ref url) = data_url {
+                    self.icon_cache
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(cache_key, url.clone());
+                }
                 Reply::ok(data_url)
             }
             Err(e) => Reply::from_core(Err(e)),
@@ -1574,7 +2032,7 @@ impl BridgeState {
         target: String,
         args: Option<String>,
     ) -> Reply<UiLaunchResult> {
-        let kind = classify_launch_target(&target);
+        let kind = classify_launch_target(&target, device == SELF_ID).await;
         let req = AppLaunchArgs {
             target,
             kind,
@@ -1691,13 +2149,6 @@ impl BridgeState {
                 .iter()
                 .find(|r| r.preferred)
                 .map(|r| r.relay_host.clone());
-            let mapping_varies = if rep.nat_status.contains("对称") {
-                Some(true)
-            } else if rep.nat_status.contains("固定") {
-                Some(false)
-            } else {
-                None
-            };
             let relay_latencies = rep
                 .relays
                 .into_iter()
@@ -1710,7 +2161,7 @@ impl BridgeState {
                 checked_at_ms: rep.checked_at_ms,
                 udp_ipv4: rep.udp_v4,
                 udp_ipv6: rep.udp_v6,
-                mapping_varies_by_dest_ip: mapping_varies,
+                mapping_varies_by_dest_ip: rep.mapping_varies_by_dest_ip,
                 upnp_available: None,
                 pcp_available: None,
                 nat_pmp_available: None,
@@ -1767,9 +2218,9 @@ impl BridgeState {
 
     // ────────────────────────── 后台任务进度与限流辅助 ──────────────────────────
 
-    fn next_task_id(&self) -> String {
+    fn next_task_id(&self) -> (u64, String) {
         let n = self.task_seq.fetch_add(1, Ordering::Relaxed);
-        format!("ui-task-{n}")
+        (n, format!("ui-task-{n}"))
     }
 
     async fn run_stage2_transfer_worker(
@@ -1783,43 +2234,50 @@ impl BridgeState {
     ) {
         let last_emit = Arc::new(Mutex::new(Instant::now()));
         let started = Instant::now();
+        // 留空 speed_limit_bps，使在途任务动态跟随 CoreNode::rate_limiter() 实时全局限速而非静态冻结
         let opts = TransferQueueOptions {
             conflict,
             concurrency: 4,
-            speed_limit_bps: self.node.rate_limiter().limit_bps(),
+            speed_limit_bps: None,
         };
 
-        let make_cb = || {
-            let sink = self.sink.clone();
-            let last_c = last_emit.clone();
-            let tid = ui_task_id.clone();
-            let meta_c = meta.clone();
-            let ctrl_c = control.clone();
-            Arc::new(move |done: u64, tot: u64, speed: f64| {
-                let clean_tot = tot.max(done).max(1);
-                meta_c.bytes_done.store(done, Ordering::Relaxed);
-                meta_c.bytes_total.store(clean_tot, Ordering::Relaxed);
-                if ctrl_c.is_paused() {
-                    return;
-                }
-                emit_throttled_running(
-                    &sink,
-                    &last_c,
-                    UiTaskProgress {
-                        id: tid.clone(),
-                        kind: meta_c.kind,
-                        title: meta_c.title.clone(),
-                        src_device: meta_c.src_device.clone(),
-                        dst_device: meta_c.dst_device.clone(),
-                        bytes_done: done.min(clean_tot),
-                        bytes_total: clean_tot,
-                        speed,
-                        state: UiTaskState::Running,
-                        error: None,
-                    },
-                );
-            })
-        };
+        let make_cb =
+            |base_done: u64, total_scale: u64, base_total: u64| -> pcshare_core::ProgressCallback {
+                let sink = self.sink.clone();
+                let last_c = last_emit.clone();
+                let tid = ui_task_id.clone();
+                let meta_c = meta.clone();
+                let ctrl_c = control.clone();
+                Arc::new(move |done: u64, tot: u64, speed: f64| {
+                    let scaled_done = base_done.saturating_add(done);
+                    let scaled_tot = base_total
+                        .saturating_add(tot.saturating_mul(total_scale))
+                        .max(scaled_done)
+                        .max(1);
+                    meta_c.bytes_done.store(scaled_done, Ordering::Relaxed);
+                    meta_c.bytes_total.store(scaled_tot, Ordering::Relaxed);
+                    meta_c.speed_bits.store(speed.to_bits(), Ordering::Relaxed);
+                    if ctrl_c.is_paused() {
+                        return;
+                    }
+                    emit_throttled_running(
+                        &sink,
+                        &last_c,
+                        UiTaskProgress {
+                            id: tid.clone(),
+                            kind: meta_c.kind,
+                            title: meta_c.title.clone(),
+                            src_device: meta_c.src_device.clone(),
+                            dst_device: meta_c.dst_device.clone(),
+                            bytes_done: scaled_done.min(scaled_tot),
+                            bytes_total: scaled_tot,
+                            speed,
+                            state: UiTaskState::Running,
+                            error: None,
+                        },
+                    );
+                })
+            };
 
         let outcome: Result<u64, CoreError> = match meta.kind {
             UiTaskKind::Upload => {
@@ -1831,7 +2289,7 @@ impl BridgeState {
                         &dest_dir,
                         opts,
                         control.clone(),
-                        Some(make_cb()),
+                        Some(make_cb(0, 1, 0)),
                     )
                     .await
             }
@@ -1843,12 +2301,13 @@ impl BridgeState {
                         Path::new(&dest_dir),
                         opts,
                         control.clone(),
-                        Some(make_cb()),
+                        Some(make_cb(0, 1, 0)),
                     )
                     .await
             }
             UiTaskKind::Relay => {
-                // 任务 2.4：两台受控电脑之间优先建立一次性授权直传（数据不经过本机），仅在直连受阻时退回中转
+                // 任务 2.4：两台受控电脑之间优先建立一次性授权直传（数据不经过本机），
+                // 仅在连接/网络/不支持类错误时退回本机中转，确定性权限/路径/取消错误直接返回。
                 let direct_res = self
                     .node
                     .transfer_between_peers_direct(
@@ -1858,57 +2317,63 @@ impl BridgeState {
                         &dest_dir,
                         conflict,
                         control.cancel_token(),
-                        Some(make_cb()),
+                        Some(make_cb(0, 1, 0)),
                     )
                     .await;
                 match direct_res {
                     Ok(()) => Ok(meta.bytes_total.load(Ordering::Relaxed)),
-                    Err(CoreError::Cancelled) => Err(CoreError::Cancelled),
+                    Err(err) if !should_fallback_direct_to_relay(&err) => Err(err),
                     Err(_) => {
                         let relay_tmp = std::env::temp_dir().join(format!(
                             "pcshare_relay_dir_{}_{}",
                             ui_task_id,
                             fastrand::u64(..)
                         ));
-                        let _ = std::fs::create_dir_all(&relay_tmp);
-                        let dl_res = self
-                            .node
-                            .download_paths_from_peer(
-                                &meta.src_device,
-                                &sources,
-                                &relay_tmp,
-                                TransferQueueOptions {
-                                    conflict: ConflictPolicy::Overwrite,
-                                    concurrency: 4,
-                                    speed_limit_bps: self.node.rate_limiter().limit_bps(),
-                                },
-                                control.clone(),
-                                None,
-                            )
-                            .await;
-                        let up_res = match dl_res {
-                            Ok(_) => {
-                                let staged: Vec<PathBuf> = std::fs::read_dir(&relay_tmp)
-                                    .into_iter()
-                                    .flatten()
-                                    .flatten()
-                                    .map(|e| e.path())
-                                    .collect();
-                                self.node
-                                    .transfer_paths_to_peer(
-                                        &meta.dst_device,
-                                        &staged,
-                                        &dest_dir,
-                                        opts,
-                                        control.clone(),
-                                        Some(make_cb()),
-                                    )
-                                    .await
-                            }
-                            Err(e) => Err(e),
-                        };
-                        let _ = std::fs::remove_dir_all(&relay_tmp);
-                        up_res
+                        if let Err(e) = tokio::fs::create_dir_all(&relay_tmp).await {
+                            Err(CoreError::Io(e))
+                        } else {
+                            let dl_res = self
+                                .node
+                                .download_paths_from_peer(
+                                    &meta.src_device,
+                                    &sources,
+                                    &relay_tmp,
+                                    TransferQueueOptions {
+                                        conflict: ConflictPolicy::Overwrite,
+                                        concurrency: 4,
+                                        speed_limit_bps: None,
+                                    },
+                                    control.clone(),
+                                    Some(make_cb(0, 2, 0)),
+                                )
+                                .await;
+                            let up_res = match dl_res {
+                                Ok(dl_bytes) => {
+                                    let dl_base =
+                                        dl_bytes.max(meta.bytes_done.load(Ordering::Relaxed));
+                                    let mut staged = Vec::new();
+                                    if let Ok(mut rd) = tokio::fs::read_dir(&relay_tmp).await {
+                                        while let Ok(Some(item)) = rd.next_entry().await {
+                                            staged.push(item.path());
+                                        }
+                                    }
+                                    self.node
+                                        .transfer_paths_to_peer(
+                                            &meta.dst_device,
+                                            &staged,
+                                            &dest_dir,
+                                            opts,
+                                            control.clone(),
+                                            Some(make_cb(dl_base, 1, dl_base)),
+                                        )
+                                        .await
+                                        .map(|up_bytes| dl_base.saturating_add(up_bytes))
+                                }
+                                Err(e) => Err(e),
+                            };
+                            let _ = tokio::fs::remove_dir_all(&relay_tmp).await;
+                            up_res
+                        }
                     }
                 }
             }
@@ -1980,8 +2445,7 @@ impl BridgeState {
         self: Arc<Self>,
         ui_task_id: String,
         raw_task_id: String,
-        kind: UiTaskKind,
-        title: String,
+        meta: FsTaskMeta,
     ) {
         let mut rx = self.node.fs_service().subscribe_task_events();
         let started = Instant::now();
@@ -1989,37 +2453,97 @@ impl BridgeState {
 
         loop {
             tokio::select! {
+                _ = self.shutdown.cancelled() => break,
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                    if let Ok(p) = self.node.fs_service().task_status(&raw_task_id)
-                        && emit_fs_task_progress(
-                            &self.sink,
-                            &last_emit,
-                            &ui_task_id,
-                            kind,
-                            &title,
-                            SELF_ID,
-                            &p,
-                            started,
-                        )
-                    {
-                        break;
+                    match self.node.fs_service().task_status(&raw_task_id) {
+                        Ok(p) => {
+                            if emit_fs_task_progress(
+                                &self.sink,
+                                &last_emit,
+                                &ui_task_id,
+                                &meta,
+                                &p,
+                                started,
+                            ) {
+                                break;
+                            }
+                        }
+                        Err(rpc) => {
+                            self.sink.emit_task_progress(UiTaskProgress {
+                                id: ui_task_id.clone(),
+                                kind: meta.kind,
+                                title: meta.title.clone(),
+                                src_device: meta.device_id.clone(),
+                                dst_device: meta.device_id.clone(),
+                                bytes_done: meta.bytes_done.load(Ordering::Relaxed),
+                                bytes_total: meta.bytes_total.load(Ordering::Relaxed).max(1),
+                                speed: 0.0,
+                                state: UiTaskState::Failed,
+                                error: Some(map_rpc_error(&rpc)),
+                            });
+                            break;
+                        }
                     }
                 }
                 ev = rx.recv() => {
-                    if let Ok((_peer, RemoteEvent::TaskProgress(p))) = ev
-                        && p.task_id == raw_task_id
-                        && emit_fs_task_progress(
-                            &self.sink,
-                            &last_emit,
-                            &ui_task_id,
-                            kind,
-                            &title,
-                            SELF_ID,
-                            &p,
-                            started,
-                        )
-                    {
-                        break;
+                    match ev {
+                        Ok((_peer, RemoteEvent::TaskProgress(p))) if p.task_id == raw_task_id => {
+                            if emit_fs_task_progress(
+                                &self.sink,
+                                &last_emit,
+                                &ui_task_id,
+                                &meta,
+                                &p,
+                                started,
+                            ) {
+                                break;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            match self.node.fs_service().task_status(&raw_task_id) {
+                                Ok(p) => {
+                                    if emit_fs_task_progress(
+                                        &self.sink,
+                                        &last_emit,
+                                        &ui_task_id,
+                                        &meta,
+                                        &p,
+                                        started,
+                                    ) {
+                                        break;
+                                    }
+                                }
+                                Err(rpc) => {
+                                    self.sink.emit_task_progress(UiTaskProgress {
+                                        id: ui_task_id.clone(),
+                                        kind: meta.kind,
+                                        title: meta.title.clone(),
+                                        src_device: meta.device_id.clone(),
+                                        dst_device: meta.device_id.clone(),
+                                        bytes_done: meta.bytes_done.load(Ordering::Relaxed),
+                                        bytes_total: meta.bytes_total.load(Ordering::Relaxed).max(1),
+                                        speed: 0.0,
+                                        state: UiTaskState::Failed,
+                                        error: Some(map_rpc_error(&rpc)),
+                                    });
+                                    break;
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            if let Ok(p) = self.node.fs_service().task_status(&raw_task_id) {
+                                let _ = emit_fs_task_progress(
+                                    &self.sink,
+                                    &last_emit,
+                                    &ui_task_id,
+                                    &meta,
+                                    &p,
+                                    started,
+                                );
+                            }
+                            break;
+                        }
                     }
                 }
             }
@@ -2035,22 +2559,23 @@ impl BridgeState {
         ui_task_id: String,
         peer_id: String,
         raw_task_id: String,
-        kind: UiTaskKind,
-        title: String,
+        meta: FsTaskMeta,
     ) {
         let started = Instant::now();
         let last_emit = Mutex::new(Instant::now() - PROGRESS_THROTTLE);
 
         loop {
-            match self.node.remote_task_status(&peer_id, &raw_task_id).await {
+            let status_res = tokio::select! {
+                _ = self.shutdown.cancelled() => break,
+                res = self.node.remote_task_status(&peer_id, &raw_task_id) => res,
+            };
+            match status_res {
                 Ok(p) => {
                     if emit_fs_task_progress(
                         &self.sink,
                         &last_emit,
                         &ui_task_id,
-                        kind,
-                        &title,
-                        &peer_id,
+                        &meta,
                         &p,
                         started,
                     ) {
@@ -2060,12 +2585,12 @@ impl BridgeState {
                 Err(err) => {
                     self.sink.emit_task_progress(UiTaskProgress {
                         id: ui_task_id.clone(),
-                        kind,
-                        title,
-                        src_device: peer_id.clone(),
-                        dst_device: peer_id,
-                        bytes_done: 0,
-                        bytes_total: 1,
+                        kind: meta.kind,
+                        title: meta.title.clone(),
+                        src_device: meta.device_id.clone(),
+                        dst_device: meta.device_id.clone(),
+                        bytes_done: meta.bytes_done.load(Ordering::Relaxed),
+                        bytes_total: meta.bytes_total.load(Ordering::Relaxed).max(1),
                         speed: 0.0,
                         state: UiTaskState::Failed,
                         error: Some(map_core_error(&err)),
@@ -2073,7 +2598,10 @@ impl BridgeState {
                     break;
                 }
             }
-            tokio::time::sleep(PROGRESS_THROTTLE).await;
+            tokio::select! {
+                _ = self.shutdown.cancelled() => break,
+                _ = tokio::time::sleep(PROGRESS_THROTTLE) => {}
+            }
         }
         self.active_tasks
             .lock()
@@ -2083,6 +2611,23 @@ impl BridgeState {
 }
 
 // ────────────────────────────── 映射与工具函数 ──────────────────────────────
+
+/// 仅对连接、超时、协议帧或不支持直传等网络/能力错误回退本机中转；
+/// 权限不足、文件不存在、参数非法、已取消、被控暂停等确定性错误直接报错，避免无效下载。
+pub fn should_fallback_direct_to_relay(err: &CoreError) -> bool {
+    match err {
+        CoreError::NotConnected(_) | CoreError::Timeout | CoreError::Frame(_) => true,
+        CoreError::Rpc(rpc) => matches!(
+            rpc.code,
+            ErrorCode::Unsupported | ErrorCode::Io | ErrorCode::Internal
+        ),
+        CoreError::Internal(_) => true,
+        CoreError::Cancelled
+        | CoreError::InvalidArgument(_)
+        | CoreError::Platform(_)
+        | CoreError::Io(_) => false,
+    }
+}
 
 fn emit_throttled_running(
     sink: &Arc<dyn EventSink>,
@@ -2097,14 +2642,11 @@ fn emit_throttled_running(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn emit_fs_task_progress(
     sink: &Arc<dyn EventSink>,
     last_emit: &Mutex<Instant>,
     ui_task_id: &str,
-    kind: UiTaskKind,
-    title: &str,
-    device_id: &str,
+    meta: &FsTaskMeta,
     p: &FsTaskProgress,
     started: Instant,
 ) -> bool {
@@ -2116,18 +2658,23 @@ fn emit_fs_task_progress(
         FsTaskState::Failed => (UiTaskState::Failed, true),
         FsTaskState::Cancelled => (UiTaskState::Cancelled, true),
     };
+    let bytes_done = if state == UiTaskState::Done {
+        total
+    } else {
+        p.processed_bytes.min(total)
+    };
+    meta.bytes_done.store(bytes_done, Ordering::Relaxed);
+    meta.bytes_total.store(total, Ordering::Relaxed);
+    meta.speed_bits.store(speed.to_bits(), Ordering::Relaxed);
+
     let error = p.error.as_ref().map(map_rpc_error);
     let payload = UiTaskProgress {
         id: ui_task_id.to_string(),
-        kind,
-        title: title.to_string(),
-        src_device: device_id.to_string(),
-        dst_device: device_id.to_string(),
-        bytes_done: if state == UiTaskState::Done {
-            total
-        } else {
-            p.processed_bytes.min(total)
-        },
+        kind: meta.kind,
+        title: meta.title.clone(),
+        src_device: meta.device_id.clone(),
+        dst_device: meta.device_id.clone(),
+        bytes_done,
         bytes_total: total,
         speed,
         state,
@@ -2256,7 +2803,7 @@ fn convert_entry(e: DirEntry) -> UiFsEntry {
     }
 }
 
-fn classify_launch_target(target: &str) -> LaunchKind {
+pub async fn classify_launch_target(target: &str, is_local: bool) -> LaunchKind {
     let t = target.trim();
     let bytes = t.as_bytes();
     let is_drive_path = bytes.len() >= 3
@@ -2270,8 +2817,11 @@ fn classify_launch_target(target: &str) -> LaunchKind {
         || t.starts_with("https://")
     {
         LaunchKind::PathOrTarget
-    } else if let Ok(clean) = normalize_lexical_absolute(t)
-        && to_fs_path(&clean).exists()
+    } else if is_local
+        && let Ok(clean) = normalize_lexical_absolute(t)
+        && tokio::fs::try_exists(to_fs_path(&clean))
+            .await
+            .unwrap_or(false)
     {
         LaunchKind::PathOrTarget
     } else {
@@ -2380,5 +2930,80 @@ fn map_core_error(err: &CoreError) -> ApiErrorBody {
             code: UiErrorCode::Internal,
             msg: msg.clone(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn icon_cache_enforces_limit_and_clears_removed_device() {
+        let mut cache = IconCache::new(3);
+        cache.insert("devA|app1".to_string(), "data:1".to_string());
+        cache.insert("devA|app2".to_string(), "data:2".to_string());
+        cache.insert("devB|app1".to_string(), "data:3".to_string());
+        // 命中 devA|app1 使其成为最近使用，下一次插入应淘汰 devA|app2
+        assert_eq!(cache.get("devA|app1").as_deref(), Some("data:1"));
+        cache.insert("devB|app2".to_string(), "data:4".to_string());
+        assert_eq!(cache.len(), 3);
+        assert!(cache.get("devA|app2").is_none());
+        assert_eq!(cache.get("devA|app1").as_deref(), Some("data:1"));
+
+        cache.remove_device("devB");
+        assert_eq!(cache.len(), 1);
+        assert!(cache.get("devB|app1").is_none());
+        assert!(cache.get("devB|app2").is_none());
+        assert_eq!(cache.get("devA|app1").as_deref(), Some("data:1"));
+    }
+
+    #[test]
+    fn direct_transfer_fallback_distinguishes_deterministic_vs_network_errors() {
+        assert!(!should_fallback_direct_to_relay(&CoreError::Cancelled));
+        assert!(!should_fallback_direct_to_relay(&CoreError::InvalidArgument(
+            "bad".into()
+        )));
+        for code in [
+            ErrorCode::Forbidden,
+            ErrorCode::Unauthorized,
+            ErrorCode::NotFound,
+            ErrorCode::AlreadyExists,
+            ErrorCode::Invalid,
+            ErrorCode::Cancelled,
+            ErrorCode::Busy,
+        ] {
+            let err = CoreError::Rpc(RpcError::new(code, "deterministic"));
+            assert!(
+                !should_fallback_direct_to_relay(&err),
+                "code {code:?} must not fallback to relay"
+            );
+        }
+
+        assert!(should_fallback_direct_to_relay(&CoreError::NotConnected(
+            "offline".into()
+        )));
+        assert!(should_fallback_direct_to_relay(&CoreError::Timeout));
+        assert!(should_fallback_direct_to_relay(&CoreError::Rpc(
+            RpcError::new(ErrorCode::Unsupported, "old peer")
+        )));
+    }
+
+    #[tokio::test]
+    async fn classify_launch_target_only_checks_local_filesystem_for_self() {
+        assert_eq!(
+            classify_launch_target(r"C:\Windows\notepad.exe", false).await,
+            LaunchKind::PathOrTarget
+        );
+        assert_eq!(
+            classify_launch_target("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App", false).await,
+            LaunchKind::AppId
+        );
+        // 远端设备对非盘符/非协议格式绝不查本机文件系统
+        let cwd = std::env::current_dir().unwrap();
+        let rel_marker = cwd.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(
+            classify_launch_target(&rel_marker, false).await,
+            LaunchKind::AppId
+        );
     }
 }

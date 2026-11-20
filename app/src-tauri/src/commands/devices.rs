@@ -7,7 +7,8 @@ pub(crate) async fn self_info(state: State<'_, ManagedBridge>) -> Result<Reply<S
 
 #[tauri::command]
 pub(crate) async fn settings_get(state: State<'_, ManagedBridge>) -> Result<Reply<UiSettings>, ()> {
-    Ok(state.settings_get())
+    let bridge = state.inner().clone();
+    spawn_blocking_reply("读取设置任务", move || bridge.settings_get()).await
 }
 
 #[tauri::command]
@@ -16,16 +17,7 @@ pub(crate) async fn settings_set(
     settings: UiSettings,
 ) -> Result<Reply<()>, ()> {
     let bridge = state.inner().clone();
-    Ok(
-        tokio::task::spawn_blocking(move || bridge.settings_set(settings))
-            .await
-            .unwrap_or_else(|e| {
-                Reply::err(
-                    bridge::UiErrorCode::Internal,
-                    format!("保存设置任务异常：{e}"),
-                )
-            }),
-    )
+    spawn_blocking_reply("保存设置任务", move || bridge.settings_set(settings)).await
 }
 
 #[tauri::command]
@@ -40,7 +32,8 @@ pub(crate) async fn host_set_paused(
     state: State<'_, ManagedBridge>,
     paused: bool,
 ) -> Result<Reply<()>, ()> {
-    Ok(state.host_set_paused(paused))
+    let bridge = state.inner().clone();
+    spawn_blocking_reply("切换被控状态任务", move || bridge.host_set_paused(paused)).await
 }
 
 #[tauri::command]
@@ -61,7 +54,8 @@ pub(crate) async fn device_rename(
     id: String,
     name: String,
 ) -> Result<Reply<()>, ()> {
-    Ok(state.device_rename(id, name))
+    let bridge = state.inner().clone();
+    spawn_blocking_reply("重命名设备任务", move || bridge.device_rename(id, name)).await
 }
 
 #[tauri::command]
@@ -69,7 +63,8 @@ pub(crate) async fn device_remove(
     state: State<'_, ManagedBridge>,
     id: String,
 ) -> Result<Reply<()>, ()> {
-    Ok(state.device_remove(id))
+    let bridge = state.inner().clone();
+    spawn_blocking_reply("移除设备任务", move || bridge.device_remove(id)).await
 }
 
 #[tauri::command]
@@ -78,7 +73,11 @@ pub(crate) async fn device_set_permissions(
     id: String,
     permissions: UiPermissions,
 ) -> Result<Reply<()>, ()> {
-    Ok(state.device_set_permissions(id, permissions))
+    let bridge = state.inner().clone();
+    spawn_blocking_reply("保存设备权限任务", move || {
+        bridge.device_set_permissions(id, permissions)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -115,5 +114,16 @@ pub(crate) async fn pair_respond(
     allow: bool,
     permissions: UiPermissions,
 ) -> Result<Reply<()>, ()> {
-    Ok(state.pair_respond(request_id, allow, permissions))
+    let bridge = state.inner().clone();
+    spawn_blocking_reply("审批配对请求任务", move || {
+        bridge.pair_respond(request_id, allow, permissions)
+    })
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn pair_pending_list(
+    state: State<'_, ManagedBridge>,
+) -> Result<Reply<Vec<UiPairRequest>>, ()> {
+    Ok(state.pair_pending_list())
 }

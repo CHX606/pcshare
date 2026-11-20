@@ -7,8 +7,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use pcshare_proto::{ConflictPolicy, ErrorCode, FsHashArgs, FsHashReply, RpcError};
@@ -21,6 +22,9 @@ use crate::error::{CoreError, map_platform_to_rpc};
 use crate::events::{CoreEvent, EditSyncPrompt};
 
 const EDIT_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
+const MAX_EDIT_SESSIONS: usize = 32;
+const EDIT_SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
+const STALE_CACHE_DIR_AGE: Duration = Duration::from_secs(24 * 3600);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalEditSessionInfo {
@@ -50,6 +54,7 @@ struct ManagedEditSession {
     info: LocalEditSessionInfo,
     last_synced_local_hash: String,
     auto_sync_approved: bool,
+    last_activity: Instant,
     _watcher: Option<RecommendedWatcher>,
 }
 
@@ -63,6 +68,7 @@ impl EditSyncManager {
     pub fn new(data_dir: &Path, events_tx: broadcast::Sender<CoreEvent>) -> Arc<Self> {
         let cache_root = data_dir.join("edit_cache");
         let _ = fs::create_dir_all(&cache_root);
+        cleanup_stale_cache_dirs(&cache_root);
         Arc::new(Self {
             cache_root,
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -70,11 +76,104 @@ impl EditSyncManager {
         })
     }
 
-    pub fn shutdown(&self) {
-        self.sessions
+    pub fn close_session(&self, session_id: &str) {
+        let removed = self
+            .sessions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clear();
+            .remove(session_id);
+        if let Some(sess) = removed
+            && let Some(dir) = sess.info.local_path.parent()
+        {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    pub fn remove_peer_sessions(&self, peer_id: &str) {
+        let mut to_remove_dirs = Vec::new();
+        {
+            let mut guard = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            guard.retain(|_, sess| {
+                if sess.info.peer_id == peer_id {
+                    if let Some(dir) = sess.info.local_path.parent() {
+                        to_remove_dirs.push(dir.to_path_buf());
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        for dir in to_remove_dirs {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    fn prune_expired_sessions(&self) {
+        let mut evicted_dirs = Vec::new();
+        {
+            let mut guard = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            guard.retain(|_, sess| {
+                if sess.last_activity.elapsed() >= EDIT_SESSION_TTL {
+                    if let Some(dir) = sess.info.local_path.parent() {
+                        evicted_dirs.push(dir.to_path_buf());
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+            while guard.len() >= MAX_EDIT_SESSIONS {
+                let oldest = guard
+                    .iter()
+                    .min_by_key(|(_, s)| s.last_activity)
+                    .map(|(k, _)| k.clone());
+                let Some(k) = oldest else { break };
+                if let Some(sess) = guard.remove(&k)
+                    && let Some(dir) = sess.info.local_path.parent()
+                {
+                    evicted_dirs.push(dir.to_path_buf());
+                }
+            }
+        }
+        for dir in evicted_dirs {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    pub fn shutdown(&self) {
+        let dirs: Vec<PathBuf> = {
+            let mut guard = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            let list = guard
+                .values()
+                .filter_map(|s| s.info.local_path.parent().map(Path::to_path_buf))
+                .collect();
+            guard.clear();
+            list
+        };
+        for dir in dirs {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+}
+
+fn cleanup_stale_cache_dirs(cache_root: &Path) {
+    let Ok(rd) = fs::read_dir(cache_root) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for item in rd.flatten() {
+        let path = item.path();
+        if let Ok(meta) = item.metadata()
+            && let Ok(mtime) = meta.modified()
+            && now.duration_since(mtime).unwrap_or_default() >= STALE_CACHE_DIR_AGE
+        {
+            if meta.is_dir() {
+                let _ = fs::remove_dir_all(&path);
+            } else {
+                let _ = fs::remove_file(&path);
+            }
+        }
     }
 }
 
@@ -90,6 +189,13 @@ fn hash_file_blake3(path: &Path) -> std::io::Result<String> {
         hasher.update(&buf[..n]);
     }
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+async fn hash_file_blake3_async(path: PathBuf) -> Result<String, CoreError> {
+    tokio::task::spawn_blocking(move || hash_file_blake3(&path))
+        .await
+        .map_err(|e| CoreError::Internal(format!("计算本地文件校验值异常：{e}")))?
+        .map_err(CoreError::Io)
 }
 
 impl CoreNode {
@@ -154,7 +260,7 @@ impl CoreNode {
         )
         .await?;
 
-        let local_hash = hash_file_blake3(&local_path)?;
+        let local_hash = hash_file_blake3_async(local_path.clone()).await?;
         let info = LocalEditSessionInfo {
             session_id: session_id.clone(),
             peer_id: peer_id.to_string(),
@@ -165,6 +271,7 @@ impl CoreNode {
             baseline_blake3_hex: baseline.blake3_hex,
         };
 
+        self.edit_sync_manager().prune_expired_sessions();
         let watcher = self.spawn_edit_file_watcher(&info)?;
         {
             let mut guard = self
@@ -178,6 +285,7 @@ impl CoreNode {
                     info: info.clone(),
                     last_synced_local_hash: local_hash,
                     auto_sync_approved: false,
+                    last_activity: Instant::now(),
                     _watcher: Some(watcher),
                 },
             );
@@ -207,26 +315,24 @@ impl CoreNode {
             .to_path_buf();
         let target_file = info.local_path.clone();
         let rt_handle = tokio::runtime::Handle::current();
-        let last_emit = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(5)));
+        // 尾沿防抖代号：编辑器原子保存的多步写/改名事件合并到最后一次稳定 300ms 后触发
+        let debounce_gen = Arc::new(AtomicU64::new(0));
 
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             let Ok(event) = res else { return };
             if matches!(event.kind, notify::EventKind::Access(_)) {
                 return;
             }
-            {
-                let mut guard = last_emit.lock().unwrap_or_else(|e| e.into_inner());
-                if guard.elapsed() < EDIT_SAVE_DEBOUNCE {
-                    return;
-                }
-                *guard = Instant::now();
-            }
+            let my_gen = debounce_gen.fetch_add(1, Ordering::SeqCst) + 1;
+            let gen_ref = debounce_gen.clone();
             let weak = weak_node.clone();
             let sid = session_id.clone();
             let file_p = target_file.clone();
             rt_handle.spawn(async move {
-                // Allow editor atomic rename/flush to settle
-                tokio::time::sleep(Duration::from_millis(120)).await;
+                tokio::time::sleep(EDIT_SAVE_DEBOUNCE).await;
+                if gen_ref.load(Ordering::SeqCst) != my_gen {
+                    return;
+                }
                 let Some(node) = weak.upgrade() else { return };
                 node.on_local_edit_file_changed(&sid, &file_p).await;
             });
@@ -240,18 +346,19 @@ impl CoreNode {
     }
 
     async fn on_local_edit_file_changed(self: &Arc<Self>, session_id: &str, file_path: &Path) {
-        let Ok(current_hash) = hash_file_blake3(file_path) else {
+        let Ok(current_hash) = hash_file_blake3_async(file_path.to_path_buf()).await else {
             return;
         };
         let (prompt, auto_approved) = {
-            let guard = self
+            let mut guard = self
                 .edit_sync_manager()
                 .sessions
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            let Some(sess) = guard.get(session_id) else {
+            let Some(sess) = guard.get_mut(session_id) else {
                 return;
             };
+            sess.last_activity = Instant::now();
             if current_hash == sess.last_synced_local_hash {
                 return;
             }
@@ -298,15 +405,17 @@ impl CoreNode {
                     "找不到对应的本地编辑会话",
                 ))
             })?;
+            sess.last_activity = Instant::now();
             if remember_auto_sync {
                 sess.auto_sync_approved = true;
             }
             sess.info.clone()
         };
 
-        let new_local_hash = hash_file_blake3(&info.local_path)?;
+        let new_local_hash = hash_file_blake3_async(info.local_path.clone()).await?;
 
-        // Check current remote file hash before uploading back!
+        // 回传前必须核对远端当前校验值；仅当明确 NotFound（远端已删除）时按新建/覆盖放行，
+        // 遇到超时、断网、文件占用、权限不足等错误一律中止回传，绝不盲目覆盖。
         let remote_hash_res: Result<FsHashReply, CoreError> = self
             .call_rpc(
                 &info.peer_id,
@@ -317,26 +426,29 @@ impl CoreNode {
             )
             .await;
 
-        if let Ok(ref remote_hash) = remote_hash_res
-            && remote_hash.blake3_hex != info.baseline_blake3_hex
-            && !force_overwrite_conflict
-        {
-            let _ = self
-                .edit_sync_manager()
-                .events_tx
-                .send(CoreEvent::EditSyncPromptNeeded(EditSyncPrompt {
-                    session_id: info.session_id.clone(),
-                    peer_id: info.peer_id.clone(),
-                    peer_name: info.peer_name.clone(),
-                    remote_path: info.remote_path.clone(),
-                    local_path: info.local_path.to_string_lossy().to_string(),
-                    file_name: info.file_name.clone(),
-                    conflict: true,
-                }));
-            return Ok(EditSyncOutcome::ConflictDetected {
-                baseline_blake3_hex: info.baseline_blake3_hex,
-                remote_blake3_hex: remote_hash.blake3_hex.clone(),
-            });
+        match remote_hash_res {
+            Ok(remote_hash) => {
+                if remote_hash.blake3_hex != info.baseline_blake3_hex && !force_overwrite_conflict {
+                    let _ = self
+                        .edit_sync_manager()
+                        .events_tx
+                        .send(CoreEvent::EditSyncPromptNeeded(EditSyncPrompt {
+                            session_id: info.session_id.clone(),
+                            peer_id: info.peer_id.clone(),
+                            peer_name: info.peer_name.clone(),
+                            remote_path: info.remote_path.clone(),
+                            local_path: info.local_path.to_string_lossy().to_string(),
+                            file_name: info.file_name.clone(),
+                            conflict: true,
+                        }));
+                    return Ok(EditSyncOutcome::ConflictDetected {
+                        baseline_blake3_hex: info.baseline_blake3_hex,
+                        remote_blake3_hex: remote_hash.blake3_hex,
+                    });
+                }
+            }
+            Err(CoreError::Rpc(ref rpc)) if rpc.code == ErrorCode::NotFound => {}
+            Err(err) => return Err(err),
         }
 
         let done = self
@@ -359,6 +471,7 @@ impl CoreNode {
             if let Some(sess) = guard.get_mut(session_id) {
                 sess.info.baseline_blake3_hex = new_local_hash.clone();
                 sess.last_synced_local_hash = new_local_hash.clone();
+                sess.last_activity = Instant::now();
             }
         }
 

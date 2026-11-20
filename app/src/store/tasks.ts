@@ -16,6 +16,7 @@ interface TasksState {
   panelOpen: boolean
   speedLimitBps: number | null
   upsert(p: TaskProgress): void
+  mergeSnapshot(list: TaskProgress[]): void
   pause(id: string): Promise<void>
   resume(id: string): Promise<void>
   cancel(id: string): Promise<void>
@@ -39,24 +40,42 @@ export function registerTask(id: string, target: TaskTarget) {
 const VERB = { upload: '上传', download: '下载', relay: '传输', copy: '复制', move: '移动' } as const
 const isActive = (s: TaskProgress['state']) => s === 'running' || s === 'paused'
 
-export const useTasks = create<TasksState>()((set) => ({
+export const useTasks = create<TasksState>()((set, get) => ({
   tasks: [],
   panelOpen: false,
   speedLimitBps: null,
   upsert(p) {
+    const prev = get().tasks.find((t) => t.id === p.id)
+    const shouldAnnounce =
+      (prev && isActive(prev.state) && !isActive(p.state)) || (!prev && !isActive(p.state))
     set((s) => {
       const i = s.tasks.findIndex((t) => t.id === p.id)
-      const prev = i >= 0 ? s.tasks[i] : undefined
-      if ((prev && isActive(prev.state) && !isActive(p.state)) || (!prev && !isActive(p.state))) {
-        announce(p)
-      }
-      if (!prev) {
+      if (i < 0) {
         const isTransfer = p.kind === 'upload' || p.kind === 'download' || p.kind === 'relay'
         return { tasks: [p, ...s.tasks], panelOpen: s.panelOpen || isTransfer }
       }
       const tasks = s.tasks.slice()
       tasks[i] = p
       return { tasks }
+    })
+    if (shouldAnnounce) announce(p)
+  },
+  mergeSnapshot(list) {
+    if (!list.length) return
+    set((s) => {
+      const existingIds = new Set(s.tasks.map((t) => t.id))
+      const added: TaskProgress[] = []
+      let openPanel = s.panelOpen
+      for (const item of list) {
+        if (existingIds.has(item.id)) continue
+        existingIds.add(item.id)
+        added.push(item)
+        if (isActive(item.state) && (item.kind === 'upload' || item.kind === 'download' || item.kind === 'relay')) {
+          openPanel = true
+        }
+      }
+      if (!added.length) return s
+      return { tasks: [...s.tasks, ...added], panelOpen: openPanel }
     })
   },
   async pause(id) {
@@ -111,9 +130,22 @@ function announce(p: TaskProgress) {
 }
 
 export function wireTaskEvents(): () => void {
+  let active = true
+  const off = backend.on('task-progress', (p) => useTasks.getState().upsert(p))
   void backend
     .getSpeedLimit()
-    .then((bps) => useTasks.setState({ speedLimitBps: bps }))
+    .then((bps) => {
+      if (active) useTasks.setState({ speedLimitBps: bps })
+    })
     .catch(() => {})
-  return backend.on('task-progress', (p) => useTasks.getState().upsert(p))
+  void backend
+    .taskList()
+    .then((snapshot) => {
+      if (active && snapshot.length > 0) useTasks.getState().mergeSnapshot(snapshot)
+    })
+    .catch(() => {})
+  return () => {
+    active = false
+    off()
+  }
 }

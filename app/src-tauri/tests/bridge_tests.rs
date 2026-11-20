@@ -33,6 +33,7 @@ struct RecordingSink {
     fs_changes: Mutex<Vec<UiFsChangedEvent>>,
     lan_changes: Mutex<Vec<Vec<UiLanPeer>>>,
     host_paused: Mutex<Vec<bool>>,
+    launcher_toggles: Mutex<usize>,
     search_batches: Mutex<Vec<UiFsSearchBatchEvent>>,
     term_outputs: Mutex<Vec<UiTermOutputEvent>>,
     edit_prompts: Mutex<Vec<UiEditSyncPrompt>>,
@@ -72,6 +73,10 @@ impl EventSink for RecordingSink {
 
     fn emit_host_paused(&self, paused: bool) {
         self.host_paused.lock().unwrap().push(paused);
+    }
+
+    fn emit_launcher_toggle(&self) {
+        *self.launcher_toggles.lock().unwrap() += 1;
     }
 
     fn emit_fs_search_batch(&self, batch: UiFsSearchBatchEvent) {
@@ -359,7 +364,7 @@ async fn bridge_commands_and_events_cover_full_stage1_contract() {
     assert_eq!(std::fs::read(dl_dir.join("已改名.bin")).unwrap().len(), payload.len());
 
     // 7. Apps & Processes on both `self` and remote
-    let apps = unwrap_ok(client.app_list(host_id.clone()).await);
+    let apps = unwrap_ok(client.app_list(host_id.clone(), false).await);
     assert!(!apps.is_empty());
     let missing_launch = unwrap_err(
         client
@@ -565,7 +570,7 @@ async fn bridge_stage2_cache_watch_batches_folder_transfer_pause_direct_p2p_icon
     );
     unwrap_ok(peer_a.host_set_paused(false));
 
-    let apps = unwrap_ok(ctrl.app_list(SELF_ID.to_string()).await);
+    let apps = unwrap_ok(ctrl.app_list(SELF_ID.to_string(), false).await);
     if let Some(first_app) = apps.first() {
         let _ = unwrap_ok(ctrl.app_icon(SELF_ID.to_string(), first_app.id.clone()).await);
     }
@@ -743,6 +748,375 @@ async fn bridge_stage3_search_shot_term_power_edit_quick_and_batch() {
     ctrl.shutdown().await;
     host.shutdown().await;
     let _ = std::fs::remove_dir_all(work);
+    let _ = std::fs::remove_dir_all(ctrl_dir);
+    let _ = std::fs::remove_dir_all(host_dir);
+}
+
+#[test]
+fn single_instance_rejects_unauthenticated_wakeup_and_accepts_valid_token() {
+    use std::io::Write as _;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
+
+    let dir = temp_dir("single_inst_tok");
+    let wake_count = Arc::new(AtomicUsize::new(0));
+    let wc = wake_count.clone();
+
+    let primary = SingleInstanceGuard::try_acquire(&dir, move || {
+        wc.fetch_add(1, Ordering::SeqCst);
+    })
+    .expect("primary instance must acquire guard");
+
+    let port_file = dir.join("ui_instance.port");
+    let content = std::fs::read_to_string(&port_file).expect("port file written");
+    let mut parts = content.split_whitespace();
+    let port: u16 = parts.next().expect("port").parse().expect("u16 port");
+    let token = parts.next().expect("wake token");
+    assert!(token.len() >= 16, "wake token should be non-trivial hex");
+
+    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+
+    // 无令牌或错误令牌的陌生本机连接不得唤醒窗口
+    for bogus in [b"SHOW\n".as_slice(), b"SHOW wrongtoken\n".as_slice()] {
+        let mut s = TcpStream::connect_timeout(&addr, Duration::from_millis(500)).unwrap();
+        s.write_all(bogus).unwrap();
+        s.flush().unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(
+        wake_count.load(Ordering::SeqCst),
+        0,
+        "unauthenticated SHOW packets must be rejected"
+    );
+
+    // 携带正确令牌时应正常唤醒
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_millis(500)).unwrap();
+    s.write_all(format!("SHOW {token}\n").as_bytes()).unwrap();
+    s.flush().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while wake_count.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+
+    drop(primary);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn launcher_hotkey_sets_pending_only_on_cold_start() {
+    let (bridge, sink, dir) = spawn_bridge("launcher_hk").await;
+
+    // 窗口已存在时（cold_started = false）：直接发送 toggle，且不残留 pending
+    bridge.on_launcher_hotkey(false);
+    assert_eq!(*sink.launcher_toggles.lock().unwrap(), 1);
+    assert!(!unwrap_ok(bridge.launcher_consume_pending()));
+
+    // 窗口冷启新建时（cold_started = true）：仅置位 pending，不额外发送 toggle 避免抵消
+    bridge.on_launcher_hotkey(true);
+    assert_eq!(*sink.launcher_toggles.lock().unwrap(), 1);
+    assert!(unwrap_ok(bridge.launcher_consume_pending()));
+    assert!(!unwrap_ok(bridge.launcher_consume_pending()));
+
+    bridge.shutdown().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn pending_pair_and_edit_queues_survive_cold_window_and_clear_after_handling() {
+    let (ctrl, _ctrl_sink, ctrl_dir) = spawn_bridge("pending_ctrl").await;
+    let (host, _host_sink, host_dir) = spawn_bridge("pending_host").await;
+    let work = temp_dir("pending_work");
+    std::fs::write(work.join("待回存文档.txt"), "原始内容").unwrap();
+
+    // 1. 模拟窗口未就绪（不消费 pair://request 事件），仅凭 pair_pending_list 补显并审批配对
+    let offer = unwrap_ok(host.pair_begin());
+    let host_clone = host.clone();
+    tokio::spawn(async move {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let pending = unwrap_ok(host_clone.pair_pending_list());
+            if let Some(req) = pending.first().cloned() {
+                unwrap_ok(host_clone.pair_respond(
+                    req.request_id,
+                    true,
+                    UiPermissions::default_stage1(),
+                ));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pair_pending_list did not expose pending pairing request"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    });
+
+    let paired = unwrap_ok(ctrl.pair_connect(offer.invite, String::new()).await);
+    let host_id = paired.id;
+    assert!(
+        unwrap_ok(host.pair_pending_list()).is_empty(),
+        "handled pairing request must be removed from pending list"
+    );
+
+    // 2. 模拟编辑回存提示在窗口未就绪时由 edit_pending_list 暂存，回存后清除
+    let remote_file = work.join("待回存文档.txt").to_string_lossy().to_string();
+    let edit_sess = unwrap_ok(
+        ctrl.fs_open_local_edit(host_id.clone(), remote_file, Some(false))
+            .await,
+    );
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    std::fs::write(&edit_sess.local_path, "冷启窗口后补显的修改").unwrap();
+
+    let edit_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let pending = unwrap_ok(ctrl.edit_pending_list());
+        if pending.iter().any(|p| p.session_id == edit_sess.session_id) {
+            break;
+        }
+        assert!(
+            Instant::now() < edit_deadline,
+            "edit_pending_list did not capture edit prompt"
+        );
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+
+    let sync_res = unwrap_ok(
+        ctrl.fs_edit_sync_back(edit_sess.session_id.clone(), false, false)
+            .await,
+    );
+    assert!(!sync_res.conflict);
+    assert!(
+        !unwrap_ok(ctrl.edit_pending_list())
+            .iter()
+            .any(|p| p.session_id == edit_sess.session_id),
+        "synced edit prompt must be removed from pending list"
+    );
+
+    ctrl.shutdown().await;
+    host.shutdown().await;
+    let _ = std::fs::remove_dir_all(work);
+    let _ = std::fs::remove_dir_all(ctrl_dir);
+    let _ = std::fs::remove_dir_all(host_dir);
+}
+
+#[tokio::test]
+async fn fs_check_conflicts_is_readonly_and_does_not_emit_batches_or_recent_folder() {
+    let (bridge, sink, dir) = spawn_bridge("readonly_conflict").await;
+    let large_dir = temp_dir("conflict_only_unique_7788");
+    for i in 0..550 {
+        std::fs::write(large_dir.join(format!("file_{i:03}.txt")), b"x").unwrap();
+    }
+    let path_str = large_dir.to_string_lossy().to_string();
+
+    let conflicts = unwrap_ok(
+        bridge
+            .fs_check_conflicts(
+                SELF_ID.to_string(),
+                path_str.clone(),
+                vec!["file_010.txt".to_string(), "not_there.txt".to_string()],
+            )
+            .await,
+    );
+    assert_eq!(conflicts, vec!["file_010.txt".to_string()]);
+    assert!(
+        sink.list_batches.lock().unwrap().is_empty(),
+        "fs_check_conflicts must not emit fs://list-batch events"
+    );
+    let recent_hits = unwrap_ok(bridge.quick_search("conflict_only_unique_7788".to_string(), Some(10)));
+    assert!(
+        recent_hits.is_empty(),
+        "fs_check_conflicts must not record dest_dir into recent folders"
+    );
+
+    bridge.shutdown().await;
+    let _ = std::fs::remove_dir_all(large_dir);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn window_destroy_cleans_sessions_preserves_task_snapshot_and_cleans_drag_staging() {
+    let (ctrl, _ctrl_sink, ctrl_dir) = spawn_bridge("win_cleanup_ctrl").await;
+    let (host, host_sink, host_dir) = spawn_bridge("win_cleanup_host").await;
+    let work = temp_dir("win_cleanup_work");
+
+    // 配对 ctrl -> host
+    let offer = unwrap_ok(host.pair_begin());
+    let h_clone = host.clone();
+    let hs_clone = host_sink.clone();
+    tokio::spawn(async move {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(req) = hs_clone.pair_requests.lock().unwrap().first().cloned() {
+                unwrap_ok(h_clone.pair_respond(
+                    req.request_id,
+                    true,
+                    UiPermissions::default_stage1(),
+                ));
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    let host_id = unwrap_ok(ctrl.pair_connect(offer.invite, String::new()).await).id;
+
+    // 1. 建立本机终端、目录监听与搜索会话，然后模拟主窗口销毁，验证窗口级会话被清理
+    let term = unwrap_ok(
+        ctrl.term_open(SELF_ID.to_string(), "cmd".to_string(), 80, 24, None)
+            .await,
+    );
+    let watched = unwrap_ok(
+        ctrl.fs_watch(SELF_ID.to_string(), work.to_string_lossy().to_string())
+            .await,
+    );
+    assert!(watched >= 1);
+
+    // 2. 启动一个限速上传任务并暂停，验证关窗销毁后 task_list 仍能恢复暂停任务快照
+    let payload_file = work.join("paused_snapshot.bin");
+    std::fs::write(&payload_file, vec![0xABu8; 2 * 1024 * 1024]).unwrap();
+    let dest_dir = work.join("dest");
+    std::fs::create_dir_all(&dest_dir).unwrap();
+    unwrap_ok(ctrl.transfer_set_speed_limit(Some(64 * 1024)));
+    let tid = unwrap_ok(
+        ctrl.transfer_start(
+            SELF_ID.to_string(),
+            vec![payload_file.to_string_lossy().to_string()],
+            host_id.clone(),
+            dest_dir.to_string_lossy().to_string(),
+            UiConflictPolicy::Overwrite,
+        )
+        .await,
+    );
+    unwrap_ok(ctrl.task_pause(tid.clone()));
+
+    ctrl.on_main_window_destroyed().await;
+
+    // 终端应已被关闭，继续写入应报 NotFound
+    assert_eq!(
+        unwrap_err(ctrl.term_write(term.session_id, "YQ==".to_string()).await),
+        UiErrorCode::NotFound
+    );
+
+    // 暂停中的传输任务应仍在 task_list 快照中保留且状态为 Paused
+    let snapshot = unwrap_ok(ctrl.task_list());
+    let paused_task = snapshot
+        .iter()
+        .find(|t| t.id == tid)
+        .expect("paused task must survive window close in task_list");
+    assert_eq!(paused_task.state, UiTaskState::Paused);
+
+    unwrap_ok(ctrl.task_cancel(tid).await);
+    unwrap_ok(ctrl.transfer_set_speed_limit(None));
+
+    // 3. 验证 drag_out_staging/drag-* 过期清理与关停全量清理
+    let staging_dir = ctrl_dir.join("drag_out_staging").join("drag-test-123");
+    std::fs::create_dir_all(&staging_dir).unwrap();
+    std::fs::write(staging_dir.join("tmp.txt"), b"hello").unwrap();
+    pcshare_app::bridge_stage3::cleanup_drag_out_staging(&ctrl_dir, Some(Duration::from_secs(600)));
+    assert!(
+        staging_dir.exists(),
+        "fresh drag staging dir should not be pruned before TTL"
+    );
+
+    ctrl.shutdown().await;
+    assert!(
+        !staging_dir.exists(),
+        "shutdown must clean up drag_out_staging/drag-* directories"
+    );
+
+    host.shutdown().await;
+    let _ = std::fs::remove_dir_all(work);
+    let _ = std::fs::remove_dir_all(ctrl_dir);
+    let _ = std::fs::remove_dir_all(host_dir);
+}
+
+#[tokio::test]
+async fn input_validation_batch_dedup_and_force_app_list_regression() {
+    let (ctrl, _ctrl_sink, ctrl_dir) = spawn_bridge("val_ctrl").await;
+    let (host, host_sink, host_dir) = spawn_bridge("val_host").await;
+
+    let offer = unwrap_ok(host.pair_begin());
+    let h_clone = host.clone();
+    let hs_clone = host_sink.clone();
+    tokio::spawn(async move {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(req) = hs_clone.pair_requests.lock().unwrap().first().cloned() {
+                let mut perms = UiPermissions::default_stage1();
+                perms.terminal = true;
+                unwrap_ok(h_clone.pair_respond(req.request_id, true, perms));
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    let host_id = unwrap_ok(ctrl.pair_connect(offer.invite, String::new()).await).id;
+
+    // 1. 非法 target_hwnd / refresh_hwnd / shot_capture hwnd 必须返回 Invalid 而非静默降级为 None
+    for bad in ["not_a_hwnd", "0"] {
+        assert_eq!(
+            unwrap_err(
+                ctrl.input_click(
+                    host_id.clone(),
+                    10,
+                    10,
+                    "left".to_string(),
+                    false,
+                    Some(bad.to_string()),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+            ),
+            UiErrorCode::Invalid
+        );
+        assert_eq!(
+            unwrap_err(
+                ctrl.input_key(
+                    host_id.clone(),
+                    Some("a".to_string()),
+                    None,
+                    Some(bad.to_string()),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+            ),
+            UiErrorCode::Invalid
+        );
+        assert_eq!(
+            unwrap_err(
+                ctrl.shot_capture(host_id.clone(), None, Some(bad.to_string()), None, None)
+                    .await
+            ),
+            UiErrorCode::Invalid
+        );
+    }
+
+    // 2. batch_exec 传入重复设备 ID 应自动去重只执行一次
+    let dedup_res = unwrap_ok(
+        ctrl.batch_exec(
+            vec![host_id.clone(), host_id.clone(), " ".to_string()],
+            "run_command".to_string(),
+            None,
+            None,
+            Some("echo DEDUP_OK".to_string()),
+            Some("cmd".to_string()),
+        )
+        .await,
+    );
+    assert_eq!(dedup_res.len(), 1);
+    assert!(dedup_res[0].ok);
+
+    // 3. app_list(force = true) 强制刷新正常透传
+    let forced_apps = unwrap_ok(ctrl.app_list(SELF_ID.to_string(), true).await);
+    assert!(!forced_apps.is_empty());
+
+    ctrl.shutdown().await;
+    host.shutdown().await;
     let _ = std::fs::remove_dir_all(ctrl_dir);
     let _ = std::fs::remove_dir_all(host_dir);
 }

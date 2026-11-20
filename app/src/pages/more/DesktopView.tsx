@@ -1,6 +1,6 @@
 import { isTauri } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { backend } from '../../api'
 import { errorCode, humanError } from '../../api/errors'
 import type {
@@ -19,7 +19,6 @@ import {
   DesktopInputQueue,
   LONG_PRESS_MS,
   TouchGesture,
-  QUICK_KEYS,
   canDecodeVideo,
   mapPointToRemotePixel,
   parseSourceChoice,
@@ -27,6 +26,7 @@ import {
   vkFromCode,
   wheelToWindows,
 } from '../../lib/desktop'
+import { RemoteInputBar, SourceSelect } from './RemoteControlBars'
 
 type ClickMode = 'left' | 'right' | 'double'
 type ViewMode = 'fit' | 'actual'
@@ -36,6 +36,73 @@ interface Stats {
   meta: DesktopFrameMeta
   bytes: number
   fps: number
+}
+
+/** 独立统计状态容器：每 500ms 更新帧率与码率时只触发底部小状态行重渲，避免整页重绘。 */
+class StatsChannel {
+  private value: Stats | null = null
+  private listeners = new Set<() => void>()
+
+  get = () => this.value
+
+  set(next: Stats | null) {
+    this.value = next
+    for (const fn of this.listeners) fn()
+  }
+
+  subscribe = (fn: () => void) => {
+    this.listeners.add(fn)
+    return () => {
+      this.listeners.delete(fn)
+    }
+  }
+}
+
+function FullscreenStatsBadge({ channel }: { channel: StatsChannel }) {
+  const stats = useSyncExternalStore(channel.subscribe, channel.get)
+  if (!stats) return null
+  return (
+    <span className={`text-xs ${stats.meta.mode === 'live' ? 'text-ok' : 'text-warn'}`}>
+      {stats.meta.mode === 'live' ? `实时 ${stats.fps} 帧/秒` : '逐步模式'}
+    </span>
+  )
+}
+
+function DesktopStatsFooter({
+  channel,
+  interactive,
+  rawInput,
+}: {
+  channel: StatsChannel
+  interactive: boolean
+  rawInput: boolean
+}) {
+  const stats = useSyncExternalStore(channel.subscribe, channel.get)
+  if (!stats) return null
+  const meta = stats.meta
+  const t = meta.transform
+  return (
+    <div className="flex flex-wrap items-center gap-3 text-xs text-muted">
+      {meta.mode === 'live' ? (
+        <span className="text-ok">
+          实时画面 · {stats.fps} 帧/秒 · 编码器 {meta.encoder}
+        </span>
+      ) : (
+        <span className="text-warn">逐步模式{meta.reason ? `：${meta.reason}` : ''}</span>
+      )}
+      <span>
+        原图 {t.sourceWidth}×{t.sourceHeight} → 传输 {t.imageWidth}×{t.imageHeight}（
+        {meta.format === 'jpeg' ? 'JPEG' : 'H.264'} {formatSize(stats.bytes)}）
+      </span>
+      {interactive && (
+        <span className="text-accent">
+          {rawInput
+            ? '点一下画面后，鼠标、滚轮和键盘都会直接发往对方；触屏轻点是单击、长按是右键、按住移动是拖动；中文请用上方文字框'
+            : '对方程序较旧，只能单击、双击、发文字和组合键'}
+        </span>
+      )}
+    </div>
+  )
 }
 
 const BUTTONS: DesktopMouseButton[] = ['left', 'middle', 'right']
@@ -71,7 +138,7 @@ export function DesktopView({
   const [targets, setTargets] = useState<ShotTargets | null>(null)
   const [sourceChoice, setSourceChoice] = useState<string | null>(null)
   const [phase, setPhase] = useState<Phase>({ kind: 'opening' })
-  const [stats, setStats] = useState<Stats | null>(null)
+  const [hasFrame, setHasFrame] = useState(false)
   const [rawInput, setRawInput] = useState(false)
   const [warning, setWarning] = useState<string | null>(null)
   const [clickMode, setClickMode] = useState<ClickMode>('left')
@@ -82,6 +149,7 @@ export function DesktopView({
   const [fullscreen, setFullscreen] = useState(false)
   const [barOpen, setBarOpen] = useState(true)
 
+  const [statsChannel] = useState(() => new StatsChannel())
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const sessionRef = useRef<number | null>(null)
   const queueRef = useRef<DesktopInputQueue | null>(null)
@@ -135,10 +203,15 @@ export function DesktopView({
     let decoder: VideoDecoder | null = null
     let decoderEpoch = -1
     let codec: string | null = null
+    let paintedFirstFrame = false
     const transforms = new Map<number, ShotTransform>()
     const drawnAt: number[] = []
     let latest: { meta: DesktopFrameMeta; bytes: number } | null = null
     const held = heldRef.current
+
+    const pruneFpsWindow = (now: number) => {
+      while (drawnAt.length > 0 && drawnAt[0] < now - 1000) drawnAt.shift()
+    }
 
     const draw = (img: CanvasImageSource, w: number, h: number, t: ShotTransform) => {
       const c = canvasRef.current
@@ -149,7 +222,12 @@ export function DesktopView({
       transformRef.current = t
       const now = performance.now()
       drawnAt.push(now)
-      while (drawnAt.length > 0 && drawnAt[0] < now - 1000) drawnAt.shift()
+      pruneFpsWindow(now)
+      if (!paintedFirstFrame) {
+        paintedFirstFrame = true
+        setHasFrame(true)
+        if (latest) statsChannel.set({ ...latest, fps: drawnAt.length })
+      }
     }
 
     const fallback = (reason: string) => {
@@ -193,12 +271,15 @@ export function DesktopView({
     }
 
     const statsTimer = window.setInterval(() => {
-      if (latest) setStats({ ...latest, fps: drawnAt.length })
+      if (!latest) return
+      pruneFpsWindow(performance.now())
+      statsChannel.set({ ...latest, fps: drawnAt.length })
     }, 500)
 
     const run = async () => {
       setPhase({ kind: 'opening' })
-      setStats(null)
+      setHasFrame(false)
+      statsChannel.set(null)
       setWarning(null)
       try {
         const opened = await backend.desktopOpen({ device, ...parseSourceChoice(sourceChoice) })
@@ -268,7 +349,7 @@ export function DesktopView({
         void release.then(() => backend.desktopClose(id).catch(() => undefined))
       }
     }
-  }, [device, sourceChoice, visible, generation])
+  }, [device, sourceChoice, visible, generation, statsChannel])
 
   const interactive = canInput && phase.kind === 'running'
   const pointerOnly = interactive && rawInput
@@ -418,6 +499,8 @@ export function DesktopView({
     const vk = vkFromCode(e.code)
     if (vk == null) return
     e.preventDefault()
+    // 使用原生事件阻止冒泡，避免触发 window 上的全局快捷键（Ctrl+1..5 / Ctrl+K）
+    e.nativeEvent.stopPropagation()
     if (down) heldRef.current.add(`k:${vk}`)
     else heldRef.current.delete(`k:${vk}`)
     push({ kind: 'key', vk, down })
@@ -476,68 +559,20 @@ export function DesktopView({
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [fullscreen, pointerOnly])
 
-  const meta = stats?.meta
-  const t = meta?.transform
-
-  const renderTextForm = (className: string) => (
-    <form
-      onSubmit={(e) => {
-        e.preventDefault()
-        if (textInput) sendTextOrCombo({ kind: 'text', text: textInput })
-      }}
-      className={`flex flex-wrap items-center gap-2 text-xs ${className}`}
-    >
-      <input
-        value={textInput}
-        disabled={!interactive}
-        onChange={(e) => setTextInput(e.target.value)}
-        placeholder={
-          canInput ? '输入中文等文字后发往对方当前焦点窗口…' : '对方尚未开启“点按”权限，当前只能看画面'
-        }
-        aria-label="向对方当前窗口输入文字"
-        className="h-8 min-w-48 flex-1 rounded-md border border-line bg-panel px-2.5 text-xs outline-none focus:border-accent disabled:opacity-50"
-      />
-      <Button type="submit" variant="primary" disabled={!interactive || !textInput}>
-        发送文字
-      </Button>
-      <div className="flex flex-wrap items-center gap-1">
-        {QUICK_KEYS.map((k) => (
-          <button
-            key={k.combo}
-            type="button"
-            disabled={!interactive}
-            onClick={() => sendTextOrCombo({ kind: 'shortcut', combo: k.combo })}
-            className="h-7 rounded border border-line bg-panel px-2 font-mono text-[11px] hover:bg-hover disabled:opacity-40"
-          >
-            {k.label}
-          </button>
-        ))}
-      </div>
-    </form>
-  )
+  const inputPlaceholder = canInput
+    ? '输入中文等文字后发往对方当前焦点窗口…'
+    : '对方尚未开启“点按”权限，当前只能看画面'
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-3">
       <Toolbar label="实时桌面控制栏" className="rounded-lg border border-line bg-bg/60 p-2">
         <div role="group" aria-label="画面来源" className="flex flex-wrap items-center gap-2">
-          <select
-            aria-label="选择要查看的显示器或窗口"
+          <SourceSelect
+            targets={targets}
             value={sourceChoice ?? ''}
-            onChange={(e) => setSourceChoice(e.target.value)}
-            className="h-8 max-w-64 rounded-md border border-line bg-panel px-2 text-xs outline-none focus:border-accent"
-          >
-            {!targets && sourceChoice && <option value={sourceChoice}>显示器</option>}
-            {targets?.monitors.map((m) => (
-              <option key={`mon:${m.index}`} value={`mon:${m.index}`}>
-                {m.name}（缩放 {m.dpiScalePercent}%）
-              </option>
-            ))}
-            {targets?.windows.map((w) => (
-              <option key={`win:${w.hwnd}`} value={`win:${w.hwnd}`}>
-                窗口：{w.title}（{w.width}×{w.height}）
-              </option>
-            ))}
-          </select>
+            onChange={setSourceChoice}
+            fallbackOption
+          />
 
           <Button onClick={refresh} disabled={phase.kind !== 'running'} title="刷新窗口列表；逐步模式下立即取一张新画面">
             <Icon name="refresh" size={14} />
@@ -609,23 +644,34 @@ export function DesktopView({
         </div>
       )}
 
-      {renderTextForm('rounded-lg border border-line bg-bg/40 px-3 py-2')}
+      <RemoteInputBar
+        text={textInput}
+        onTextChange={setTextInput}
+        disabled={!interactive}
+        placeholder={inputPlaceholder}
+        onSendText={(text) => sendTextOrCombo({ kind: 'text', text })}
+        onSendShortcut={(combo) => sendTextOrCombo({ kind: 'shortcut', combo })}
+        className="rounded-lg border border-line bg-bg/40 px-3 py-2"
+      />
 
       <div
         className={`scroll-thin flex min-h-0 flex-col overflow-auto ${
-          fullscreen ? 'fixed inset-0 z-50 bg-bg' :'flex-1 rounded-lg border border-line bg-bg p-3'
+          fullscreen ? 'fixed inset-0 z-50 bg-bg' : 'flex-1 rounded-lg border border-line bg-bg p-3'
         } ${viewMode === 'fit' ? 'items-center justify-center' : 'items-start justify-start'}`}
       >
         {fullscreen && (
           <div className="fixed top-2 left-1/2 z-10 flex max-w-[calc(100vw-1rem)] -translate-x-1/2 flex-col items-center">
             {barOpen && (
               <div className="flex flex-wrap items-center gap-2 rounded-t-lg border border-line bg-panel/95 p-2 shadow-lg">
-                {renderTextForm('')}
-                {meta && (
-                  <span className={`text-xs ${meta.mode === 'live' ? 'text-ok' : 'text-warn'}`}>
-                    {meta.mode === 'live' ? `实时 ${stats.fps} 帧/秒` : '逐步模式'}
-                  </span>
-                )}
+                <RemoteInputBar
+                  text={textInput}
+                  onTextChange={setTextInput}
+                  disabled={!interactive}
+                  placeholder={inputPlaceholder}
+                  onSendText={(text) => sendTextOrCombo({ kind: 'text', text })}
+                  onSendShortcut={(combo) => sendTextOrCombo({ kind: 'shortcut', combo })}
+                />
+                <FullscreenStatsBadge channel={statsChannel} />
                 <Button onClick={() => setFullscreen(false)} title="也可以按 F11；画面没有键盘焦点时按 Esc">
                   退出全屏
                 </Button>
@@ -655,15 +701,16 @@ export function DesktopView({
           <div
             className={`flex flex-col gap-2 ${viewMode === 'fit' ? 'max-h-full max-w-full items-center' : 'items-start'}`}
           >
-            {!stats && (
+            {!hasFrame && (
               <span className="flex items-center gap-2 text-sm text-muted">
                 <Icon name="loader" className="spin text-accent" /> 正在打开对方桌面…
               </span>
             )}
             <canvas
               ref={canvasRef}
-              hidden={!stats}
+              hidden={!hasFrame}
               tabIndex={pointerOnly ? 0 : -1}
+              data-capture-keys={pointerOnly ? 'true' : undefined}
               aria-label="对方桌面画面"
               onPointerMove={onPointerMove}
               onPointerDown={onPointerDown}
@@ -687,27 +734,8 @@ export function DesktopView({
                     : 'h-auto max-h-[calc(100vh-300px)] w-auto max-w-full'
               } ${interactive ? 'cursor-crosshair' : ''} ${pointerOnly ? 'touch-none select-none' : ''}`}
             />
-            {meta && t && !fullscreen && (
-              <div className="flex flex-wrap items-center gap-3 text-xs text-muted">
-                {meta.mode === 'live' ? (
-                  <span className="text-ok">
-                    实时画面 · {stats.fps} 帧/秒 · 编码器 {meta.encoder}
-                  </span>
-                ) : (
-                  <span className="text-warn">逐步模式{meta.reason ? `：${meta.reason}` : ''}</span>
-                )}
-                <span>
-                  原图 {t.sourceWidth}×{t.sourceHeight} → 传输 {t.imageWidth}×{t.imageHeight}（
-                  {meta.format === 'jpeg' ? 'JPEG' : 'H.264'} {formatSize(stats.bytes)}）
-                </span>
-                {interactive && (
-                  <span className="text-accent">
-                    {rawInput
-                      ? '点一下画面后，鼠标、滚轮和键盘都会直接发往对方；触屏轻点是单击、长按是右键、按住移动是拖动；中文请用上方文字框'
-                      : '对方程序较旧，只能单击、双击、发文字和组合键'}
-                  </span>
-                )}
-              </div>
+            {!fullscreen && (
+              <DesktopStatsFooter channel={statsChannel} interactive={interactive} rawInput={rawInput} />
             )}
           </div>
         )}

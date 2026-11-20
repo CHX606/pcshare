@@ -93,6 +93,7 @@ export interface Backend {
   /** target 可以是身份码，也可以是整串邀请码（此时 code 可留空）。 */
   pairConnect(target: string, code: string): Promise<Device>
   pairRespond(requestId: string, allow: boolean, permissions: Permissions): Promise<void>
+  pairPendingList(): Promise<PairRequest[]>
 
   // 文件（device 为 SELF_ID 时操作本机）
   fsRoots(device: DeviceId): Promise<FsRoot[]>
@@ -119,6 +120,7 @@ export interface Backend {
   pauseTask(taskId: string): Promise<void>
   resumeTask(taskId: string): Promise<void>
   cancelTask(taskId: string): Promise<void>
+  taskList(): Promise<TaskProgress[]>
   getSpeedLimit(): Promise<number | null>
   setSpeedLimit(bytesPerSec: number | null): Promise<void>
 
@@ -127,7 +129,7 @@ export interface Backend {
   pickLocalDir(): Promise<string | null>
 
   // 软件与进程
-  appList(device: DeviceId): Promise<AppInfo[]>
+  appList(device: DeviceId, force?: boolean): Promise<AppInfo[]>
   appIcon(device: DeviceId, appId: string): Promise<string | null>
   /** target 为软件标识或文件路径。 */
   appLaunch(device: DeviceId, target: string, args?: string): Promise<LaunchResult>
@@ -150,6 +152,7 @@ export interface Backend {
   fsOpenRemote(device: DeviceId, path: string): Promise<LaunchResult>
   fsOpenLocalEdit(device: DeviceId, path: string, launchApp?: boolean): Promise<LocalEditSession>
   fsEditSyncBack(sessionId: string, autoSync: boolean, forceOverwrite: boolean): Promise<EditSyncResult>
+  editPendingList(): Promise<EditSyncPrompt[]>
   fsDragOut(device: DeviceId, paths: string[]): Promise<boolean>
 
   shotMonitors(device: DeviceId): Promise<ShotTargets>

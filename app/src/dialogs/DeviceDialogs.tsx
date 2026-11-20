@@ -118,13 +118,16 @@ function SettingsForm() {
     if (!settings) return
     setBusy(true)
     const deviceName = settings.deviceName.trim()
+    const quickHotkey = (settings.quickHotkey ?? '').trim()
     try {
       await backend.setSettings({
         ...settings,
         deviceName,
+        quickHotkey,
         autostartPrompted: true,
       })
       useDevices.setState((s) => ({ self: s.self && { ...s.self, name: deviceName } }))
+      useUi.getState().setQuickHotkey(quickHotkey)
       toast.success('设置已保存')
       closeSettings()
     } catch (err) {

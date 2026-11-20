@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { backend } from '../../api'
 import { humanError } from '../../api/errors'
 import type { BatchDeviceResult, DeviceId, PowerActionKind } from '../../api/types'
@@ -34,18 +34,31 @@ export function BatchPanel() {
     })
   }, [])
 
+  // 自动过滤已被移除的设备 ID，确保计数与提交目标均为现存设备
+  const existingIds = useMemo(() => new Set(devices.map((d) => d.id)), [devices])
+  const validCheckedIds = useMemo(() => {
+    const out = new Set<DeviceId>()
+    for (const id of checkedIds) {
+      if (existingIds.has(id)) out.add(id)
+    }
+    return out
+  }, [checkedIds, existingIds])
+
   const toggleDevice = (id: DeviceId) => {
     setCheckedIds((prev) => {
-      const next = new Set(prev)
+      const next = new Set<DeviceId>()
+      for (const x of prev) {
+        if (existingIds.has(x)) next.add(x)
+      }
       if (next.has(id)) next.delete(id)
-      else next.add(id)
+      else if (existingIds.has(id)) next.add(id)
       return next
     })
   }
 
   const runBatch = async (e: React.FormEvent) => {
     e.preventDefault()
-    const targets = [...checkedIds]
+    const targets = [...validCheckedIds]
     if (!targets.length) {
       toast.warn('请先勾选至少一台设备')
       return
@@ -83,7 +96,7 @@ export function BatchPanel() {
     <div className="flex flex-col gap-4">
       <div className="rounded-lg border border-line bg-panel p-4">
         <div className="mb-2 flex items-center justify-between">
-          <h3 className="text-sm font-medium">1. 选择目标电脑（已选 {checkedIds.size} 台）</h3>
+          <h3 className="text-sm font-medium">1. 选择目标电脑（已选 {validCheckedIds.size} 台）</h3>
           <div className="flex gap-2 text-xs">
             <button
               type="button"
@@ -115,7 +128,7 @@ export function BatchPanel() {
                 >
                   <input
                     type="checkbox"
-                    checked={checkedIds.has(d.id)}
+                    checked={validCheckedIds.has(d.id)}
                     onChange={() => toggleDevice(d.id)}
                     className="size-4 accent-[var(--color-accent)]"
                   />
@@ -211,9 +224,9 @@ export function BatchPanel() {
         )}
 
         <div className="flex justify-end">
-          <Button type="submit" variant="primary" disabled={running || checkedIds.size === 0}>
+          <Button type="submit" variant="primary" disabled={running || validCheckedIds.size === 0}>
             <Icon name={running ? 'loader' : 'play'} size={14} className={running ? 'spin' : ''} />
-            {running ? '正在并发执行…' : `对 ${checkedIds.size} 台设备并发执行`}
+            {running ? '正在并发执行…' : `对 ${validCheckedIds.size} 台设备并发执行`}
           </Button>
         </div>
       </form>

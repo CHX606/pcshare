@@ -38,7 +38,14 @@ export const useToasts = create<ToastState>()((set, get) => ({
   },
   dismiss(id) {
     pendingDismissIds.delete(id)
-    set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) }))
+    set((s) => {
+      const toasts = s.toasts.filter((t) => t.id !== id)
+      if (toasts.length === 0) {
+        pendingDismissIds.clear()
+        return { toasts, focusInside: false }
+      }
+      return { toasts }
+    })
   },
   setFocusInside(inside) {
     set({ focusInside: inside })

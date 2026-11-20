@@ -40,9 +40,16 @@ export function formatAgo(ms: number, now = Date.now()): string {
 
 export function formatDuration(sec: number): string {
   if (!Number.isFinite(sec) || sec < 0) return ''
-  if (sec < 60) return `${Math.ceil(sec)} 秒`
-  if (sec < 3600) return `${Math.floor(sec / 60)} 分 ${Math.ceil(sec % 60)} 秒`
-  return `${Math.floor(sec / 3600)} 小时 ${Math.floor((sec % 3600) / 60)} 分`
+  const total = Math.ceil(sec)
+  if (total < 60) return `${total} 秒`
+  if (total < 3600) {
+    const m = Math.floor(total / 60)
+    const s = total % 60
+    return s > 0 ? `${m} 分 ${s} 秒` : `${m} 分`
+  }
+  const h = Math.floor(total / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  return m > 0 ? `${h} 小时 ${m} 分` : `${h} 小时`
 }
 
 const TYPE_NAMES: Record<string, string> = {

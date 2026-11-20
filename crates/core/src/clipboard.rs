@@ -28,14 +28,14 @@ pub async fn handle_clip_get_stream(
     platform: &Arc<dyn Platform>,
     perms: &Permissions,
     send: &mut SendStream,
-) -> Result<(), CoreError> {
+) -> Result<bool, CoreError> {
     if !perms.clipboard {
         write_frame(
             send,
             &ResponseEnvelope::<ClipHeader>::err(ErrorCode::Forbidden, "对方没有开放剪贴板互通权限"),
         )
         .await?;
-        return Ok(());
+        return Ok(false);
     }
     let plat = platform.clone();
     let res = tokio::task::spawn_blocking(move || {
@@ -45,62 +45,69 @@ pub async fn handle_clip_get_stream(
     .map_err(|e| CoreError::Internal(format!("读取剪贴板异常：{e}")))?;
 
     match res {
-        Ok(data) => match data.content {
-            ClipboardContent::Empty => {
-                let hdr = ClipHeader {
-                    kind: ClipKind::Empty,
-                    text: None,
-                    image_width: None,
-                    image_height: None,
-                    png_byte_len: 0,
-                    sequence: data.sequence,
-                };
-                write_frame(send, &ResponseEnvelope::ok(hdr)).await?;
+        Ok(data) => {
+            match data.content {
+                ClipboardContent::Empty => {
+                    let hdr = ClipHeader {
+                        kind: ClipKind::Empty,
+                        text: None,
+                        image_width: None,
+                        image_height: None,
+                        png_byte_len: 0,
+                        sequence: data.sequence,
+                    };
+                    write_frame(send, &ResponseEnvelope::ok(hdr)).await?;
+                }
+                ClipboardContent::Text(s) => {
+                    let hdr = ClipHeader {
+                        kind: ClipKind::Text,
+                        text: Some(s),
+                        image_width: None,
+                        image_height: None,
+                        png_byte_len: 0,
+                        sequence: data.sequence,
+                    };
+                    write_frame(send, &ResponseEnvelope::ok(hdr)).await?;
+                }
+                ClipboardContent::ImagePng {
+                    png_bytes,
+                    width,
+                    height,
+                } => {
+                    let hdr = ClipHeader {
+                        kind: ClipKind::ImagePng,
+                        text: None,
+                        image_width: Some(width),
+                        image_height: Some(height),
+                        png_byte_len: png_bytes.len() as u32,
+                        sequence: data.sequence,
+                    };
+                    write_frame(send, &ResponseEnvelope::ok(hdr)).await?;
+                    send.write_all(&png_bytes)
+                        .await
+                        .map_err(|e| CoreError::NotConnected(format!("发送剪贴板图片中断：{e}")))?;
+                }
             }
-            ClipboardContent::Text(s) => {
-                let hdr = ClipHeader {
-                    kind: ClipKind::Text,
-                    text: Some(s),
-                    image_width: None,
-                    image_height: None,
-                    png_byte_len: 0,
-                    sequence: data.sequence,
-                };
-                write_frame(send, &ResponseEnvelope::ok(hdr)).await?;
-            }
-            ClipboardContent::ImagePng {
-                png_bytes,
-                width,
-                height,
-            } => {
-                let hdr = ClipHeader {
-                    kind: ClipKind::ImagePng,
-                    text: None,
-                    image_width: Some(width),
-                    image_height: Some(height),
-                    png_byte_len: png_bytes.len() as u32,
-                    sequence: data.sequence,
-                };
-                write_frame(send, &ResponseEnvelope::ok(hdr)).await?;
-                send.write_all(&png_bytes)
-                    .await
-                    .map_err(|e| CoreError::NotConnected(format!("发送剪贴板图片中断：{e}")))?;
-            }
-        },
+            Ok(true)
+        }
         Err(err) => {
             write_frame(send, &ResponseEnvelope::<ClipHeader>::Err(err)).await?;
+            Ok(false)
         }
     }
-    Ok(())
 }
 
-pub async fn handle_clip_set_stream(
+pub async fn handle_clip_set_stream<F>(
     platform: &Arc<dyn Platform>,
     perms: &Permissions,
     args: ClipSetArgs,
     recv: &mut RecvStream,
     send: &mut SendStream,
-) -> Result<(), CoreError> {
+    on_applied_seq: F,
+) -> Result<bool, CoreError>
+where
+    F: FnOnce(u32),
+{
     if !perms.clipboard {
         write_frame(
             send,
@@ -110,7 +117,7 @@ pub async fn handle_clip_set_stream(
             ),
         )
         .await?;
-        return Ok(());
+        return Ok(false);
     }
     if args.png_byte_len > MAX_CLIP_PNG_BYTES {
         write_frame(
@@ -121,7 +128,7 @@ pub async fn handle_clip_set_stream(
             ),
         )
         .await?;
-        return Ok(());
+        return Ok(false);
     }
 
     let png_buf = if args.kind == ClipKind::ImagePng && args.png_byte_len > 0 {
@@ -151,13 +158,16 @@ pub async fn handle_clip_set_stream(
 
     match res {
         Ok(sequence) => {
+            // 写入本机剪贴板成功后立即记录序号，防止自动同步轮询把刚收到的剪贴板再回推形成死循环
+            on_applied_seq(sequence);
             write_frame(send, &ResponseEnvelope::ok(ClipSetReply { sequence })).await?;
+            Ok(true)
         }
         Err(err) => {
             write_frame(send, &ResponseEnvelope::<ClipSetReply>::Err(err)).await?;
+            Ok(false)
         }
     }
-    Ok(())
 }
 
 impl CoreNode {

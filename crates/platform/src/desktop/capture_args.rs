@@ -94,7 +94,7 @@ pub(super) fn configure(
 ) {
     cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error", "-nostats"]);
     if path == CapturePath::Gdi {
-        gdi_input(cmd, source, area, cfg);
+        gdi_input(cmd, source, area, cfg, enc);
     } else {
         graphics_input(cmd, source, area, cfg, enc, path);
     }
@@ -125,7 +125,7 @@ fn configure_output(cmd: &mut Command, cfg: Encoding) {
         "-stats_mux_pre",
         "pipe:2",
         "-stats_mux_pre_fmt",
-        "PCSHARE {size} {pts} {tb} {key}",
+        "PCSHARE_FRAME {size} {pts} {tb} {key} END",
         "-f",
         "h264",
         "pipe:1",
@@ -163,7 +163,13 @@ fn graphics_input(
     ]);
 }
 
-fn gdi_input(cmd: &mut Command, source: CaptureSource, area: CaptureArea, cfg: Encoding) {
+fn gdi_input(
+    cmd: &mut Command,
+    source: CaptureSource,
+    area: CaptureArea,
+    cfg: Encoding,
+    enc: Encoder,
+) {
     cmd.args([
         "-f",
         "gdigrab",
@@ -189,10 +195,15 @@ fn gdi_input(cmd: &mut Command, source: CaptureSource, area: CaptureArea, cfg: E
             ]);
         }
     }
+    let pix_fmt = if enc == Encoder::Software {
+        "yuv420p"
+    } else {
+        "nv12"
+    };
     cmd.args([
         "-vf",
         &format!(
-            "scale={}:{}:flags=fast_bilinear,format=nv12",
+            "scale={}:{}:flags=fast_bilinear,format={pix_fmt}",
             cfg.width, cfg.height
         ),
     ]);

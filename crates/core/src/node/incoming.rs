@@ -57,7 +57,12 @@ impl CoreNode {
             return;
         };
 
-        let Ok(req) = read_frame::<_, PairRequest>(&mut recv).await else {
+        let Ok(Ok(req)) = timeout(
+            Duration::from_secs(10),
+            read_frame_limited::<_, PairRequest>(&mut recv, MAX_HANDSHAKE_FRAME_SIZE),
+        )
+        .await
+        else {
             conn.close(CLOSE_UNAUTHORIZED.into(), b"bad_pair_req");
             return;
         };
@@ -112,13 +117,18 @@ impl CoreNode {
                 &req.code,
             )
             .map_err(|e| (e, b"invalid_code" as &'static [u8]))?;
+        let request_id = prompt.request_id.clone();
         let _ = self
             .events_tx
             .send(CoreEvent::PairingApprovalNeeded(prompt));
-        Ok(match timeout(Duration::from_secs(120), decision_rx).await {
+        let decision = match timeout(Duration::from_secs(120), decision_rx).await {
             Ok(Ok(d)) => d,
-            _ => PairingDecision::Reject,
-        })
+            _ => {
+                self.pairing.remove_pending(&request_id);
+                PairingDecision::Reject
+            }
+        };
+        Ok(decision)
     }
 
     async fn approve_pair(
@@ -175,9 +185,12 @@ impl CoreNode {
             return;
         }
 
-        let _ =
-            self.storage
-                .touch_peer_seen(&peer_id_str, Utc::now().timestamp_millis() as u64, None);
+        self.register_incoming_conn(&peer_id_str, conn.clone());
+        let _ = self.storage.touch_peer_seen_in_memory(
+            &peer_id_str,
+            Utc::now().timestamp_millis() as u64,
+            None,
+        );
 
         while let Ok((send, recv)) = conn.accept_bi().await {
             let node = self.clone();
@@ -189,7 +202,10 @@ impl CoreNode {
                 }
             });
         }
-        self.fs_watch.unwatch_all_for_peer(&peer_id_str);
+        let still_has_incoming = self.unregister_incoming_conn(&peer_id_str, conn.stable_id());
+        if !still_has_incoming {
+            self.fs_watch.unwatch_all_for_peer(&peer_id_str);
+        }
     }
 }
 

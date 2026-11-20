@@ -6,6 +6,7 @@ import {
   closeTabInPane,
   createPaneTabsState,
   openTabInPane,
+  paneKeyOf,
   resolvePaneTabsState,
   tabLabelOf,
 } from './stage2'
@@ -75,5 +76,33 @@ describe('多标签栏状态机（任务 2.6）', () => {
   it('resolvePaneTabsState 对未初始化设备返回稳定引用，避免 React useSyncExternalStore 循环重渲染', () => {
     const empty = {}
     expect(resolvePaneTabsState(empty, 'self')).toBe(resolvePaneTabsState(empty, 'self'))
+  })
+
+  it('双栏使用 paneKeyOf 按栏位隔离，同选一台设备时左右栏标签与路径互不覆盖', () => {
+    const leftKey = paneKeyOf('left', 'self')
+    const rightKey = paneKeyOf('right', 'self')
+    expect(leftKey).not.toBe(rightKey)
+
+    const panes = {
+      [leftKey]: openTabInPane(createPaneTabsState('self', 'C:\\Users\\Me'), 'D:\\工作'),
+      [rightKey]: createPaneTabsState('self', 'E:\\备份'),
+    }
+
+    const leftPane = resolvePaneTabsState(panes, leftKey, 'self')
+    const rightPane = resolvePaneTabsState(panes, rightKey, 'self')
+    expect(leftPane.tabs).toHaveLength(2)
+    expect(rightPane.tabs).toHaveLength(1)
+    expect(leftPane.tabs[1].path).toBe('D:\\工作')
+    expect(rightPane.tabs[0].path).toBe('E:\\备份')
+
+    // 未初始化的左右栏默认对象也按栏位隔离且保持引用稳定
+    const empty = {}
+    const defLeft = resolvePaneTabsState(empty, leftKey, 'self')
+    const defRight = resolvePaneTabsState(empty, rightKey, 'self')
+    expect(defLeft).toBe(resolvePaneTabsState(empty, leftKey, 'self'))
+    expect(defRight).toBe(resolvePaneTabsState(empty, rightKey, 'self'))
+    expect(defLeft).not.toBe(defRight)
+    expect(defLeft.device).toBe('self')
+    expect(defRight.device).toBe('self')
   })
 })

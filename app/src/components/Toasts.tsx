@@ -21,10 +21,19 @@ export function Toasts() {
   useEffect(() => {
     const el = host.current
     if (!el) return
+    if (toasts.length === 0) {
+      setFocusInside(false)
+      try {
+        if (el.matches(':popover-open')) el.hidePopover()
+      } catch {
+        // Ignore in headless test DOM without Popover API
+      }
+      return
+    }
     const syncVisibility = () => {
       const hasModal = document.querySelector('dialog:modal') !== null
       try {
-        if (hasModal || toasts.length === 0) {
+        if (hasModal) {
           if (el.matches(':popover-open')) el.hidePopover()
         } else if (!el.matches(':popover-open')) {
           el.showPopover()
@@ -37,7 +46,7 @@ export function Toasts() {
     const obs = new MutationObserver(syncVisibility)
     obs.observe(document.body, { subtree: true, attributes: true, attributeFilter: ['open'] })
     return () => obs.disconnect()
-  }, [toasts.length])
+  }, [toasts.length, setFocusInside])
 
   useEffect(() => {
     if (!last) return
@@ -80,7 +89,8 @@ export function Toasts() {
                 if (wasFocused) {
                   requestAnimationFrame(() => {
                     const nextBtn = container?.querySelector<HTMLButtonElement>('button')
-                    nextBtn?.focus()
+                    if (nextBtn) nextBtn.focus()
+                    else setFocusInside(false)
                   })
                 }
                 e.stopPropagation()

@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { Suspense, lazy, useEffect } from 'react'
 import { SELF_ID, type Feature } from './api/types'
 import { ConfirmHost } from './components/ConfirmHost'
 import { Icon, type IconName } from './components/Icon'
@@ -13,15 +13,24 @@ import { EditDeviceDialog, SettingsDialog } from './dialogs/DeviceDialogs'
 import { EditSyncDialog } from './dialogs/EditSyncDialog'
 import { PairRequestDialog } from './dialogs/PairRequestDialog'
 import { QuickLauncherDialog } from './dialogs/QuickLauncherDialog'
+import { shouldSkipGlobalShortcut } from './lib/keyboard'
 import { AppsPage } from './pages/AppsPage'
-import { DiagnosticsPage } from './pages/DiagnosticsPage'
 import { FilesPage } from './pages/files/FilesPage'
-import { MorePage } from './pages/MorePage'
 import { ProcsPage } from './pages/ProcsPage'
 import { useDevice, useDevices, wireDeviceEvents } from './store/devices'
 import { wireFileEvents } from './store/files'
 import { useTasks, wireTaskEvents } from './store/tasks'
 import { useUi, type Tab } from './store/ui'
+
+const DiagnosticsPage = lazy(async () => {
+  const m = await import('./pages/DiagnosticsPage')
+  return { default: m.DiagnosticsPage }
+})
+
+const MorePage = lazy(async () => {
+  const m = await import('./pages/MorePage')
+  return { default: m.MorePage }
+})
 
 const TABS: Array<{ id: Tab; label: string; icon: IconName; feature?: Feature }> = [
   { id: 'files', label: '文件', icon: 'folder', feature: 'fs' },
@@ -37,6 +46,7 @@ export default function App() {
   const selected = useDevices((s) => s.selected)
   const dev = useDevice(selected)
   const tab = useUi((s) => s.tab)
+  const quickHotkey = useUi((s) => s.quickHotkey)
   const setTab = useUi((s) => s.setTab)
   const openLauncher = useUi((s) => s.openLauncher)
   const panelOpen = useTasks((s) => s.panelOpen)
@@ -47,9 +57,10 @@ export default function App() {
     return () => offs.forEach((f) => f())
   }, [])
 
-  // Ctrl+1…5 切换页签
+  // Ctrl+1…5 切换页签（远控画布或终端聚焦时跳过，避免打断会话）
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (shouldSkipGlobalShortcut(e)) return
       if (!e.ctrlKey || e.altKey || e.shiftKey) return
       const i = Number(e.key) - 1
       if (i >= 0 && i < TABS.length) {
@@ -74,6 +85,10 @@ export default function App() {
 
   const supported = (f?: Feature) => !f || !dev || dev.features.includes(f)
   const activeTab = supported(TABS.find((t) => t.id === tab)?.feature) ? tab : 'files'
+  const hotkeyBadge = quickHotkey || 'Ctrl+K'
+  const hotkeyTitle = quickHotkey
+    ? `跨设备快捷搜索并启动软件或文件夹（${quickHotkey} 或 Ctrl+K）`
+    : '跨设备快捷搜索并启动软件或文件夹（Ctrl+K）'
 
   return (
     <div className="flex h-full">
@@ -109,20 +124,28 @@ export default function App() {
           <button
             type="button"
             onClick={() => openLauncher(true)}
-            title="跨设备快捷搜索并启动软件或文件夹（Alt+Space 或 Ctrl+K）"
+            title={hotkeyTitle}
             className="ml-auto flex h-7 items-center gap-2 rounded-md border border-line bg-bg px-2.5 text-xs text-muted hover:border-accent hover:text-fg"
           >
             <Icon name="search" size={13} />
             <span>快捷启动…</span>
-            <kbd className="rounded bg-hover px-1.5 py-0.5 font-mono text-[11px] text-faint">Alt+Space</kbd>
+            <kbd className="rounded bg-hover px-1.5 py-0.5 font-mono text-[11px] text-faint">{hotkeyBadge}</kbd>
           </button>
         </header>
         <div className="flex min-h-0 flex-1 flex-col" key={`${selected}-${activeTab}`}>
           {activeTab === 'files' && <FilesPage device={selected} />}
           {activeTab === 'apps' && <AppsPage device={selected} />}
           {activeTab === 'procs' && <ProcsPage device={selected} />}
-          {activeTab === 'diag' && <DiagnosticsPage />}
-          {activeTab === 'more' && <MorePage device={selected} />}
+          {activeTab === 'diag' && (
+            <Suspense fallback={<div className="grid flex-1 place-items-center text-sm text-muted">正在加载诊断页…</div>}>
+              <DiagnosticsPage />
+            </Suspense>
+          )}
+          {activeTab === 'more' && (
+            <Suspense fallback={<div className="grid flex-1 place-items-center text-sm text-muted">正在加载更多功能…</div>}>
+              <MorePage device={selected} />
+            </Suspense>
+          )}
         </div>
         {panelOpen && <TransferPanel />}
         <StatusBar device={selected} />

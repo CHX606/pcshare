@@ -1,48 +1,85 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { backend } from '../api'
 import { humanError } from '../api/errors'
 import type { EditSyncPrompt } from '../api/types'
 import { Button, Modal } from '../components/Modal'
 import { toast } from '../store/toasts'
 
+function upsertPromptQueue(prev: EditSyncPrompt[], incoming: EditSyncPrompt[]): EditSyncPrompt[] {
+  if (!incoming.length) return prev
+  const next = prev.slice()
+  for (const ev of incoming) {
+    const idx = next.findIndex((p) => p.sessionId === ev.sessionId)
+    if (idx >= 0) {
+      // 原地更新，避免正在处理的队首文件被移至队尾导致错位
+      next[idx] = ev
+    } else {
+      next.push(ev)
+    }
+  }
+  return next
+}
+
 /** 任务 3.4：取回本机编辑的文件在本地保存后，询问是否存回远端，并在远端文件被改动过时明确提示冲突。 */
 export function EditSyncDialog() {
   const [queue, setQueue] = useState<EditSyncPrompt[]>([])
   const [autoSync, setAutoSync] = useState(false)
   const [busy, setBusy] = useState(false)
+  const busyRef = useRef(false)
 
   useEffect(() => {
-    return backend.on('edit-prompt', (ev) => {
-      setQueue((prev) => {
-        const filtered = prev.filter((p) => p.sessionId !== ev.sessionId)
-        return [...filtered, ev]
-      })
+    let active = true
+    const off = backend.on('edit-prompt', (ev) => {
+      setQueue((prev) => upsertPromptQueue(prev, [ev]))
     })
+    void backend
+      .editPendingList()
+      .then((pending) => {
+        if (active && pending.length > 0) {
+          setQueue((prev) => upsertPromptQueue(prev, pending))
+        }
+      })
+      .catch(() => {})
+    return () => {
+      active = false
+      off()
+    }
   }, [])
 
   const current = queue[0] ?? null
-  const shift = () => {
+
+  const removeSession = (sessionId: string) => {
     setAutoSync(false)
-    setQueue((prev) => prev.slice(1))
+    setQueue((prev) => prev.filter((item) => item.sessionId !== sessionId))
+  }
+
+  const dismissCurrent = () => {
+    if (busyRef.current || !current) return
+    removeSession(current.sessionId)
   }
 
   const confirmUpload = async (forceOverwrite: boolean) => {
-    if (!current) return
+    const target = current
+    if (!target || busyRef.current) return
+    busyRef.current = true
     setBusy(true)
     try {
-      const res = await backend.fsEditSyncBack(current.sessionId, autoSync, forceOverwrite)
+      const res = await backend.fsEditSyncBack(target.sessionId, autoSync, forceOverwrite)
       if (res.conflict && !forceOverwrite) {
-        // 后台刚刚检测到远端文件也被改过了，更新当前弹窗为冲突模式
+        // 后台刚刚检测到远端文件也被改过了，按 sessionId 精准更新为冲突模式
         setQueue((prev) =>
-          prev.map((item, idx) => (idx === 0 ? { ...item, conflict: true } : item)),
+          prev.map((item) =>
+            item.sessionId === target.sessionId ? { ...item, conflict: true } : item,
+          ),
         )
       } else {
-        toast.success(`已将「${current.fileName}」存回「${current.peerName}」`)
-        shift()
+        toast.success(`已将「${target.fileName}」存回「${target.peerName}」`)
+        removeSession(target.sessionId)
       }
     } catch (err) {
       toast.error(humanError(err))
     } finally {
+      busyRef.current = false
       setBusy(false)
     }
   }
@@ -50,7 +87,8 @@ export function EditSyncDialog() {
   return (
     <Modal
       open={!!current}
-      onClose={shift}
+      dismissible={!busy}
+      onClose={dismissCurrent}
       title={current?.conflict ? '远端文件冲突提醒' : '要把修改存回对方电脑吗？'}
       width={480}
     >
@@ -75,6 +113,7 @@ export function EditSyncDialog() {
               <input
                 type="checkbox"
                 checked={autoSync}
+                disabled={busy}
                 onChange={(e) => setAutoSync(e.target.checked)}
                 className="size-4 accent-[var(--color-accent)]"
               />
@@ -83,7 +122,11 @@ export function EditSyncDialog() {
           )}
 
           <div className="flex items-center justify-end gap-2">
-            <Button data-autofocus={current.conflict ? true : undefined} onClick={shift} disabled={busy}>
+            <Button
+              data-autofocus={current.conflict ? true : undefined}
+              onClick={dismissCurrent}
+              disabled={busy}
+            >
               {current.conflict ? '保留对方版本（不回传）' : '暂不存回'}
             </Button>
             {current.conflict ? (

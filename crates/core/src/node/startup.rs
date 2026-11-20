@@ -33,9 +33,11 @@ impl CoreNode {
         warnings: Vec<String>,
     ) -> Arc<Self> {
         let settings = storage.settings();
+        let clip_auto = settings.clipboard_auto_sync;
         let services = services(&config, &platform, &endpoint, settings);
         Arc::new(Self {
             desktop_input_lock: tokio::sync::Mutex::new(()),
+            power_exec_lock: tokio::sync::Mutex::new(()),
             config,
             storage,
             platform,
@@ -50,15 +52,20 @@ impl CoreNode {
             active_power_cancel: Mutex::new(None),
             dry_run_power_actions: AtomicBool::new(false),
             last_applied_clip_seq: AtomicU32::new(services.initial_clip_seq),
+            clipboard_auto_sync_enabled: AtomicBool::new(clip_auto),
+            clipboard_auto_sync_notify: Arc::new(Notify::new()),
             host_paused: AtomicBool::new(false),
             direct_grants: Mutex::new(HashMap::new()),
+            active_direct_transfers: Mutex::new(HashMap::new()),
             pairing: services.pairing,
             events_tx: services.events_tx,
             remote_events_tx: services.remote_events_tx,
             active_conns: RwLock::new(HashMap::new()),
+            incoming_conns: RwLock::new(HashMap::new()),
             dial_locks: Mutex::new(HashMap::new()),
             peer_states: RwLock::new(HashMap::new()),
             peer_workers: Mutex::new(HashMap::new()),
+            next_worker_id: AtomicU64::new(1),
             accept_handle: Mutex::new(None),
             shutdown_token: CancellationToken::new(),
             startup_warnings: warnings,
@@ -113,16 +120,29 @@ fn services(
     let fs_service = Arc::new(FsService::new(platform.clone(), remote_events_tx.clone()));
     let dir_cache = Arc::new(DirCache::load_or_new(&config.data_dir));
     let fs_watch = FsWatchManager::new(remote_events_tx.clone(), events_tx.clone());
-    let iroh_port = endpoint
-        .addr()
-        .ip_addrs()
-        .next()
-        .map(|a| a.port())
+    // 局域网 mDNS 使用 IPv4 组播，必须选用配对的 IPv4 监听端口，避免双栈下错用 IPv6 端口
+    let bound_addrs: Vec<SocketAddr> = endpoint.addr().ip_addrs().copied().collect();
+    let iroh_port = bound_addrs
+        .iter()
+        .find_map(|a| match a {
+            SocketAddr::V4(v4) => Some(v4.port()),
+            SocketAddr::V6(_) => None,
+        })
         .unwrap_or(0);
-    let lan_discovery = LanDiscovery::new(
+    let local_ipv4s: Vec<Ipv4Addr> = bound_addrs
+        .iter()
+        .filter_map(|a| match a {
+            SocketAddr::V4(v4) if !v4.ip().is_loopback() && !v4.ip().is_unspecified() => {
+                Some(*v4.ip())
+            }
+            _ => None,
+        })
+        .collect();
+    let lan_discovery = LanDiscovery::new_with_ifaces(
         endpoint.id().to_string(),
         settings.device_name.clone(),
         iroh_port,
+        local_ipv4s,
         events_tx.clone(),
     );
     let edit_sync = EditSyncManager::new(&config.data_dir, events_tx.clone());

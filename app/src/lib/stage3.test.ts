@@ -27,6 +27,14 @@ describe('stage3 helpers', () => {
     // Top-left corner -> (-1920, 120)
     const topLeft = mapClientPointToRemoteScreen(100, 50, rect, transform)
     expect(topLeft).toEqual({ screenX: -1920, screenY: 120 })
+
+    // Bottom-right exact edge & outside clamp -> strictly within [origin, origin + size - 1]
+    const bottomRight = mapClientPointToRemoteScreen(580, 320, rect, transform)
+    expect(bottomRight).toEqual({ screenX: -1, screenY: 1199 })
+    const outOfBounds = mapClientPointToRemoteScreen(999, 999, rect, transform)
+    expect(outOfBounds).toEqual({ screenX: -1, screenY: 1199 })
+    const beforeOrigin = mapClientPointToRemoteScreen(0, 0, rect, transform)
+    expect(beforeOrigin).toEqual({ screenX: -1920, screenY: 120 })
   })
 
   it('parses quick search device prefix and single-online-device fallback hint', () => {

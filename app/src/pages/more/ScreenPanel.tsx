@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react'
 import { backend } from '../../api'
 import { humanError } from '../../api/errors'
 import {
@@ -11,11 +11,16 @@ import {
 import { Icon } from '../../components/Icon'
 import { Button } from '../../components/Modal'
 import { Toolbar } from '../../components/Toolbar'
+import { canDecodeVideo, parseSourceChoice, pickSourceChoice } from '../../lib/desktop'
 import { formatSize } from '../../lib/format'
-import { QUICK_KEYS, canDecodeVideo, pickSourceChoice } from '../../lib/desktop'
 import { mapClientPointToRemoteScreen } from '../../lib/stage3'
 import { toast } from '../../store/toasts'
-import { DesktopView } from './DesktopView'
+import { RemoteInputBar, SourceSelect } from './RemoteControlBars'
+
+const DesktopView = lazy(async () => {
+  const m = await import('./DesktopView')
+  return { default: m.DesktopView }
+})
 
 type ClickMode = 'left' | 'right' | 'double'
 type ViewMode = 'fit' | 'actual'
@@ -93,15 +98,23 @@ export function ScreenPanel({ device, canInput }: { device: DeviceId; canInput: 
         </div>
       )}
       {mode === 'live' ? (
-        <DesktopView
-          key={device}
-          device={device}
-          canInput={canInput}
-          onFallback={(reason) => {
-            setFallbackNote(reason)
-            setMode('shot')
-          }}
-        />
+        <Suspense
+          fallback={
+            <div className="grid flex-1 place-items-center text-sm text-muted">
+              正在加载实时桌面组件…
+            </div>
+          }
+        >
+          <DesktopView
+            key={device}
+            device={device}
+            canInput={canInput}
+            onFallback={(reason) => {
+              setFallbackNote(reason)
+              setMode('shot')
+            }}
+          />
+        </Suspense>
       ) : (
         <ShotView key={device} device={device} canInput={canInput} />
       )}
@@ -123,20 +136,25 @@ function ShotView({ device, canInput }: { device: DeviceId; canInput: boolean })
   const [viewMode, setViewMode] = useState<ViewMode>('fit')
   const [autoRefreshSec, setAutoRefreshSec] = useState<number>(0)
   const imgRef = useRef<HTMLImageElement>(null)
-  /** 防止手动截图、点按刷新和自动刷新同时向对方要图。 */
-  const inflightRef = useRef(false)
+  /** 统一隔离首屏抓图、手动刷新、点按操作与自动刷新，防止旧帧覆盖新操作后的画面。 */
+  const ctrlRef = useRef({ inflight: false, opSeq: 0, unmounted: false })
 
-  const parsedSource = useCallback((choice: string): { monitorIndex?: number; hwnd?: string } => {
-    if (choice.startsWith('win:')) return { hwnd: choice.slice(4) }
-    const idx = Number(choice.slice(4))
-    return { monitorIndex: Number.isFinite(idx) ? idx : 0 }
+  useEffect(() => {
+    const ctrl = ctrlRef.current
+    ctrl.unmounted = false
+    return () => {
+      ctrl.unmounted = true
+      ctrl.opSeq += 1
+    }
   }, [])
 
   const captureNow = useCallback(
     async (choiceOverride?: string, widthOverride?: number, quiet = false) => {
-      if (inflightRef.current) return
-      inflightRef.current = true
-      const src = parsedSource(choiceOverride ?? sourceChoice)
+      const ctrl = ctrlRef.current
+      if (quiet && ctrl.inflight) return
+      const seq = quiet ? ctrl.opSeq : ++ctrl.opSeq
+      ctrl.inflight = true
+      const src = parseSourceChoice(choiceOverride ?? sourceChoice)
       const mw = widthOverride ?? maxWidth
       // 自动刷新时不改 busy，免得输入框每隔几秒被禁用一次、丢掉焦点。
       if (!quiet) {
@@ -145,6 +163,7 @@ function ShotView({ device, canInput }: { device: DeviceId; canInput: boolean })
       }
       try {
         if (device === SELF_ID) await waitForRepaint(quiet ? 0 : 200)
+        if (ctrl.unmounted || seq !== ctrl.opSeq) return
         const res = await backend.shotCapture({
           device,
           monitorIndex: src.monitorIndex,
@@ -152,47 +171,75 @@ function ShotView({ device, canInput }: { device: DeviceId; canInput: boolean })
           maxWidth: mw > 0 ? mw : undefined,
           quality: 80,
         })
+        if (ctrl.unmounted || seq !== ctrl.opSeq) return
         setShot(res)
         if (quiet) setErrorMsg(null)
       } catch (err) {
-        setErrorMsg(humanError(err))
+        if (!ctrl.unmounted && seq === ctrl.opSeq) {
+          setErrorMsg(humanError(err))
+        }
       } finally {
-        inflightRef.current = false
-        if (!quiet) setBusy(false)
+        if (seq === ctrl.opSeq) {
+          ctrl.inflight = false
+          if (!quiet) setBusy(false)
+        }
       }
     },
-    [device, maxWidth, parsedSource, sourceChoice],
+    [device, maxWidth, sourceChoice],
   )
 
   const loadTargetsAndShot = useCallback(async () => {
+    const ctrl = ctrlRef.current
+    const seq = ++ctrl.opSeq
+    ctrl.inflight = true
     setBusy(true)
     setErrorMsg(null)
     try {
       const t = await backend.shotMonitors(device)
+      if (ctrl.unmounted || seq !== ctrl.opSeq) return
       setTargets(t)
       const choice = pickSourceChoice(t, sourceChoice)
       setSourceChoice(choice)
-      setBusy(false)
-      await captureNow(choice)
+      const src = parseSourceChoice(choice)
+      if (device === SELF_ID) await waitForRepaint(200)
+      if (ctrl.unmounted || seq !== ctrl.opSeq) return
+      const res = await backend.shotCapture({
+        device,
+        monitorIndex: src.monitorIndex,
+        hwnd: src.hwnd,
+        maxWidth: maxWidth > 0 ? maxWidth : undefined,
+        quality: 80,
+      })
+      if (ctrl.unmounted || seq !== ctrl.opSeq) return
+      setShot(res)
+      setErrorMsg(null)
     } catch (err) {
-      setErrorMsg(humanError(err))
+      if (!ctrl.unmounted && seq === ctrl.opSeq) {
+        setErrorMsg(humanError(err))
+      }
     } finally {
-      setBusy(false)
+      if (seq === ctrl.opSeq) {
+        ctrl.inflight = false
+        setBusy(false)
+      }
     }
-  }, [captureNow, device, sourceChoice])
+  }, [device, maxWidth, sourceChoice])
 
   useEffect(() => {
+    const ctrl = ctrlRef.current
     let cancelled = false
+    const seq = ++ctrl.opSeq
+    ctrl.inflight = true
     void backend
       .shotMonitors(device)
       .then(async (t) => {
-        if (cancelled) return
+        if (cancelled || seq !== ctrl.opSeq) return
         setTargets(t)
         const defaultChoice = pickSourceChoice(t, null)
         setSourceChoice(defaultChoice)
-        const src = parsedSource(defaultChoice)
+        const src = parseSourceChoice(defaultChoice)
         if (device === SELF_ID) await waitForRepaint(200)
-        if (cancelled) return
+        if (cancelled || seq !== ctrl.opSeq) return
         const res = await backend.shotCapture({
           device,
           monitorIndex: src.monitorIndex,
@@ -200,18 +247,21 @@ function ShotView({ device, canInput }: { device: DeviceId; canInput: boolean })
           maxWidth: 1280,
           quality: 80,
         })
-        if (!cancelled) {
+        if (!cancelled && seq === ctrl.opSeq) {
           setShot(res)
           setErrorMsg(null)
         }
       })
       .catch((err) => {
-        if (!cancelled) setErrorMsg(humanError(err))
+        if (!cancelled && seq === ctrl.opSeq) setErrorMsg(humanError(err))
+      })
+      .finally(() => {
+        if (seq === ctrl.opSeq) ctrl.inflight = false
       })
     return () => {
       cancelled = true
     }
-  }, [device, parsedSource])
+  }, [device])
 
   // 自动刷新：上一张到手后再等一个间隔；窗口不在前台时暂停。
   const captureRef = useRef(captureNow)
@@ -234,10 +284,11 @@ function ShotView({ device, canInput }: { device: DeviceId; canInput: boolean })
     }
   }, [autoRefreshSec, device])
 
-  const onImageClick = async (e: React.MouseEvent<HTMLImageElement>) => {
+  const onImageClick = async (e: React.MouseEvent<HTMLImageElement>, modeOverride?: ClickMode) => {
     if (!shot || device === SELF_ID || !canInput || busy) return
     const imgEl = imgRef.current
     if (!imgEl) return
+    const activeMode = modeOverride ?? clickMode
     const rect = imgEl.getBoundingClientRect()
     const { screenX, screenY } = mapClientPointToRemoteScreen(
       e.clientX,
@@ -245,40 +296,56 @@ function ShotView({ device, canInput }: { device: DeviceId; canInput: boolean })
       rect,
       shot.transform,
     )
-    const src = parsedSource(sourceChoice)
+    const ctrl = ctrlRef.current
+    const src = parseSourceChoice(sourceChoice)
+    const seq = ++ctrl.opSeq
+    ctrl.inflight = true
     setBusy(true)
     setWarning(null)
+    let delegatedRefresh = false
     try {
       const res = await backend.inputClick({
         device,
         screenX,
         screenY,
-        button: clickMode === 'right' ? 'right' : 'left',
-        double: clickMode === 'double',
+        button: activeMode === 'right' ? 'right' : 'left',
+        double: activeMode === 'double',
         targetHwnd: shot.transform.targetHwnd,
         refreshMonitor: src.monitorIndex,
         refreshHwnd: src.hwnd,
         maxWidth: maxWidth > 0 ? maxWidth : undefined,
       })
+      if (ctrl.unmounted || seq !== ctrl.opSeq) return
       if (res.uipiBlocked && res.warning) {
         setWarning(res.warning)
       } else if (res.refreshedShot) {
         setShot(res.refreshedShot)
       } else {
+        delegatedRefresh = true
+        ctrl.inflight = false
         await captureNow()
       }
     } catch (err) {
-      toast.error(humanError(err))
+      if (!ctrl.unmounted && seq === ctrl.opSeq) {
+        toast.error(humanError(err))
+      }
     } finally {
-      setBusy(false)
+      if (!delegatedRefresh && seq === ctrl.opSeq) {
+        ctrl.inflight = false
+        setBusy(false)
+      }
     }
   }
 
   const sendKeyOrText = async (opts: { text?: string; keyCombo?: string }) => {
     if (device === SELF_ID || !canInput || busy) return
-    const src = parsedSource(sourceChoice)
+    const ctrl = ctrlRef.current
+    const src = parseSourceChoice(sourceChoice)
+    const seq = ++ctrl.opSeq
+    ctrl.inflight = true
     setBusy(true)
     setWarning(null)
+    let delegatedRefresh = false
     try {
       const res = await backend.inputKey({
         device,
@@ -289,18 +356,26 @@ function ShotView({ device, canInput }: { device: DeviceId; canInput: boolean })
         refreshHwnd: src.hwnd,
         maxWidth: maxWidth > 0 ? maxWidth : undefined,
       })
+      if (ctrl.unmounted || seq !== ctrl.opSeq) return
       if (res.uipiBlocked && res.warning) {
         setWarning(res.warning)
       } else if (res.refreshedShot) {
         setShot(res.refreshedShot)
       } else {
+        delegatedRefresh = true
+        ctrl.inflight = false
         await captureNow()
       }
       if (opts.text) setTextInput('')
     } catch (err) {
-      toast.error(humanError(err))
+      if (!ctrl.unmounted && seq === ctrl.opSeq) {
+        toast.error(humanError(err))
+      }
     } finally {
-      setBusy(false)
+      if (!delegatedRefresh && seq === ctrl.opSeq) {
+        ctrl.inflight = false
+        setBusy(false)
+      }
     }
   }
 
@@ -310,27 +385,14 @@ function ShotView({ device, canInput }: { device: DeviceId; canInput: boolean })
     <div className="flex min-h-0 flex-1 flex-col gap-3">
       <Toolbar label="截图与点按控制栏" className="rounded-lg border border-line bg-bg/60 p-2">
         <div role="group" aria-label="画面来源与清晰度" className="flex flex-wrap items-center gap-2">
-          <select
-            aria-label="选择要查看的显示器或窗口"
+          <SourceSelect
+            targets={targets}
             value={sourceChoice}
-            onChange={(e) => {
-              const v = e.target.value
+            onChange={(v) => {
               setSourceChoice(v)
               void captureNow(v)
             }}
-            className="h-8 max-w-64 rounded-md border border-line bg-panel px-2 text-xs outline-none focus:border-accent"
-          >
-            {targets?.monitors.map((m) => (
-              <option key={`mon:${m.index}`} value={`mon:${m.index}`}>
-                {m.name}（缩放 {m.dpiScalePercent}%）
-              </option>
-            ))}
-            {targets?.windows.map((w) => (
-              <option key={`win:${w.hwnd}`} value={`win:${w.hwnd}`}>
-                窗口：{w.title}（{w.width}×{w.height}）
-              </option>
-            ))}
-          </select>
+          />
 
           <select
             aria-label="截图最大宽度"
@@ -417,42 +479,19 @@ function ShotView({ device, canInput }: { device: DeviceId; canInput: boolean })
       )}
 
       {device !== SELF_ID && (
-        <form
-          onSubmit={(e) => {
-            e.preventDefault()
-            if (textInput) void sendKeyOrText({ text: textInput })
-          }}
-          className="flex flex-wrap items-center gap-2 rounded-lg border border-line bg-bg/40 px-3 py-2 text-xs"
-        >
-          <input
-            value={textInput}
-            disabled={!canInput || busy}
-            onChange={(e) => setTextInput(e.target.value)}
-            placeholder={
-              canInput
-                ? '输入要发往对方当前焦点窗口的文字…'
-                : '对方尚未开启“点按”权限，当前为只读看屏模式'
-            }
-            aria-label="向对方当前窗口输入文字"
-            className="h-8 min-w-48 flex-1 rounded-md border border-line bg-panel px-2.5 text-xs outline-none focus:border-accent disabled:opacity-50"
-          />
-          <Button type="submit" variant="primary" disabled={!canInput || busy || !textInput}>
-            发送文字
-          </Button>
-          <div className="flex flex-wrap items-center gap-1">
-            {QUICK_KEYS.map((k) => (
-              <button
-                key={k.combo}
-                type="button"
-                disabled={!canInput || busy}
-                onClick={() => void sendKeyOrText({ keyCombo: k.combo })}
-                className="h-7 rounded border border-line bg-panel px-2 font-mono text-[11px] hover:bg-hover disabled:opacity-40"
-              >
-                {k.label}
-              </button>
-            ))}
-          </div>
-        </form>
+        <RemoteInputBar
+          text={textInput}
+          onTextChange={setTextInput}
+          disabled={!canInput || busy}
+          placeholder={
+            canInput
+              ? '输入要发往对方当前焦点窗口的文字…'
+              : '对方尚未开启“点按”权限，当前为只读看屏模式'
+          }
+          onSendText={(text) => void sendKeyOrText({ text })}
+          onSendShortcut={(keyCombo) => void sendKeyOrText({ keyCombo })}
+          className="rounded-lg border border-line bg-bg/40 px-3 py-2"
+        />
       )}
 
       <div
@@ -487,18 +526,14 @@ function ShotView({ device, canInput }: { device: DeviceId; canInput: boolean })
               onContextMenu={(e) => {
                 if (!interactiveRemote) return
                 e.preventDefault()
-                const prev = clickMode
-                setClickMode('right')
-                void onImageClick(e).finally(() => setClickMode(prev))
+                void onImageClick(e, 'right')
               }}
               // h-auto w-auto 让浏览器按原比例缩放；只写最大宽高会被横竖分别压扁。
               className={`rounded border border-line shadow-sm ${
                 viewMode === 'fit'
                   ? 'h-auto max-h-[calc(100vh-300px)] w-auto max-w-full'
                   : 'h-auto w-auto max-w-none'
-              } ${
-                interactiveRemote ? 'cursor-crosshair' : ''
-              }`}
+              } ${interactiveRemote ? 'cursor-crosshair' : ''}`}
             />
             <div className="flex flex-wrap items-center gap-3 text-xs text-muted">
               <span>

@@ -1,6 +1,13 @@
 import type { DeviceId, FsEntry } from '../api/types'
 import { ROOT, baseName } from './path'
 
+export type PaneSide = 'left' | 'right'
+
+/** 生成栏位隔离键，确保左右双栏选中同一设备时各自维护独立标签页与路径。 */
+export function paneKeyOf(side: PaneSide, device: DeviceId): string {
+  return `${side}:${device}`
+}
+
 export interface FolderTab {
   id: string
   path: string
@@ -83,22 +90,23 @@ const DEFAULT_TAB: FolderTab = {
   focus: null,
 }
 
-const defaultPaneCache = new Map<DeviceId, PaneTabsState>()
+const defaultPaneCache = new Map<string, PaneTabsState>()
 
 export function defaultTab(): FolderTab {
   return DEFAULT_TAB
 }
 
 export function resolvePaneTabsState(
-  panes: Record<DeviceId, PaneTabsState>,
-  device: DeviceId,
+  panes: Record<string, PaneTabsState>,
+  paneKey: string,
+  device: DeviceId = paneKey,
 ): PaneTabsState {
-  const existing = panes[device]
+  const existing = panes[paneKey]
   if (existing) return existing
-  let fallback = defaultPaneCache.get(device)
+  let fallback = defaultPaneCache.get(paneKey)
   if (!fallback) {
     fallback = { device, activeId: DEFAULT_TAB.id, tabs: [DEFAULT_TAB] }
-    defaultPaneCache.set(device, fallback)
+    defaultPaneCache.set(paneKey, fallback)
   }
   return fallback
 }

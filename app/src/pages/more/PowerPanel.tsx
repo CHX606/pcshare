@@ -112,7 +112,7 @@ export function PowerPanel({ dev }: { dev: Device | undefined }) {
         </Button>
       </div>
 
-      {countingAction && (
+      {countingAction && countingAction !== 'lock' && (
         <div
           role="status"
           className="flex items-center justify-between gap-3 rounded-lg border border-warn/50 bg-warn/10 px-4 py-3 text-sm"

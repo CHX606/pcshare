@@ -29,6 +29,7 @@ interface UiState {
   moreTab: MoreFeatureTab
   dualPane: boolean
   rightDevice: DeviceId
+  quickHotkey: string
   addDeviceOpen: boolean
   settingsOpen: boolean
   launcherOpen: boolean
@@ -39,6 +40,7 @@ interface UiState {
   setMoreTab(moreTab: MoreFeatureTab): void
   setDualPane(dualPane: boolean): void
   setRightDevice(rightDevice: DeviceId): void
+  setQuickHotkey(quickHotkey: string): void
   openAddDevice(open: boolean): void
   openSettings(open: boolean): void
   openLauncher(open: boolean): void
@@ -51,6 +53,7 @@ export const useUi = create<UiState>()((set) => ({
   moreTab: 'shot',
   dualPane: false,
   rightDevice: SELF_ID,
+  quickHotkey: 'Alt+Space',
   addDeviceOpen: false,
   settingsOpen: false,
   launcherOpen: false,
@@ -61,6 +64,7 @@ export const useUi = create<UiState>()((set) => ({
   setMoreTab: (moreTab) => set({ moreTab }),
   setDualPane: (dualPane) => set({ dualPane }),
   setRightDevice: (rightDevice) => set({ rightDevice }),
+  setQuickHotkey: (quickHotkey) => set({ quickHotkey }),
   openAddDevice: (addDeviceOpen) => set({ addDeviceOpen }),
   openSettings: (settingsOpen) => set({ settingsOpen }),
   openLauncher: (launcherOpen) => set({ launcherOpen }),

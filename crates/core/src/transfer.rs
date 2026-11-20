@@ -14,24 +14,30 @@ use iroh::{EndpointId, TransportAddr};
 use pcshare_proto::*;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{Notify, Semaphore};
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{CoreError, map_io_to_rpc};
-use crate::events::{CoreEvent, ProgressCallback, TransferDirection, TransferProgressEvent};
+use crate::events::{
+    CoreEvent, DeviceConnState, ProgressCallback, TransferDirection, TransferProgressEvent,
+};
 use crate::fs_service::{
-    deterministic_part_name, hash_file_prefix_sync, pick_unique_target, replace_file_atomically,
-    sanitize_rel_subpath, system_time_to_ms,
+    MAX_BATCH_FILE_BYTES, STREAM_STOP_CODE_CANCEL, STREAM_STOP_CODE_PAUSE, deterministic_part_name,
+    hash_file_prefix_sync, pick_unique_target, replace_file_atomically, sanitize_rel_subpath,
+    system_time_to_ms,
 };
 use crate::node::{CoreNode, build_endpoint_addr};
+use crate::pairing::csprng_token_hex_64;
 use crate::path_guard::{
     normalize_lexical_absolute, resolve_authorized_path, to_display_path, to_fs_path,
 };
 
-const CLOSE_CANCELLED: u32 = 499;
-const CLOSE_PAUSED: u32 = 498;
+const CLOSE_CANCELLED: u32 = STREAM_STOP_CODE_CANCEL;
+const CLOSE_PAUSED: u32 = STREAM_STOP_CODE_PAUSE;
 const BATCH_MAX_ITEMS: usize = 2600;
 const BATCH_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const DIRECT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub type WireDeltaCallback = Arc<dyn Fn(u64) + Send + Sync>;
 
@@ -98,6 +104,21 @@ impl TransferTaskControl {
             .store(bps.unwrap_or(0), Ordering::Relaxed);
     }
 
+    pub fn speed_limit_bps(&self) -> Option<u64> {
+        let v = self.speed_limit_bps.load(Ordering::Relaxed);
+        if v == 0 { None } else { Some(v) }
+    }
+
+    /// 派生一个共享暂停/动态限速、带独立子取消令牌的控制器（父取消会级联，子取消不影响父）。
+    pub fn child(&self) -> Self {
+        Self {
+            paused: self.paused.clone(),
+            cancel: self.cancel.child_token(),
+            notify: self.notify.clone(),
+            speed_limit_bps: self.speed_limit_bps.clone(),
+        }
+    }
+
     pub fn pause(&self) {
         self.paused.store(true, Ordering::SeqCst);
         self.notify.notify_waiters();
@@ -143,19 +164,29 @@ impl TransferTaskControl {
 
 pub struct RateLimiter {
     global_bps: Arc<AtomicU64>,
-    state: Mutex<(Instant, f64)>,
+    /// 单调预约时间（GCRA 虚拟调度）：多并发调用按顺序串行预约配额时间片，彻底消除并发倍率放大。
+    next_available: Mutex<Instant>,
 }
 
 impl RateLimiter {
     pub fn new(initial_bps: Option<u64>) -> Arc<Self> {
         Arc::new(Self {
             global_bps: Arc::new(AtomicU64::new(initial_bps.unwrap_or(0))),
-            state: Mutex::new((Instant::now(), 0.0)),
+            next_available: Mutex::new(Instant::now()),
         })
     }
 
     pub fn set_limit_bps(&self, bps: Option<u64>) {
         self.global_bps.store(bps.unwrap_or(0), Ordering::Relaxed);
+        // 调高或解除限速时立即收缩历史低速预约，让在途任务马上提速
+        let now = Instant::now();
+        let mut guard = self
+            .next_available
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if *guard > now {
+            *guard = now;
+        }
     }
 
     pub fn limit_bps(&self) -> Option<u64> {
@@ -163,30 +194,67 @@ impl RateLimiter {
         if v == 0 { None } else { Some(v) }
     }
 
-    pub async fn acquire(&self, bytes: usize, override_bps: Option<u64>) {
-        let limit = override_bps.or_else(|| self.limit_bps()).unwrap_or(0);
-        if limit == 0 || bytes == 0 {
-            return;
+    fn effective_limit_bps(
+        &self,
+        task_bps: Option<u64>,
+        override_bps: Option<u64>,
+    ) -> u64 {
+        let per_task = task_bps.or(override_bps);
+        let global = self.limit_bps();
+        match (per_task, global) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => 0,
         }
-        let wait_dur = {
-            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let now = Instant::now();
-            let elapsed = now.duration_since(guard.0).as_secs_f64();
-            guard.0 = now;
-            let burst = (limit as f64) * 0.25;
-            guard.1 = (guard.1 + elapsed * (limit as f64)).min(burst.max(bytes as f64));
-            if guard.1 >= bytes as f64 {
-                guard.1 -= bytes as f64;
-                Duration::ZERO
-            } else {
-                let deficit = (bytes as f64) - guard.1;
-                guard.1 = 0.0;
-                Duration::from_secs_f64(deficit / (limit as f64))
-            }
-        };
+    }
+
+    fn reserve_wait(&self, bytes: usize, limit: u64) -> Duration {
+        if limit == 0 || bytes == 0 {
+            return Duration::ZERO;
+        }
+        let mut guard = self
+            .next_available
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        // 允许极小突发信用（100ms），既不丢平滑性，也不放大多并发下的长期速率
+        let max_burst = Duration::from_millis(100);
+        let earliest = now.checked_sub(max_burst).unwrap_or(now);
+        let slot_start = if *guard < earliest { earliest } else { *guard };
+        let cost = Duration::from_secs_f64((bytes as f64) / (limit as f64));
+        let next = slot_start + cost;
+        *guard = next;
+        next.saturating_duration_since(now)
+    }
+
+    pub async fn acquire(&self, bytes: usize, override_bps: Option<u64>) {
+        let limit = self.effective_limit_bps(None, override_bps);
+        let wait_dur = self.reserve_wait(bytes, limit);
         if !wait_dur.is_zero() {
             tokio::time::sleep(wait_dur).await;
         }
+    }
+
+    pub async fn acquire_with_ctrl(
+        &self,
+        bytes: usize,
+        ctrl: &TransferTaskControl,
+        override_bps: Option<u64>,
+    ) -> Result<(), CoreError> {
+        if ctrl.is_cancelled() {
+            return Err(CoreError::Cancelled);
+        }
+        let limit = self.effective_limit_bps(ctrl.speed_limit_bps(), override_bps);
+        let wait_dur = self.reserve_wait(bytes, limit);
+        if !wait_dur.is_zero() {
+            let cancel_tok = ctrl.cancel_token();
+            tokio::select! {
+                _ = cancel_tok.cancelled() => return Err(CoreError::Cancelled),
+                _ = tokio::time::sleep(wait_dur) => {}
+            }
+        }
+        Ok(())
     }
 }
 
@@ -383,7 +451,7 @@ impl CoreNode {
         let total_size = meta.len();
         let modified_ms = meta.modified().ok().and_then(system_time_to_ms);
 
-        // 先探测远端是否已有同名 `.pcshare.part` 文件可断点续传
+        // 先探测远端冲突与是否已有同名 `.pcshare.part` 文件可断点续传
         let mut resume_offset = 0u64;
         let remote_clean_opt = normalize_lexical_absolute(remote_dest).ok();
         if let Some(ref r_clean) = remote_clean_opt
@@ -397,19 +465,40 @@ impl CoreNode {
                     conflict,
                 )
                 .await
-            && probe.part_bytes > 0
-            && probe.part_bytes <= total_size
-            && let Some(remote_part_hex) = probe.part_blake3_hex
         {
-            let fs_c = local_fs.clone();
-            let part_len = probe.part_bytes;
-            let local_hex_opt =
-                tokio::task::spawn_blocking(move || hash_file_prefix_sync(&fs_c, part_len).ok())
-                    .await
-                    .ok()
-                    .flatten();
-            if local_hex_opt.as_deref() == Some(remote_part_hex.as_str()) {
-                resume_offset = part_len;
+            // 先按 dest_exists 短路 Fail/Skip，避免远端同时存在正式文件与残留 .part 时白算整段本地哈希
+            if probe.dest_exists {
+                match conflict {
+                    ConflictPolicy::Skip => {
+                        return Ok(FsWriteDone {
+                            target_path: probe.target_path,
+                            bytes_written: 0,
+                        });
+                    }
+                    ConflictPolicy::Fail => {
+                        return Err(CoreError::Rpc(RpcError::new(
+                            ErrorCode::AlreadyExists,
+                            format!("目标文件已存在：{}", probe.target_path),
+                        )));
+                    }
+                    ConflictPolicy::Overwrite | ConflictPolicy::RenameKeepBoth => {}
+                }
+            }
+            if probe.part_bytes > 0
+                && probe.part_bytes <= total_size
+                && let Some(remote_part_hex) = probe.part_blake3_hex
+            {
+                let fs_c = local_fs.clone();
+                let part_len = probe.part_bytes;
+                let local_hex_opt = tokio::task::spawn_blocking(move || {
+                    hash_file_prefix_sync(&fs_c, part_len).ok()
+                })
+                .await
+                .ok()
+                .flatten();
+                if local_hex_opt.as_deref() == Some(remote_part_hex.as_str()) {
+                    resume_offset = part_len;
+                }
             }
         }
 
@@ -477,7 +566,14 @@ impl CoreNode {
                 return Err(CoreError::Internal("读取本地文件时意外提前结束".to_string()));
             }
 
-            self.rate_limiter().acquire(n, speed_limit_bps).await;
+            if let Err(err) = self
+                .rate_limiter()
+                .acquire_with_ctrl(n, ctrl, speed_limit_bps)
+                .await
+            {
+                let _ = send.reset(CLOSE_CANCELLED.into());
+                return Err(err);
+            }
 
             let cancel_tok = ctrl.cancel_token();
             tokio::select! {
@@ -513,6 +609,11 @@ impl CoreNode {
                 ));
                 last_report = Instant::now();
             }
+        }
+
+        if ctrl.is_cancelled() {
+            let _ = send.reset(CLOSE_CANCELLED.into());
+            return Err(CoreError::Cancelled);
         }
 
         send.finish()
@@ -708,7 +809,16 @@ impl CoreNode {
                 ));
             };
 
-            self.rate_limiter().acquire(n, speed_limit_bps).await;
+            if let Err(err) = self
+                .rate_limiter()
+                .acquire_with_ctrl(n, ctrl, speed_limit_bps)
+                .await
+            {
+                let _ = recv.stop(CLOSE_CANCELLED.into());
+                drop(part_file);
+                let _ = fs::remove_file(&part_fs);
+                return Err(err);
+            }
             part_file.write_all(&buf[..n]).await?;
             received += n as u64;
             if let Some(ref wcb) = on_wire_delta {
@@ -734,6 +844,13 @@ impl CoreNode {
                 ));
                 last_report = Instant::now();
             }
+        }
+
+        if ctrl.is_cancelled() {
+            let _ = recv.stop(CLOSE_CANCELLED.into());
+            drop(part_file);
+            let _ = fs::remove_file(&part_fs);
+            return Err(CoreError::Cancelled);
         }
 
         part_file.flush().await?;
@@ -797,60 +914,114 @@ impl CoreNode {
             }
         }
 
+        // 使用派生子控制器，任何子任务报错立即取消其余并发任务并等待全部回收
+        let sub_ctrl = ctrl.child();
+
         // 1. 先按批次并发发送所有目录骨架与小文件（单流连续发多文件，大幅减少开流开销）
         let batches = chunk_walk_entries(small_items);
         if !batches.is_empty() {
             let sem = Arc::new(Semaphore::new(concurrency));
-            let mut handles = Vec::with_capacity(batches.len());
+            let mut set: JoinSet<Result<(), CoreError>> = JoinSet::new();
+            let mut first_err: Option<CoreError> = None;
+
             for batch in batches {
-                let permit = sem.clone().acquire_owned().await.unwrap();
+                if first_err.is_some() || sub_ctrl.is_cancelled() {
+                    break;
+                }
+                let cancel_tok = sub_ctrl.cancel_token();
+                let permit = tokio::select! {
+                    _ = cancel_tok.cancelled() => break,
+                    p = sem.clone().acquire_owned() => match p {
+                        Ok(p) => p,
+                        Err(_) => break,
+                    },
+                };
                 let node = self.clone();
                 let pid = peer_id.to_string();
                 let dst = remote_dest_dir.to_string();
                 let conflict = opts.conflict;
                 let limit_bps = opts.speed_limit_bps;
-                let ctrl_c = ctrl.clone();
+                let ctrl_c = sub_ctrl.clone();
                 let done_c = done_bytes.clone();
                 let cb_c = on_progress.clone();
-                handles.push(tokio::spawn(async move {
+                set.spawn(async move {
                     let _permit = permit;
-                    node.upload_small_batch(
-                        &pid,
-                        &dst,
-                        conflict,
-                        limit_bps,
-                        batch,
-                        &ctrl_c,
-                        &done_c,
-                        total_bytes,
-                        started,
-                        cb_c,
-                    )
-                    .await
-                }));
+                    let res = node
+                        .upload_small_batch(
+                            &pid,
+                            &dst,
+                            conflict,
+                            limit_bps,
+                            batch,
+                            &ctrl_c,
+                            &done_c,
+                            total_bytes,
+                            started,
+                            cb_c,
+                        )
+                        .await;
+                    if res.is_err() {
+                        ctrl_c.cancel();
+                    }
+                    res
+                });
             }
-            for h in handles {
-                h.await
-                    .map_err(|e| CoreError::Internal(format!("小文件批量传输异常：{e}")))??;
+
+            while let Some(joined) = set.join_next().await {
+                match joined {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        if first_err.is_none() {
+                            first_err = Some(err);
+                            sub_ctrl.cancel();
+                        }
+                    }
+                    Err(join_err) => {
+                        if first_err.is_none() {
+                            first_err = Some(CoreError::Internal(format!(
+                                "小文件批量传输异常：{join_err}"
+                            )));
+                            sub_ctrl.cancel();
+                        }
+                    }
+                }
+            }
+            if let Some(err) = first_err {
+                return Err(err);
+            }
+            if ctrl.is_cancelled() {
+                return Err(CoreError::Cancelled);
             }
         }
 
         // 2. 再用 4 路并发队列传输大文件（支持断点续传）
         if !large_files.is_empty() {
             let sem = Arc::new(Semaphore::new(concurrency));
-            let mut handles = Vec::with_capacity(large_files.len());
+            let mut set: JoinSet<Result<(), CoreError>> = JoinSet::new();
+            let mut first_err: Option<CoreError> = None;
+
             for lf in large_files {
-                let permit = sem.clone().acquire_owned().await.unwrap();
+                if first_err.is_some() || sub_ctrl.is_cancelled() {
+                    break;
+                }
+                let cancel_tok = sub_ctrl.cancel_token();
+                let permit = tokio::select! {
+                    _ = cancel_tok.cancelled() => break,
+                    p = sem.clone().acquire_owned() => match p {
+                        Ok(p) => p,
+                        Err(_) => break,
+                    },
+                };
                 let node = self.clone();
                 let pid = peer_id.to_string();
                 let remote_file_path = join_remote_subpath(remote_dest_dir, &lf.rel_path);
                 let local_p = PathBuf::from(&lf.abs_path);
                 let conflict = opts.conflict;
                 let limit_bps = opts.speed_limit_bps;
-                let ctrl_c = ctrl.clone();
+                let ctrl_c = sub_ctrl.clone();
                 let done_c = done_bytes.clone();
                 let cb_c = on_progress.clone();
-                handles.push(tokio::spawn(async move {
+                set.spawn(async move {
                     let _permit = permit;
                     let prev_reported = Arc::new(AtomicU64::new(0));
                     let prev_c = prev_reported.clone();
@@ -864,23 +1035,49 @@ impl CoreNode {
                             outer(agg, total_bytes.max(1), spd);
                         }) as ProgressCallback
                     });
-                    node.upload_file_with_ctrl(
-                        &pid,
-                        &local_p,
-                        &remote_file_path,
-                        conflict,
-                        &ctrl_c,
-                        limit_bps,
-                        progress_cb,
-                        None,
-                    )
-                    .await?;
-                    Ok::<_, CoreError>(())
-                }));
+                    let res = node
+                        .upload_file_with_ctrl(
+                            &pid,
+                            &local_p,
+                            &remote_file_path,
+                            conflict,
+                            &ctrl_c,
+                            limit_bps,
+                            progress_cb,
+                            None,
+                        )
+                        .await;
+                    if res.is_err() {
+                        ctrl_c.cancel();
+                    }
+                    res.map(|_| ())
+                });
             }
-            for h in handles {
-                h.await
-                    .map_err(|e| CoreError::Internal(format!("大文件并发上传异常：{e}")))??;
+
+            while let Some(joined) = set.join_next().await {
+                match joined {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        if first_err.is_none() {
+                            first_err = Some(err);
+                            sub_ctrl.cancel();
+                        }
+                    }
+                    Err(join_err) => {
+                        if first_err.is_none() {
+                            first_err = Some(CoreError::Internal(format!(
+                                "大文件并发上传异常：{join_err}"
+                            )));
+                            sub_ctrl.cancel();
+                        }
+                    }
+                }
+            }
+            if let Some(err) = first_err {
+                return Err(err);
+            }
+            if ctrl.is_cancelled() {
+                return Err(CoreError::Cancelled);
             }
         }
 
@@ -918,28 +1115,66 @@ impl CoreNode {
             .map_err(|_| CoreError::Timeout)??;
         ready.into_result()?;
 
-        // 用 2 个后台阻塞线程并行预读本批小文件并计算 BLAKE3，同时按 256 KB 聚合写入 QUIC 流
-        let (rd_tx, mut rd_rx) =
-            tokio::sync::mpsc::channel::<(WalkEntry, Option<(Vec<u8>, String)>)>(256);
+        // 用 2 个后台阻塞线程并行预读本批小文件并计算 BLAKE3；读取失败直接报错，绝不静默跳过
+        let (rd_tx, mut rd_rx) = tokio::sync::mpsc::channel::<
+            Result<(WalkEntry, Option<(Vec<u8>, String)>), CoreError>,
+        >(256);
         let shared_batch = Arc::new(Mutex::new(batch.into_iter()));
+        let read_abort = ctrl.cancel_token().child_token();
         for _ in 0..2 {
             let tx_c = rd_tx.clone();
             let iter_c = shared_batch.clone();
+            let abort_c = read_abort.clone();
             tokio::task::spawn_blocking(move || {
                 loop {
+                    if abort_c.is_cancelled() {
+                        break;
+                    }
                     let next_item = iter_c.lock().unwrap_or_else(|e| e.into_inner()).next();
                     let Some(item) = next_item else {
                         break;
                     };
                     if item.dir {
-                        if tx_c.blocking_send((item, None)).is_err() {
+                        if tx_c.blocking_send(Ok((item, None))).is_err() {
                             break;
                         }
                     } else {
                         let fs_p = to_fs_path(Path::new(&item.abs_path));
-                        if let Ok(bytes) = fs::read(&fs_p) {
+                        let read_res = (|| -> Result<(Vec<u8>, String), CoreError> {
+                            let meta = fs::metadata(&fs_p).map_err(|e| {
+                                CoreError::Rpc(map_io_to_rpc(&e, Some(&item.abs_path)))
+                            })?;
+                            if meta.len() > MAX_BATCH_FILE_BYTES {
+                                return Err(CoreError::Rpc(RpcError::new(
+                                    ErrorCode::Invalid,
+                                    format!(
+                                        "小文件大小已超出批传上限（{} 字节）：{}",
+                                        meta.len(),
+                                        item.abs_path
+                                    ),
+                                )));
+                            }
+                            let bytes = fs::read(&fs_p).map_err(|e| {
+                                CoreError::Rpc(map_io_to_rpc(&e, Some(&item.abs_path)))
+                            })?;
+                            if bytes.len() as u64 > MAX_BATCH_FILE_BYTES {
+                                return Err(CoreError::Rpc(RpcError::new(
+                                    ErrorCode::Invalid,
+                                    format!("小文件大小已超出批传上限：{}", item.abs_path),
+                                )));
+                            }
                             let hex = blake3::hash(&bytes).to_hex().to_string();
-                            if tx_c.blocking_send((item, Some((bytes, hex)))).is_err() {
+                            Ok((bytes, hex))
+                        })();
+                        match read_res {
+                            Ok(pair) => {
+                                if tx_c.blocking_send(Ok((item, Some(pair)))).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                abort_c.cancel();
+                                let _ = tx_c.blocking_send(Err(err));
                                 break;
                             }
                         }
@@ -961,8 +1196,20 @@ impl CoreNode {
             Ok(())
         };
 
-        while let Some((item, data_opt)) = rd_rx.recv().await {
-            ctrl.wait_ready().await?;
+        while let Some(res_item) = rd_rx.recv().await {
+            if let Err(err) = ctrl.wait_ready().await {
+                read_abort.cancel();
+                let _ = send.reset(CLOSE_CANCELLED.into());
+                return Err(err);
+            }
+            let (item, data_opt) = match res_item {
+                Ok(v) => v,
+                Err(err) => {
+                    read_abort.cancel();
+                    let _ = send.reset(CLOSE_CANCELLED.into());
+                    return Err(err);
+                }
+            };
             match data_opt {
                 None => {
                     let hdr = BatchFileItem {
@@ -977,7 +1224,15 @@ impl CoreNode {
                 }
                 Some((bytes, hex)) => {
                     let len = bytes.len();
-                    self.rate_limiter().acquire(len, speed_limit_bps).await;
+                    if let Err(err) = self
+                        .rate_limiter()
+                        .acquire_with_ctrl(len, ctrl, speed_limit_bps)
+                        .await
+                    {
+                        read_abort.cancel();
+                        let _ = send.reset(CLOSE_CANCELLED.into());
+                        return Err(err);
+                    }
                     let hdr = BatchFileItem {
                         done: false,
                         rel_path: item.rel_path,
@@ -996,9 +1251,10 @@ impl CoreNode {
                 }
             }
             if wire_buf.len() >= COALESCE_BYTES {
-                send.write_all(&wire_buf)
-                    .await
-                    .map_err(|e| CoreError::NotConnected(format!("批量上传数据中断：{e}")))?;
+                if let Err(e) = send.write_all(&wire_buf).await {
+                    read_abort.cancel();
+                    return Err(CoreError::NotConnected(format!("批量上传数据中断：{e}")));
+                }
                 wire_buf.clear();
             }
         }
@@ -1061,6 +1317,8 @@ impl CoreNode {
             }
         }
 
+        let sub_ctrl = ctrl.child();
+
         // 1. 小文件并发批量下载
         if !small_files.is_empty() {
             let sem = Arc::new(Semaphore::new(concurrency));
@@ -1079,52 +1337,102 @@ impl CoreNode {
                 chunks.push(cur);
             }
 
-            let mut handles = Vec::with_capacity(chunks.len());
+            let mut set: JoinSet<Result<(), CoreError>> = JoinSet::new();
+            let mut first_err: Option<CoreError> = None;
+
             for chunk in chunks {
-                let permit = sem.clone().acquire_owned().await.unwrap();
+                if first_err.is_some() || sub_ctrl.is_cancelled() {
+                    break;
+                }
+                let cancel_tok = sub_ctrl.cancel_token();
+                let permit = tokio::select! {
+                    _ = cancel_tok.cancelled() => break,
+                    p = sem.clone().acquire_owned() => match p {
+                        Ok(p) => p,
+                        Err(_) => break,
+                    },
+                };
                 let node = self.clone();
                 let pid = peer_id.to_string();
                 let conflict = opts.conflict;
                 let limit_bps = opts.speed_limit_bps;
-                let ctrl_c = ctrl.clone();
+                let ctrl_c = sub_ctrl.clone();
                 let done_c = done_bytes.clone();
                 let cb_c = on_progress.clone();
-                handles.push(tokio::spawn(async move {
+                set.spawn(async move {
                     let _permit = permit;
-                    node.download_small_batch(
-                        &pid,
-                        conflict,
-                        limit_bps,
-                        chunk,
-                        &ctrl_c,
-                        &done_c,
-                        total_bytes,
-                        started,
-                        cb_c,
-                    )
-                    .await
-                }));
+                    let res = node
+                        .download_small_batch(
+                            &pid,
+                            conflict,
+                            limit_bps,
+                            chunk,
+                            &ctrl_c,
+                            &done_c,
+                            total_bytes,
+                            started,
+                            cb_c,
+                        )
+                        .await;
+                    if res.is_err() {
+                        ctrl_c.cancel();
+                    }
+                    res
+                });
             }
-            for h in handles {
-                h.await
-                    .map_err(|e| CoreError::Internal(format!("小文件批量下载异常：{e}")))??;
+            while let Some(joined) = set.join_next().await {
+                match joined {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        if first_err.is_none() {
+                            first_err = Some(err);
+                            sub_ctrl.cancel();
+                        }
+                    }
+                    Err(join_err) => {
+                        if first_err.is_none() {
+                            first_err = Some(CoreError::Internal(format!(
+                                "小文件批量下载异常：{join_err}"
+                            )));
+                            sub_ctrl.cancel();
+                        }
+                    }
+                }
+            }
+            if let Some(err) = first_err {
+                return Err(err);
+            }
+            if ctrl.is_cancelled() {
+                return Err(CoreError::Cancelled);
             }
         }
 
         // 2. 大文件 4 路并发断点续传下载
         if !large_files.is_empty() {
             let sem = Arc::new(Semaphore::new(concurrency));
-            let mut handles = Vec::with_capacity(large_files.len());
+            let mut set: JoinSet<Result<(), CoreError>> = JoinSet::new();
+            let mut first_err: Option<CoreError> = None;
+
             for (entry, target_clean) in large_files {
-                let permit = sem.clone().acquire_owned().await.unwrap();
+                if first_err.is_some() || sub_ctrl.is_cancelled() {
+                    break;
+                }
+                let cancel_tok = sub_ctrl.cancel_token();
+                let permit = tokio::select! {
+                    _ = cancel_tok.cancelled() => break,
+                    p = sem.clone().acquire_owned() => match p {
+                        Ok(p) => p,
+                        Err(_) => break,
+                    },
+                };
                 let node = self.clone();
                 let pid = peer_id.to_string();
                 let conflict = opts.conflict;
                 let limit_bps = opts.speed_limit_bps;
-                let ctrl_c = ctrl.clone();
+                let ctrl_c = sub_ctrl.clone();
                 let done_c = done_bytes.clone();
                 let cb_c = on_progress.clone();
-                handles.push(tokio::spawn(async move {
+                set.spawn(async move {
                     let _permit = permit;
                     let prev_reported = Arc::new(AtomicU64::new(0));
                     let prev_c = prev_reported.clone();
@@ -1138,23 +1446,48 @@ impl CoreNode {
                             outer(agg, total_bytes.max(1), spd);
                         }) as ProgressCallback
                     });
-                    node.download_file_with_ctrl(
-                        &pid,
-                        &entry.abs_path,
-                        &target_clean,
-                        conflict,
-                        &ctrl_c,
-                        limit_bps,
-                        progress_cb,
-                        None,
-                    )
-                    .await?;
-                    Ok::<_, CoreError>(())
-                }));
+                    let res = node
+                        .download_file_with_ctrl(
+                            &pid,
+                            &entry.abs_path,
+                            &target_clean,
+                            conflict,
+                            &ctrl_c,
+                            limit_bps,
+                            progress_cb,
+                            None,
+                        )
+                        .await;
+                    if res.is_err() {
+                        ctrl_c.cancel();
+                    }
+                    res.map(|_| ())
+                });
             }
-            for h in handles {
-                h.await
-                    .map_err(|e| CoreError::Internal(format!("大文件并发下载异常：{e}")))??;
+            while let Some(joined) = set.join_next().await {
+                match joined {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        if first_err.is_none() {
+                            first_err = Some(err);
+                            sub_ctrl.cancel();
+                        }
+                    }
+                    Err(join_err) => {
+                        if first_err.is_none() {
+                            first_err = Some(CoreError::Internal(format!(
+                                "大文件并发下载异常：{join_err}"
+                            )));
+                            sub_ctrl.cancel();
+                        }
+                    }
+                }
+            }
+            if let Some(err) = first_err {
+                return Err(err);
+            }
+            if ctrl.is_cancelled() {
+                return Err(CoreError::Cancelled);
             }
         }
 
@@ -1175,8 +1508,9 @@ impl CoreNode {
         on_progress: Option<ProgressCallback>,
     ) -> Result<(), CoreError> {
         ctrl.wait_ready().await?;
-        let mut target_map: HashMap<String, PathBuf> = HashMap::with_capacity(chunk.len());
-        let mut sources = Vec::with_capacity(chunk.len());
+        let expected_files = chunk.len();
+        let mut target_map: HashMap<String, PathBuf> = HashMap::with_capacity(expected_files);
+        let mut sources = Vec::with_capacity(expected_files);
         for (entry, dst_clean) in chunk {
             sources.push(entry.abs_path.clone());
             target_map.insert(entry.abs_path, dst_clean);
@@ -1198,11 +1532,32 @@ impl CoreNode {
             .map_err(|_| CoreError::Timeout)??;
         ready.into_result()?;
 
+        let mut received_files = 0usize;
         loop {
-            ctrl.wait_ready().await?;
-            let hdr: BatchReadItemHeader = read_frame(&mut recv).await?;
+            if let Err(err) = ctrl.wait_ready().await {
+                let _ = recv.stop(CLOSE_CANCELLED.into());
+                return Err(err);
+            }
+            let cancel_tok = ctrl.cancel_token();
+            let hdr: BatchReadItemHeader = tokio::select! {
+                _ = cancel_tok.cancelled() => {
+                    let _ = recv.stop(CLOSE_CANCELLED.into());
+                    return Err(CoreError::Cancelled);
+                }
+                r = read_frame(&mut recv) => r?,
+            };
             if hdr.done {
                 break;
+            }
+            if hdr.size > MAX_BATCH_FILE_BYTES {
+                let _ = recv.stop(CLOSE_CANCELLED.into());
+                return Err(CoreError::Rpc(RpcError::new(
+                    ErrorCode::Invalid,
+                    format!(
+                        "批量下载收到超过单文件上限的数据（{} 字节，上限 {} 字节）：{}",
+                        hdr.size, MAX_BATCH_FILE_BYTES, hdr.source_path
+                    ),
+                )));
             }
             let mut data = vec![0u8; hdr.size as usize];
             if hdr.size > 0 {
@@ -1210,9 +1565,14 @@ impl CoreNode {
                     CoreError::NotConnected(format!("读取批量下载数据中断：{e}"))
                 })?;
             }
-            self.rate_limiter()
-                .acquire(data.len(), speed_limit_bps)
-                .await;
+            if let Err(err) = self
+                .rate_limiter()
+                .acquire_with_ctrl(data.len(), ctrl, speed_limit_bps)
+                .await
+            {
+                let _ = recv.stop(CLOSE_CANCELLED.into());
+                return Err(err);
+            }
 
             let got_hex = blake3::hash(&data).to_hex().to_string();
             if got_hex != hdr.blake3_hex {
@@ -1255,6 +1615,7 @@ impl CoreNode {
                 })
                 .await
                 .map_err(|e| CoreError::Internal(format!("写入本地小文件异常：{e}")))??;
+                received_files += 1;
             }
 
             let agg = done_bytes.fetch_add(hdr.size, Ordering::Relaxed) + hdr.size;
@@ -1262,6 +1623,12 @@ impl CoreNode {
                 let spd = agg as f64 / started.elapsed().as_secs_f64().max(0.001);
                 cb(agg, total_bytes.max(1), spd);
             }
+        }
+
+        if received_files < expected_files {
+            return Err(CoreError::Internal(format!(
+                "批量下载未收齐全部文件（期望 {expected_files} 个，实际收到 {received_files} 个）"
+            )));
         }
         Ok(())
     }
@@ -1299,14 +1666,8 @@ impl CoreNode {
         }
         let target_relay = self.storage().get_peer(dst_peer_id).and_then(|r| r.relay_url);
 
-        let token = format!(
-            "{:016x}{:016x}{:016x}{:016x}",
-            fastrand::u64(..),
-            fastrand::u64(..),
-            fastrand::u64(..),
-            fastrand::u64(..)
-        );
-        let transfer_id = format!("p2p-{:012x}", fastrand::u64(..));
+        let token = csprng_token_hex_64();
+        let transfer_id = format!("p2p-{}", &csprng_token_hex_64()[..16]);
 
         // 1. 先向乙签发一次性直传接收许可（5 分钟有效）
         let grant_rep: PeerGrantDirectReply = self
@@ -1324,10 +1685,10 @@ impl CoreNode {
             return Err(CoreError::Internal("目标设备拒绝了直传接收许可".to_string()));
         }
 
-        // 订阅来自甲的直传进度事件（确保先连上甲并启动事件订阅）
+        // 订阅来自甲的直传进度事件（等待 sub.events 真正就绪，去掉 50ms 盲等）
         let src_conn = self.get_or_connect(src_peer_id).await?;
-        self.ensure_peer_worker_public(src_peer_id, src_conn);
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        self.ensure_peer_event_subscription(src_peer_id, src_conn.clone())
+            .await;
         let mut ev_rx = self.subscribe_events();
 
         // 2. 通知甲直接连接乙并推送数据
@@ -1353,7 +1714,18 @@ impl CoreNode {
         let started = Instant::now();
         loop {
             tokio::select! {
-                _ = cancel.cancelled() => return Err(CoreError::Cancelled),
+                _ = cancel.cancelled() => {
+                    // 取消时通知源端中止直传，不再让源端继续向目标推送
+                    let _ = timeout(
+                        Duration::from_secs(2),
+                        self.remote_task_cancel(src_peer_id, &transfer_id),
+                    )
+                    .await;
+                    return Err(CoreError::Cancelled);
+                }
+                _ = src_conn.closed() => {
+                    return Err(CoreError::NotConnected("源设备在直传途中断开连接，直传已中断".to_string()));
+                }
                 ev = ev_rx.recv() => {
                     match ev {
                         Ok(CoreEvent::RemoteDirectTransferProgress { peer_id, progress })
@@ -1374,6 +1746,11 @@ impl CoreNode {
                                     });
                                 }
                             }
+                        }
+                        Ok(CoreEvent::DeviceStateChanged { peer_id, state: DeviceConnState::Offline { .. } })
+                            if peer_id == src_peer_id =>
+                        {
+                            return Err(CoreError::NotConnected("源设备已离线，直传已中断".to_string()));
                         }
                         Ok(_) => {}
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -1421,28 +1798,47 @@ impl CoreNode {
         for s in &args.sources {
             let _ = resolve_authorized_path(s, perms)?;
         }
+        let cancel = CancellationToken::new();
+        self.register_direct_transfer(args.transfer_id.clone(), cancel.clone());
+
         let node = self.clone();
         let ctrl_id = controller_peer_id.to_string();
         let perms_clone = perms.clone();
         tokio::spawn(async move {
             let res = node
-                .run_outgoing_direct_worker(&ctrl_id, &perms_clone, &args)
+                .run_outgoing_direct_worker(&ctrl_id, &perms_clone, &args, cancel)
                 .await;
-            if let Err(err) = res {
-                let rpc = match err {
-                    CoreError::Rpc(r) => r,
-                    other => RpcError::new(ErrorCode::Io, other.to_user_message()),
-                };
-                node.emit_remote_event(
-                    &ctrl_id,
-                    RemoteEvent::DirectTransferProgress(DirectTransferProgress {
-                        transfer_id: args.transfer_id,
-                        state: FsTaskState::Failed,
-                        bytes_done: 0,
-                        bytes_total: 1,
-                        error: Some(rpc),
-                    }),
-                );
+            node.unregister_direct_transfer(&args.transfer_id);
+            match res {
+                Ok(()) => {}
+                Err(CoreError::Cancelled) => {
+                    node.emit_remote_event(
+                        &ctrl_id,
+                        RemoteEvent::DirectTransferProgress(DirectTransferProgress {
+                            transfer_id: args.transfer_id,
+                            state: FsTaskState::Cancelled,
+                            bytes_done: 0,
+                            bytes_total: 1,
+                            error: None,
+                        }),
+                    );
+                }
+                Err(err) => {
+                    let rpc = match err {
+                        CoreError::Rpc(r) => r,
+                        other => RpcError::new(ErrorCode::Io, other.to_user_message()),
+                    };
+                    node.emit_remote_event(
+                        &ctrl_id,
+                        RemoteEvent::DirectTransferProgress(DirectTransferProgress {
+                            transfer_id: args.transfer_id,
+                            state: FsTaskState::Failed,
+                            bytes_done: 0,
+                            bytes_total: 1,
+                            error: Some(rpc),
+                        }),
+                    );
+                }
             }
         });
         Ok(PeerDirectTransferReply { accepted: true })
@@ -1453,7 +1849,11 @@ impl CoreNode {
         controller_peer_id: &str,
         perms: &Permissions,
         args: &PeerDirectTransferArgs,
+        cancel: CancellationToken,
     ) -> Result<(), CoreError> {
+        if cancel.is_cancelled() {
+            return Err(CoreError::Cancelled);
+        }
         let walked = self
             .fs_service()
             .walk_local(perms, &args.sources)
@@ -1481,60 +1881,192 @@ impl CoreNode {
         .map_err(|_| CoreError::Timeout)?
         .map_err(|e| CoreError::NotConnected(format!("无法直连目标设备：{e}")))?;
 
-        let (mut send, mut recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| CoreError::NotConnected(format!("打开直传数据流失败：{e}")))?;
-
-        let req = DirectStreamRequest::Batch {
-            token: args.token.clone(),
-            conflict: args.conflict,
-        };
-        write_frame(&mut send, &req).await?;
-        let ready: ResponseEnvelope<()> = timeout(Duration::from_secs(15), read_frame(&mut recv))
-            .await
-            .map_err(|_| CoreError::Timeout)??;
-        ready.into_result()?;
+        let mut small_items = Vec::new();
+        let mut large_files = Vec::new();
+        for item in walked {
+            if item.dir || item.size <= SMALL_FILE_BATCH_THRESHOLD {
+                small_items.push(item);
+            } else {
+                large_files.push(item);
+            }
+        }
 
         let mut done_bytes = 0u64;
         let mut last_emit = Instant::now();
 
-        for item in walked {
-            if item.dir {
-                write_frame(
-                    &mut send,
-                    &BatchFileItem {
-                        done: false,
-                        rel_path: item.rel_path,
-                        dir: true,
-                        size: 0,
-                        modified_ms: item.modified_ms,
-                        blake3_hex: None,
-                    },
-                )
-                .await?;
-            } else {
-                let fs_p = to_fs_path(Path::new(&item.abs_path));
-                let bytes = tokio::fs::read(&fs_p).await?;
-                let hex = blake3::hash(&bytes).to_hex().to_string();
-                write_frame(
-                    &mut send,
-                    &BatchFileItem {
-                        done: false,
-                        rel_path: item.rel_path,
-                        dir: false,
-                        size: bytes.len() as u64,
-                        modified_ms: item.modified_ms,
-                        blake3_hex: Some(hex),
-                    },
-                )
-                .await?;
-                if !bytes.is_empty() {
-                    send.write_all(&bytes).await.map_err(|e| {
-                        CoreError::NotConnected(format!("直传发送文件数据中断：{e}"))
-                    })?;
+        // 1. 小文件与目录骨架走 Batch 流
+        if !small_items.is_empty() {
+            let (mut send, mut recv) = conn
+                .open_bi()
+                .await
+                .map_err(|e| CoreError::NotConnected(format!("打开直传小文件流失败：{e}")))?;
+
+            let req = DirectStreamRequest::Batch {
+                token: args.token.clone(),
+                conflict: args.conflict,
+            };
+            write_frame(&mut send, &req).await?;
+            let ready: ResponseEnvelope<()> =
+                timeout(Duration::from_secs(15), read_frame(&mut recv))
+                    .await
+                    .map_err(|_| CoreError::Timeout)??;
+            ready.into_result()?;
+
+            for item in small_items {
+                if cancel.is_cancelled() {
+                    let _ = send.reset(CLOSE_CANCELLED.into());
+                    conn.close(CLOSE_CANCELLED.into(), b"direct_cancelled");
+                    return Err(CoreError::Cancelled);
                 }
-                done_bytes += bytes.len() as u64;
+                if item.dir {
+                    write_frame(
+                        &mut send,
+                        &BatchFileItem {
+                            done: false,
+                            rel_path: item.rel_path,
+                            dir: true,
+                            size: 0,
+                            modified_ms: item.modified_ms,
+                            blake3_hex: None,
+                        },
+                    )
+                    .await?;
+                } else {
+                    let fs_p = to_fs_path(Path::new(&item.abs_path));
+                    let meta_len = tokio::fs::metadata(&fs_p).await?.len();
+                    if meta_len > MAX_BATCH_FILE_BYTES {
+                        let _ = send.reset(CLOSE_CANCELLED.into());
+                        return Err(CoreError::Rpc(RpcError::new(
+                            ErrorCode::Invalid,
+                            format!(
+                                "小文件大小变化超过直传批传上限（{meta_len} 字节）：{}",
+                                item.abs_path
+                            ),
+                        )));
+                    }
+                    let bytes = tokio::fs::read(&fs_p).await?;
+                    if bytes.len() as u64 > MAX_BATCH_FILE_BYTES {
+                        let _ = send.reset(CLOSE_CANCELLED.into());
+                        return Err(CoreError::Rpc(RpcError::new(
+                            ErrorCode::Invalid,
+                            format!("小文件大小变化超过直传批传上限：{}", item.abs_path),
+                        )));
+                    }
+                    let hex = blake3::hash(&bytes).to_hex().to_string();
+                    write_frame(
+                        &mut send,
+                        &BatchFileItem {
+                            done: false,
+                            rel_path: item.rel_path,
+                            dir: false,
+                            size: bytes.len() as u64,
+                            modified_ms: item.modified_ms,
+                            blake3_hex: Some(hex),
+                        },
+                    )
+                    .await?;
+                    if !bytes.is_empty() {
+                        send.write_all(&bytes).await.map_err(|e| {
+                            CoreError::NotConnected(format!("直传发送文件数据中断：{e}"))
+                        })?;
+                    }
+                    done_bytes += bytes.len() as u64;
+                    if last_emit.elapsed() >= Duration::from_millis(100) {
+                        self.emit_remote_event(
+                            controller_peer_id,
+                            RemoteEvent::DirectTransferProgress(DirectTransferProgress {
+                                transfer_id: args.transfer_id.clone(),
+                                state: FsTaskState::Running,
+                                bytes_done: done_bytes,
+                                bytes_total: total_bytes.max(1),
+                                error: None,
+                            }),
+                        );
+                        last_emit = Instant::now();
+                    }
+                }
+            }
+
+            write_frame(
+                &mut send,
+                &BatchFileItem {
+                    done: true,
+                    ..Default::default()
+                },
+            )
+            .await?;
+            send.finish()
+                .map_err(|e| CoreError::Internal(format!("结束直传流失败：{e}")))?;
+
+            let done_resp: ResponseEnvelope<FsWriteBatchReply> =
+                timeout(Duration::from_secs(60), read_frame(&mut recv))
+                    .await
+                    .map_err(|_| CoreError::Timeout)??;
+            done_resp.into_result()?;
+        }
+
+        // 2. 大文件走 SingleFile 分块流式传输（64 KB 分块，绝不整文件读入内存防 OOM）
+        let mut buf = vec![0u8; TRANSFER_CHUNK_SIZE];
+        for item in large_files {
+            if cancel.is_cancelled() {
+                conn.close(CLOSE_CANCELLED.into(), b"direct_cancelled");
+                return Err(CoreError::Cancelled);
+            }
+            let fs_p = to_fs_path(Path::new(&item.abs_path));
+            let mut file = tokio::fs::File::open(&fs_p).await?;
+            let file_size = file.metadata().await?.len();
+
+            let (mut send, mut recv) = conn
+                .open_bi()
+                .await
+                .map_err(|e| CoreError::NotConnected(format!("打开直传单文件流失败：{e}")))?;
+
+            let req = DirectStreamRequest::SingleFile {
+                token: args.token.clone(),
+                rel_path: item.rel_path,
+                size: file_size,
+                offset: 0,
+                modified_ms: item.modified_ms,
+                conflict: args.conflict,
+                blake3_hex: None,
+            };
+            write_frame(&mut send, &req).await?;
+            let ready_resp: ResponseEnvelope<FsWriteReady> =
+                timeout(Duration::from_secs(15), read_frame(&mut recv))
+                    .await
+                    .map_err(|_| CoreError::Timeout)??;
+            let ready = ready_resp.into_result()?;
+            if ready.skipped {
+                let _ = send.finish();
+                done_bytes += file_size;
+                continue;
+            }
+
+            let mut sent = 0u64;
+            while sent < file_size {
+                if cancel.is_cancelled() {
+                    let _ = send.reset(CLOSE_CANCELLED.into());
+                    conn.close(CLOSE_CANCELLED.into(), b"direct_cancelled");
+                    return Err(CoreError::Cancelled);
+                }
+                let want = ((file_size - sent) as usize).min(TRANSFER_CHUNK_SIZE);
+                let n = file.read(&mut buf[..want]).await?;
+                if n == 0 {
+                    let _ = send.reset(CLOSE_PAUSED.into());
+                    return Err(CoreError::Internal("直传读取本地文件意外提前结束".to_string()));
+                }
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        let _ = send.reset(CLOSE_CANCELLED.into());
+                        conn.close(CLOSE_CANCELLED.into(), b"direct_cancelled");
+                        return Err(CoreError::Cancelled);
+                    }
+                    w = send.write_all(&buf[..n]) => {
+                        w.map_err(|e| CoreError::NotConnected(format!("直传发送大文件数据中断：{e}")))?;
+                    }
+                }
+                sent += n as u64;
+                done_bytes += n as u64;
                 if last_emit.elapsed() >= Duration::from_millis(100) {
                     self.emit_remote_event(
                         controller_peer_id,
@@ -1549,24 +2081,16 @@ impl CoreNode {
                     last_emit = Instant::now();
                 }
             }
+            send.finish()
+                .map_err(|e| CoreError::Internal(format!("结束直传单文件流失败：{e}")))?;
+
+            let done_resp: ResponseEnvelope<FsWriteDone> =
+                timeout(Duration::from_secs(60), read_frame(&mut recv))
+                    .await
+                    .map_err(|_| CoreError::Timeout)??;
+            done_resp.into_result()?;
         }
 
-        write_frame(
-            &mut send,
-            &BatchFileItem {
-                done: true,
-                ..Default::default()
-            },
-        )
-        .await?;
-        send.finish()
-            .map_err(|e| CoreError::Internal(format!("结束直传流失败：{e}")))?;
-
-        let done_resp: ResponseEnvelope<FsWriteBatchReply> =
-            timeout(Duration::from_secs(60), read_frame(&mut recv))
-                .await
-                .map_err(|_| CoreError::Timeout)??;
-        done_resp.into_result()?;
         conn.close(0u32.into(), b"direct_done");
 
         self.emit_remote_event(
@@ -1584,13 +2108,59 @@ impl CoreNode {
 
     pub(crate) async fn handle_incoming_direct(self: Arc<Self>, conn: Connection) {
         let remote_id = conn.remote_id().to_string();
-        while let Ok((mut send, mut recv)) = conn.accept_bi().await {
-            let Ok(req) = read_frame::<_, DirectStreamRequest>(&mut recv).await else {
+        // 令牌一次性消费后仅绑定当前已认证连接（供该连接上的小文件 Batch 与多个大文件 SingleFile 流共用）
+        let mut session_grant: Option<(String, DirectGrantRecord)> = None;
+
+        loop {
+            let accept_timeout = if session_grant.is_none() {
+                DIRECT_HANDSHAKE_TIMEOUT
+            } else {
+                Duration::from_secs(30)
+            };
+            let Ok(Ok((mut send, mut recv))) = timeout(accept_timeout, conn.accept_bi()).await
+            else {
                 break;
             };
-            match req {
-                DirectStreamRequest::Batch { token, conflict } => {
-                    let Some(grant) = self.verify_direct_grant(&token, &remote_id) else {
+
+            if self.is_host_paused() {
+                let _ = write_frame(
+                    &mut send,
+                    &ResponseEnvelope::<()>::err(
+                        ErrorCode::Busy,
+                        "对方当前开启了“暂停被控”，暂不接收直传文件",
+                    ),
+                )
+                .await;
+                let _ = send.finish();
+                let _ = timeout(Duration::from_secs(2), send.stopped()).await;
+                conn.close(403u32.into(), b"host_paused");
+                return;
+            }
+
+            let Ok(Ok(req)) = timeout(
+                DIRECT_HANDSHAKE_TIMEOUT,
+                read_frame_limited::<_, DirectStreamRequest>(&mut recv, MAX_HANDSHAKE_FRAME_SIZE),
+            )
+            .await
+            else {
+                conn.close(401u32.into(), b"direct_req_timeout");
+                return;
+            };
+
+            let req_token = match &req {
+                DirectStreamRequest::Batch { token, .. }
+                | DirectStreamRequest::SingleFile { token, .. }
+                | DirectStreamRequest::Mkdir { token, .. }
+                | DirectStreamRequest::ProbeResume { token, .. } => token.as_str(),
+            };
+
+            let grant = match &session_grant {
+                Some((bound_tok, rec)) => {
+                    if Instant::now() < rec.expires_at
+                        && constant_time_eq(bound_tok.as_bytes(), req_token.as_bytes())
+                    {
+                        rec.clone()
+                    } else {
                         let _ = write_frame(
                             &mut send,
                             &ResponseEnvelope::<()>::err(
@@ -1600,13 +2170,39 @@ impl CoreNode {
                         )
                         .await;
                         let _ = send.finish();
+                        let _ = timeout(Duration::from_secs(2), send.stopped()).await;
+                        conn.close(401u32.into(), b"bad_direct_token");
+                        return;
+                    }
+                }
+                None => {
+                    // 首次校验成功立即从表里移除销毁（单次有效，拒绝跨连接重放）
+                    let Some(rec) = self.take_direct_grant(req_token, &remote_id) else {
+                        let _ = write_frame(
+                            &mut send,
+                            &ResponseEnvelope::<()>::err(
+                                ErrorCode::Unauthorized,
+                                "直传令牌无效、已被使用或已过期",
+                            ),
+                        )
+                        .await;
+                        let _ = send.finish();
+                        let _ = timeout(Duration::from_secs(2), send.stopped()).await;
                         conn.close(401u32.into(), b"bad_direct_token");
                         return;
                     };
-                    let mut restricted_perms = Permissions::default();
-                    restricted_perms
-                        .allowed_roots
-                        .push(to_display_path(&grant.dest_clean));
+                    session_grant = Some((req_token.to_string(), rec.clone()));
+                    rec
+                }
+            };
+
+            let mut restricted_perms = Permissions::default();
+            restricted_perms
+                .allowed_roots
+                .push(to_display_path(&grant.dest_clean));
+
+            match req {
+                DirectStreamRequest::Batch { conflict, .. } => {
                     let _ = self
                         .fs_service()
                         .handle_write_batch_stream(
@@ -1621,10 +2217,75 @@ impl CoreNode {
                         .await;
                     let _ = send.finish();
                 }
-                _ => {
+                DirectStreamRequest::SingleFile {
+                    rel_path,
+                    size,
+                    offset,
+                    modified_ms,
+                    conflict,
+                    ..
+                } => {
+                    let rel_clean = match sanitize_rel_subpath(&rel_path) {
+                        Ok(p) => p,
+                        Err(err) => {
+                            let _ =
+                                write_frame(&mut send, &ResponseEnvelope::<FsWriteReady>::Err(err))
+                                    .await;
+                            let _ = send.finish();
+                            continue;
+                        }
+                    };
+                    let target_clean = grant.dest_clean.join(&rel_clean);
+                    let target_disp = to_display_path(&target_clean);
+                    let _ = self
+                        .fs_service()
+                        .handle_write_stream(
+                            &restricted_perms,
+                            FsWriteArgs {
+                                path: target_disp,
+                                size,
+                                offset,
+                                modified_ms,
+                                conflict,
+                            },
+                            &mut recv,
+                            &mut send,
+                        )
+                        .await;
+                    let _ = send.finish();
+                }
+                DirectStreamRequest::Mkdir { rel_path, .. } => {
+                    let res = match sanitize_rel_subpath(&rel_path) {
+                        Ok(rel_clean) => {
+                            let target_disp = to_display_path(&grant.dest_clean.join(&rel_clean));
+                            self.fs_service()
+                                .mkdir(
+                                    &restricted_perms,
+                                    FsMkdirArgs {
+                                        path: target_disp,
+                                        parents: true,
+                                    },
+                                )
+                                .await
+                        }
+                        Err(err) => Err(err),
+                    };
+                    let _ = match res {
+                        Ok(rep) => write_frame(&mut send, &ResponseEnvelope::ok(rep)).await,
+                        Err(err) => {
+                            write_frame(&mut send, &ResponseEnvelope::<FsMkdirReply>::Err(err))
+                                .await
+                        }
+                    };
+                    let _ = send.finish();
+                }
+                DirectStreamRequest::ProbeResume { .. } => {
                     let _ = write_frame(
                         &mut send,
-                        &ResponseEnvelope::<()>::err(ErrorCode::Unsupported, "不支持的直传子模式"),
+                        &ResponseEnvelope::<()>::err(
+                            ErrorCode::Unsupported,
+                            "不支持的直传子模式",
+                        ),
                     )
                     .await;
                     let _ = send.finish();
@@ -1633,20 +2294,27 @@ impl CoreNode {
         }
     }
 
-    fn verify_direct_grant(&self, candidate_token: &str, remote_peer_id: &str) -> Option<DirectGrantRecord> {
+    /// 校验直传令牌并立即移除销毁（单次有效，防止 5 分钟内跨连接重放）。
+    fn take_direct_grant(
+        &self,
+        candidate_token: &str,
+        remote_peer_id: &str,
+    ) -> Option<DirectGrantRecord> {
         let mut guard = self
             .direct_grants_mutex()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         guard.retain(|_, v| Instant::now() < v.expires_at);
-        for (stored_tok, rec) in guard.iter() {
+        let matched_key = guard.iter().find_map(|(stored_tok, rec)| {
             if rec.allowed_peer_id == remote_peer_id
                 && constant_time_eq(stored_tok.as_bytes(), candidate_token.as_bytes())
             {
-                return Some(rec.clone());
+                Some(stored_tok.clone())
+            } else {
+                None
             }
-        }
-        None
+        });
+        matched_key.and_then(|k| guard.remove(&k))
     }
 }
 

@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, type RefObject } from 'react'
 import { crumbs, normalizePath } from '../../lib/path'
 import { toast } from '../../store/toasts'
 import { Icon } from '../../components/Icon'
@@ -7,10 +7,11 @@ interface Props {
   path: string
   onNavigate: (path: string) => void
   editRequest: number
+  paneRef?: RefObject<HTMLElement | null>
 }
 
 /** 路径栏：每一级都能点；点空白处、Ctrl+L 或 Alt+D 切换成输入框，可直接输入或粘贴路径。 */
-export function PathBar({ path, onNavigate, editRequest }: Props) {
+export function PathBar({ path, onNavigate, editRequest, paneRef }: Props) {
   const [editing, setEditing] = useState(false)
   const [text, setText] = useState(path)
   const [seenRequest, setSeenRequest] = useState(editRequest)
@@ -33,8 +34,10 @@ export function PathBar({ path, onNavigate, editRequest }: Props) {
     }
     setEditing(false)
     onNavigate(p)
-    // 交还焦点给文件列表，便于继续用键盘
-    requestAnimationFrame(() => document.querySelector<HTMLElement>('[data-file-list]')?.focus())
+    // 交还焦点给当前栏位的文件列表，避免双栏模式下抢回左栏焦点
+    requestAnimationFrame(() =>
+      paneRef?.current?.querySelector<HTMLElement>('[data-file-list]')?.focus(),
+    )
   }
 
   if (editing) {

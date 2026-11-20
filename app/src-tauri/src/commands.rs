@@ -7,6 +7,22 @@ pub(super) mod files;
 pub(super) mod operations;
 pub(super) mod screen;
 
+pub(super) async fn spawn_blocking_reply<T, F>(
+    task_name: &'static str,
+    f: F,
+) -> Result<Reply<T>, ()>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Reply<T> + Send + 'static,
+{
+    Ok(tokio::task::spawn_blocking(f).await.unwrap_or_else(|e| {
+        Reply::err(
+            bridge::UiErrorCode::Internal,
+            format!("{task_name}异常：{e}"),
+        )
+    }))
+}
+
 macro_rules! handlers {
     () => {
         tauri::generate_handler![
@@ -30,6 +46,7 @@ macro_rules! handlers {
             commands::devices::pair_cancel,
             commands::devices::pair_connect,
             commands::devices::pair_respond,
+            commands::devices::pair_pending_list,
             commands::files::fs_roots,
             commands::files::fs_cache_get,
             commands::files::fs_list,
@@ -42,6 +59,7 @@ macro_rules! handlers {
             commands::files::fs_move,
             commands::files::fs_delete,
             commands::files::transfer_start,
+            commands::files::task_list,
             commands::files::task_pause,
             commands::files::task_resume,
             commands::files::task_cancel,
@@ -70,6 +88,7 @@ macro_rules! handlers {
             commands::operations::fs_open_remote,
             commands::operations::fs_open_local_edit,
             commands::operations::fs_edit_sync_back,
+            commands::operations::edit_pending_list,
             commands::operations::power_exec,
             commands::operations::power_cancel,
             commands::operations::power_wake,

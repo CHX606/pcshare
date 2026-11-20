@@ -72,52 +72,65 @@ impl FsWatchManager {
         let cancel_bg = shutdown.clone();
         tokio::spawn(async move {
             let mut pending: HashMap<String, Instant> = HashMap::new();
-            let mut tick = tokio::time::interval(Duration::from_millis(50));
             loop {
-                tokio::select! {
-                    _ = cancel_bg.cancelled() => break,
-                    maybe_path = raw_rx.recv() => {
-                        let Some(changed_path) = maybe_path else { break; };
-                        let matched_keys = match_watched_keys(&inner_bg, &changed_path);
-                        let due = Instant::now() + WATCH_DEBOUNCE;
-                        for k in matched_keys {
-                            pending.entry(k).or_insert(due);
+                let next_due = pending.values().copied().min();
+                if let Some(earliest) = next_due {
+                    let sleep_fut = tokio::time::sleep_until(tokio::time::Instant::from_std(earliest));
+                    tokio::select! {
+                        _ = cancel_bg.cancelled() => break,
+                        maybe_path = raw_rx.recv() => {
+                            let Some(changed_path) = maybe_path else { break; };
+                            let matched_keys = match_watched_keys(&inner_bg, &changed_path);
+                            let due = Instant::now() + WATCH_DEBOUNCE;
+                            for k in matched_keys {
+                                pending.entry(k).or_insert(due);
+                            }
                         }
-                    }
-                    _ = tick.tick() => {
-                        if pending.is_empty() {
-                            continue;
-                        }
-                        let now = Instant::now();
-                        let ready: Vec<String> = pending
-                            .iter()
-                            .filter_map(|(k, &due)| if now >= due { Some(k.clone()) } else { None })
-                            .collect();
-                        for k in ready {
-                            pending.remove(&k);
-                            let targets = {
-                                let guard = inner_bg.lock().unwrap_or_else(|e| e.into_inner());
-                                guard
-                                    .watched_paths
-                                    .get(&k)
-                                    .map(|(_, disp, peers)| (disp.clone(), peers.iter().cloned().collect::<Vec<_>>()))
-                            };
-                            if let Some((disp_path, peers)) = targets {
-                                for peer_id in peers {
-                                    if peer_id == "self" {
-                                        let _ = core_events_tx.send(CoreEvent::RemoteDirChanged {
-                                            peer_id: "self".to_string(),
-                                            path: disp_path.clone(),
-                                        });
-                                    } else {
-                                        let _ = remote_events_tx.send((
-                                            peer_id,
-                                            RemoteEvent::DirChanged {
+                        _ = sleep_fut => {
+                            let now = Instant::now();
+                            let ready: Vec<String> = pending
+                                .iter()
+                                .filter_map(|(k, &due)| if now >= due { Some(k.clone()) } else { None })
+                                .collect();
+                            for k in ready {
+                                pending.remove(&k);
+                                let targets = {
+                                    let guard = inner_bg.lock().unwrap_or_else(|e| e.into_inner());
+                                    guard
+                                        .watched_paths
+                                        .get(&k)
+                                        .map(|(_, disp, peers)| (disp.clone(), peers.iter().cloned().collect::<Vec<_>>()))
+                                };
+                                if let Some((disp_path, peers)) = targets {
+                                    for peer_id in peers {
+                                        if peer_id == "self" {
+                                            let _ = core_events_tx.send(CoreEvent::RemoteDirChanged {
+                                                peer_id: "self".to_string(),
                                                 path: disp_path.clone(),
-                                            },
-                                        ));
+                                            });
+                                        } else {
+                                            let _ = remote_events_tx.send((
+                                                peer_id,
+                                                RemoteEvent::DirChanged {
+                                                    path: disp_path.clone(),
+                                                },
+                                            ));
+                                        }
                                     }
                                 }
+                            }
+                        }
+                    }
+                } else {
+                    // 无待合并变更时彻底阻塞等待新事件或关停信号，零空闲唤醒
+                    tokio::select! {
+                        _ = cancel_bg.cancelled() => break,
+                        maybe_path = raw_rx.recv() => {
+                            let Some(changed_path) = maybe_path else { break; };
+                            let matched_keys = match_watched_keys(&inner_bg, &changed_path);
+                            let due = Instant::now() + WATCH_DEBOUNCE;
+                            for k in matched_keys {
+                                pending.entry(k).or_insert(due);
                             }
                         }
                     }

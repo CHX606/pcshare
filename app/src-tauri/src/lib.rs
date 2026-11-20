@@ -31,9 +31,13 @@ mod commands;
 mod event_sink;
 mod shell;
 use event_sink::TauriEventSink;
-use shell::{create_or_focus_main_window, parse_launch_args, setup_system_tray};
+use shell::{
+    create_or_focus_main_window, ensure_main_window_on_main_thread,
+    open_or_toggle_launcher_window, parse_launch_args, setup_system_tray,
+};
 
 pub fn run() {
+    #[cfg(feature = "console-log")]
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
         .with_target(false)
@@ -51,12 +55,14 @@ pub fn run() {
     };
     let quitting = Arc::new(AtomicBool::new(false));
     let exit = quitting.clone();
+    let tray_available = Arc::new(AtomicBool::new(false));
+    let tray_for_run = tray_available.clone();
     let app = tauri::Builder::default()
-        .setup(move |app| setup(app, args, slot, quitting))
+        .setup(move |app| setup(app, args, slot, quitting, tray_available))
         .invoke_handler(commands::handlers!())
         .build(tauri::generate_context!())
         .expect("构建电脑共享桌面应用失败");
-    app.run(move |handle, event| on_run_event(handle, event, &exit));
+    app.run(move |handle, event| on_run_event(handle, event, &exit, &tray_for_run));
 }
 
 fn setup(
@@ -64,6 +70,7 @@ fn setup(
     args: shell::LaunchArgs,
     slot: Arc<OnceLock<AppHandle>>,
     quitting: Arc<AtomicBool>,
+    tray_available: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let handle = app.handle().clone();
     let _ = slot.set(handle.clone());
@@ -73,15 +80,24 @@ fn setup(
     });
     let bridge = start_bridge(args.data_dir, args.network_mode, sink.clone())?;
     app.manage(bridge.clone());
-    let _ = setup_system_tray(&handle, &sink, quitting);
+    match setup_system_tray(&handle, &sink, quitting) {
+        Ok(()) => {
+            tray_available.store(true, Ordering::SeqCst);
+        }
+        Err(err) => {
+            bridge.node().log_event(
+                "ERROR",
+                &format!("创建系统托盘失败，关闭主窗口将直接退出程序：{err}"),
+            );
+        }
+    }
     let wake = handle.clone();
     let launcher = bridge.clone();
     let hotkey = bridge.bind_hotkey_handler(Arc::new(move || {
-        create_or_focus_main_window(&wake);
-        launcher.mark_launcher_pending();
+        open_or_toggle_launcher_window(&wake, &launcher);
     }));
-    if !args.background {
-        create_or_focus_main_window(&handle);
+    if !args.background || !tray_available.load(Ordering::SeqCst) {
+        ensure_main_window_on_main_thread(&handle);
     }
     if let Err(body) = hotkey {
         sink.emit_system_notice(UiSystemNotice {
@@ -114,11 +130,16 @@ fn start_bridge(
     .map_err(|e| std::io::Error::other(e.to_user_message()))
 }
 
-fn on_run_event(app_handle: &AppHandle, event: tauri::RunEvent, quitting: &AtomicBool) {
+fn on_run_event(
+    app_handle: &AppHandle,
+    event: tauri::RunEvent,
+    quitting: &AtomicBool,
+    tray_available: &AtomicBool,
+) {
     match event {
         tauri::RunEvent::ExitRequested { api, .. } => {
-            // 关闭最后一个窗口时销毁了浏览器内核以释放内存，但除非用户在托盘点“退出程序”，否则保持后台常驻
-            if !quitting.load(Ordering::SeqCst) {
+            // 关闭最后一个窗口时销毁了浏览器内核以释放内存，但仅在系统托盘正常可用且用户未主动退出时才保持后台常驻
+            if tray_available.load(Ordering::SeqCst) && !quitting.load(Ordering::SeqCst) {
                 api.prevent_exit();
             }
         }

@@ -1,5 +1,4 @@
 @import 'tailwindcss';
-@import '@xterm/xterm/css/xterm.css';
 
 @theme {
   --font-sans: 'Segoe UI Variable Text', 'Segoe UI', 'Microsoft YaHei UI', 'Microsoft YaHei', system-ui, sans-serif;
@@ -236,11 +235,6 @@ progress.task-progress::-moz-progress-bar {
   color: var(--color-fg);
   border-bottom-color: var(--color-accent);
   font-weight: 500;
-}
-
-.file-pane {
-  content-visibility: auto;
-  contain-intrinsic-size: auto 480px;
 }
 
 /* ───── 工具栏（遵循单 Tab 停靠点与 [aria-pressed="true"] 状态驱动样式） ───── */

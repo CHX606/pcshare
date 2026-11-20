@@ -194,6 +194,8 @@ mod win_media_input;
 #[cfg(windows)]
 mod win_sys_pty;
 #[cfg(windows)]
+mod win_util;
+#[cfg(windows)]
 mod windows_impl;
 #[cfg(windows)]
 pub use windows_impl::WindowsPlatform as NativePlatform;

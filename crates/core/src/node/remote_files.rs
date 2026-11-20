@@ -62,6 +62,22 @@ impl CoreNode {
         Ok(all)
     }
 
+    /// 只读查询指定设备（`"self"` 表示本机，否则为已配对远端设备）的目录条目：
+    /// 不写入最近访问目录、不更新目录缓存、不推送列表批次事件（供冲突检查等只读场景使用）。
+    pub async fn fs_list_readonly(
+        self: &Arc<Self>,
+        peer_id: &str,
+        path: &str,
+    ) -> Result<Vec<DirEntry>, CoreError> {
+        if peer_id == "self" {
+            let perms = Permissions::default();
+            let batch = self.fs_service.list_local(&perms, path).await?;
+            Ok(batch.entries)
+        } else {
+            self.remote_list(peer_id, path).await
+        }
+    }
+
     pub async fn remote_list_batches<F>(
         self: &Arc<Self>,
         peer_id: &str,

@@ -94,6 +94,7 @@ fn extract_global_opts(raw: Vec<String>) -> Result<(GlobalOpts, Vec<String>)> {
     let mut json_output = false;
     let mut rest = Vec::new();
 
+    // 仅在子命令前解析全局选项，遇到子命令或 `--` 后立即停止，防止误吞子命令参数（如 `--args "--name foo"`）
     let mut iter = raw.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -111,7 +112,15 @@ fn extract_global_opts(raw: Vec<String>) -> Result<(GlobalOpts, Vec<String>)> {
             "--json" => {
                 json_output = true;
             }
-            _ => rest.push(arg),
+            "--" => {
+                rest.extend(iter);
+                break;
+            }
+            _ => {
+                rest.push(arg);
+                rest.extend(iter);
+                break;
+            }
         }
     }
 
@@ -187,6 +196,12 @@ fn open_local_storage(opts: &GlobalOpts) -> Result<LocalStorage> {
         eprintln!("提示：{w}");
     }
     Ok(store)
+}
+
+/// 启动网络节点前先通过本地存储解析并校验设备名，避免输错设备名时白启完整节点或漏关节点。
+fn resolve_peer_before_start(opts: &GlobalOpts, target: &str) -> Result<String> {
+    let store = open_local_storage(opts)?;
+    resolve_peer_id(&store.list_peers(), target)
 }
 
 fn resolve_peer_id(peers: &[PeerRecord], query: &str) -> Result<String> {
@@ -293,7 +308,15 @@ async fn cmd_serve(opts: &GlobalOpts, args: &[String]) -> Result<()> {
     let mut events_rx = node.subscribe_events();
     let node_for_events = node.clone();
     tokio::spawn(async move {
-        while let Ok(ev) = events_rx.recv().await {
+        loop {
+            let ev = match events_rx.recv().await {
+                Ok(ev) => ev,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(skipped, "事件广播消费滞后，继续监听后续事件");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
             match ev {
                 CoreEvent::PairingApprovalNeeded(prompt) => {
                     let _ = writeln!(
@@ -478,8 +501,8 @@ async fn cmd_pair(opts: &GlobalOpts, args: &[String]) -> Result<()> {
 
 async fn cmd_ping(opts: &GlobalOpts, args: &[String]) -> Result<()> {
     let target = args.first().context("缺少目标设备")?;
+    let peer_id = resolve_peer_before_start(opts, target)?;
     let node = start_client_node(opts).await?;
-    let peer_id = resolve_peer_id(&node.list_peers(), target)?;
     let res = node.remote_ping(&peer_id).await;
     let state = node.peer_state(&peer_id);
     node.shutdown().await;
@@ -501,8 +524,8 @@ async fn cmd_ping(opts: &GlobalOpts, args: &[String]) -> Result<()> {
 
 async fn cmd_info(opts: &GlobalOpts, args: &[String]) -> Result<()> {
     let target = args.first().context("缺少目标设备")?;
+    let peer_id = resolve_peer_before_start(opts, target)?;
     let node = start_client_node(opts).await?;
-    let peer_id = resolve_peer_id(&node.list_peers(), target)?;
     let res = node.remote_info(&peer_id).await;
     node.shutdown().await;
     let info = res.map_err(|e| anyhow!(e.to_user_message()))?;
@@ -532,8 +555,8 @@ async fn cmd_info(opts: &GlobalOpts, args: &[String]) -> Result<()> {
 
 async fn cmd_roots(opts: &GlobalOpts, args: &[String]) -> Result<()> {
     let target = args.first().context("缺少目标设备")?;
+    let peer_id = resolve_peer_before_start(opts, target)?;
     let node = start_client_node(opts).await?;
-    let peer_id = resolve_peer_id(&node.list_peers(), target)?;
     let res = node.remote_roots(&peer_id).await;
     node.shutdown().await;
     let roots = res.map_err(|e| anyhow!(e.to_user_message()))?;
@@ -566,8 +589,8 @@ async fn cmd_ls(opts: &GlobalOpts, args: &[String]) -> Result<()> {
     let Some(path) = args.get(1) else {
         return cmd_roots(opts, args).await;
     };
+    let peer_id = resolve_peer_before_start(opts, target)?;
     let node = start_client_node(opts).await?;
-    let peer_id = resolve_peer_id(&node.list_peers(), target)?;
     let res = node.remote_list(&peer_id, path).await;
     node.shutdown().await;
     let entries = res.map_err(|e| anyhow!(e.to_user_message()))?;
@@ -589,8 +612,8 @@ async fn cmd_ls(opts: &GlobalOpts, args: &[String]) -> Result<()> {
 async fn cmd_stat(opts: &GlobalOpts, args: &[String]) -> Result<()> {
     let target = args.first().context("缺少目标设备")?;
     let path = args.get(1).context("缺少远端文件或文件夹路径")?;
+    let peer_id = resolve_peer_before_start(opts, target)?;
     let node = start_client_node(opts).await?;
-    let peer_id = resolve_peer_id(&node.list_peers(), target)?;
     let res = node.remote_stat(&peer_id, path).await;
     node.shutdown().await;
     let stat = res.map_err(|e| anyhow!(e.to_user_message()))?;
@@ -610,8 +633,8 @@ async fn cmd_mkdir(opts: &GlobalOpts, args: &[String]) -> Result<()> {
     let target = args.first().context("缺少目标设备")?;
     let path = args.get(1).context("缺少要创建的远端文件夹路径")?;
     let parents = args[2..].iter().any(|a| a == "-p" || a == "--parents");
+    let peer_id = resolve_peer_before_start(opts, target)?;
     let node = start_client_node(opts).await?;
-    let peer_id = resolve_peer_id(&node.list_peers(), target)?;
     let res = node
         .remote_mkdir(
             &peer_id,
@@ -631,8 +654,8 @@ async fn cmd_rename(opts: &GlobalOpts, args: &[String]) -> Result<()> {
     let target = args.first().context("缺少目标设备")?;
     let path = args.get(1).context("缺少原路径")?;
     let new_name = args.get(2).context("缺少新名称")?;
+    let peer_id = resolve_peer_before_start(opts, target)?;
     let node = start_client_node(opts).await?;
-    let peer_id = resolve_peer_id(&node.list_peers(), target)?;
     let res = node
         .remote_rename(
             &peer_id,
@@ -664,8 +687,8 @@ async fn cmd_copy_or_move(opts: &GlobalOpts, args: &[String], is_move: bool) -> 
         }
     }
 
+    let peer_id = resolve_peer_before_start(opts, target)?;
     let node = start_client_node(opts).await?;
-    let peer_id = resolve_peer_id(&node.list_peers(), target)?;
     let req = FsCopyMoveArgs {
         sources: vec![src.clone()],
         dest_dir: dest_dir.clone(),
@@ -702,8 +725,8 @@ async fn cmd_rm(opts: &GlobalOpts, args: &[String]) -> Result<()> {
     let path = args.get(1).context("缺少要删除的远端路径")?;
     let permanent = args[2..].iter().any(|a| a == "--permanent");
 
+    let peer_id = resolve_peer_before_start(opts, target)?;
     let node = start_client_node(opts).await?;
-    let peer_id = resolve_peer_id(&node.list_peers(), target)?;
     let res = node
         .remote_delete(
             &peer_id,
@@ -741,8 +764,8 @@ async fn cmd_upload(opts: &GlobalOpts, args: &[String]) -> Result<()> {
 
     let local_abs = std::fs::canonicalize(local_str)
         .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(local_str));
+    let peer_id = resolve_peer_before_start(opts, target)?;
     let node = start_client_node(opts).await?;
-    let peer_id = resolve_peer_id(&node.list_peers(), target)?;
 
     let cancel = CancellationToken::new();
     let c_sig = cancel.clone();
@@ -753,7 +776,7 @@ async fn cmd_upload(opts: &GlobalOpts, args: &[String]) -> Result<()> {
     });
 
     let res = node
-        .upload_file(
+        .upload_file_resumable(
             &peer_id,
             &local_abs,
             remote_str,
@@ -772,6 +795,7 @@ async fn cmd_upload(opts: &GlobalOpts, args: &[String]) -> Result<()> {
                     speed / 1_048_576.0
                 );
             })),
+            None,
         )
         .await;
     eprintln!();
@@ -808,8 +832,8 @@ async fn cmd_download(opts: &GlobalOpts, args: &[String]) -> Result<()> {
         std::env::current_dir()?.join(local_path)
     };
 
+    let peer_id = resolve_peer_before_start(opts, target)?;
     let node = start_client_node(opts).await?;
-    let peer_id = resolve_peer_id(&node.list_peers(), target)?;
 
     let cancel = CancellationToken::new();
     let c_sig = cancel.clone();
@@ -820,7 +844,7 @@ async fn cmd_download(opts: &GlobalOpts, args: &[String]) -> Result<()> {
     });
 
     let res = node
-        .download_file(
+        .download_file_resumable(
             &peer_id,
             remote_str,
             &local_abs,
@@ -839,6 +863,7 @@ async fn cmd_download(opts: &GlobalOpts, args: &[String]) -> Result<()> {
                     speed / 1_048_576.0
                 );
             })),
+            None,
         )
         .await;
     eprintln!();
@@ -864,8 +889,8 @@ async fn cmd_apps(opts: &GlobalOpts, args: &[String]) -> Result<()> {
         }
     }
 
+    let peer_id = resolve_peer_before_start(opts, target)?;
     let node = start_client_node(opts).await?;
-    let peer_id = resolve_peer_id(&node.list_peers(), target)?;
     let res = node.remote_apps(&peer_id, refresh).await;
     node.shutdown().await;
     let reply = res.map_err(|e| anyhow!(e.to_user_message()))?;
@@ -911,8 +936,8 @@ async fn cmd_launch(opts: &GlobalOpts, args: &[String]) -> Result<()> {
         }
     }
 
+    let peer_id = resolve_peer_before_start(opts, target_peer)?;
     let node = start_client_node(opts).await?;
-    let peer_id = resolve_peer_id(&node.list_peers(), target_peer)?;
     let res = node
         .remote_launch(
             &peer_id,
@@ -949,8 +974,8 @@ async fn cmd_ps(opts: &GlobalOpts, args: &[String]) -> Result<()> {
     let target = args.first().context("缺少目标设备")?;
     let keyword = args.get(1).map(|s| s.to_lowercase());
 
+    let peer_id = resolve_peer_before_start(opts, target)?;
     let node = start_client_node(opts).await?;
-    let peer_id = resolve_peer_id(&node.list_peers(), target)?;
     let res = node.remote_processes(&peer_id).await;
     node.shutdown().await;
     let reply = res.map_err(|e| anyhow!(e.to_user_message()))?;
@@ -998,8 +1023,8 @@ async fn cmd_kill(opts: &GlobalOpts, args: &[String]) -> Result<()> {
         bail!("结束进程可能导致对方电脑未保存的数据丢失，请附加 --yes 确认后再执行");
     }
 
+    let peer_id = resolve_peer_before_start(opts, target)?;
     let node = start_client_node(opts).await?;
-    let peer_id = resolve_peer_id(&node.list_peers(), target)?;
     let res = node
         .remote_kill_process(&peer_id, ProcKillArgs { pid, confirmed })
         .await;

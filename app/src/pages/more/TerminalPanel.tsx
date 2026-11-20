@@ -1,5 +1,6 @@
 import { FitAddon } from '@xterm/addon-fit'
 import { Terminal } from '@xterm/xterm'
+import '@xterm/xterm/css/xterm.css'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { backend } from '../../api'
 import { humanError } from '../../api/errors'
@@ -9,12 +10,23 @@ import { Button } from '../../components/Modal'
 import { Toolbar } from '../../components/Toolbar'
 import { base64FromUtf8, bytesFromBase64 } from '../../lib/stage3'
 
+const MAX_BUFFERED_CHUNKS = 512
+const RESIZE_DEBOUNCE_MS = 100
+
 /** 任务 3.6：交互式伪终端（被控端通过系统 ConPTY 启动 PowerShell 或 cmd，前端用 xterm.js 渲染并同步尺寸）。 */
 export function TerminalPanel({ device }: { device: DeviceId }) {
   const hostRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
-  const sessionIdRef = useRef<string | null>(null)
+  const ctrlRef = useRef({
+    sessionId: null as string | null,
+    seq: 0,
+    connecting: false,
+    unmounted: false,
+    lastSize: null as { cols: number; rows: number } | null,
+    pendingOutput: new Map<string, string[]>(),
+    pendingExit: new Map<string, number>(),
+  })
 
   const [shell, setShell] = useState<'powershell' | 'cmd'>('powershell')
   const [session, setSession] = useState<TermSession | null>(null)
@@ -27,13 +39,20 @@ export function TerminalPanel({ device }: { device: DeviceId }) {
       const term = termRef.current
       const fit = fitRef.current
       if (!term || !fit) return
+      const ctrl = ctrlRef.current
 
-      if (sessionIdRef.current) {
-        const old = sessionIdRef.current
-        sessionIdRef.current = null
+      const seq = ++ctrl.seq
+      if (ctrl.sessionId) {
+        const old = ctrl.sessionId
+        ctrl.sessionId = null
         await backend.termClose(old).catch(() => {})
+        if (ctrl.unmounted || seq !== ctrl.seq) return
       }
 
+      ctrl.connecting = true
+      ctrl.pendingOutput.clear()
+      ctrl.pendingExit.clear()
+      ctrl.lastSize = null
       setConnecting(true)
       setErrorMsg(null)
       setExitedCode(null)
@@ -44,14 +63,47 @@ export function TerminalPanel({ device }: { device: DeviceId }) {
         const cols = Math.max(40, term.cols || 100)
         const rows = Math.max(12, term.rows || 28)
         const opened = await backend.termOpen(device, targetShell, cols, rows)
-        sessionIdRef.current = opened.sessionId
+
+        // 若返回前组件已卸载或用户已切换 shell，立即关闭新会话防远端 ConPTY 泄漏
+        if (ctrl.unmounted || seq !== ctrl.seq) {
+          ctrl.pendingOutput.delete(opened.sessionId)
+          ctrl.pendingExit.delete(opened.sessionId)
+          void backend.termClose(opened.sessionId).catch(() => {})
+          return
+        }
+
+        ctrl.connecting = false
+        ctrl.sessionId = opened.sessionId
+        ctrl.lastSize = { cols, rows }
         setSession(opened)
-        term.focus()
+
+        // 回放 termOpen 返回前早到的首批输出与退出事件
+        const buffered = ctrl.pendingOutput.get(opened.sessionId)
+        ctrl.pendingOutput.clear()
+        if (buffered) {
+          for (const chunk of buffered) term.write(bytesFromBase64(chunk))
+        }
+        const earlyExit = ctrl.pendingExit.get(opened.sessionId)
+        ctrl.pendingExit.clear()
+        if (earlyExit !== undefined) {
+          setExitedCode(earlyExit)
+          term.writeln(`\r\n\x1b[33m[终端进程已退出，退出码 ${earlyExit}]\x1b[0m`)
+          ctrl.sessionId = null
+        } else {
+          term.focus()
+        }
       } catch (err) {
-        setSession(null)
-        setErrorMsg(humanError(err))
+        if (!ctrl.unmounted && seq === ctrl.seq) {
+          ctrl.connecting = false
+          ctrl.pendingOutput.clear()
+          ctrl.pendingExit.clear()
+          setSession(null)
+          setErrorMsg(humanError(err))
+        }
       } finally {
-        setConnecting(false)
+        if (!ctrl.unmounted && seq === ctrl.seq) {
+          setConnecting(false)
+        }
       }
     },
     [device],
@@ -60,6 +112,8 @@ export function TerminalPanel({ device }: { device: DeviceId }) {
   useEffect(() => {
     const container = hostRef.current
     if (!container) return
+    const ctrl = ctrlRef.current
+    ctrl.unmounted = false
 
     const term = new Terminal({
       cursorBlink: true,
@@ -81,45 +135,76 @@ export function TerminalPanel({ device }: { device: DeviceId }) {
     fitRef.current = fit
 
     const dataDisp = term.onData((data) => {
-      const sid = sessionIdRef.current
+      const sid = ctrl.sessionId
       if (!sid) return
       void backend.termWrite(sid, base64FromUtf8(data)).catch(() => {})
     })
 
     const offOut = backend.on('term-output', (ev) => {
-      if (ev.sessionId !== sessionIdRef.current) return
-      term.write(bytesFromBase64(ev.dataB64))
+      if (ev.sessionId === ctrl.sessionId) {
+        term.write(bytesFromBase64(ev.dataB64))
+        return
+      }
+      if (ctrl.connecting) {
+        let queue = ctrl.pendingOutput.get(ev.sessionId)
+        if (!queue) {
+          queue = []
+          ctrl.pendingOutput.set(ev.sessionId, queue)
+        }
+        if (queue.length < MAX_BUFFERED_CHUNKS) queue.push(ev.dataB64)
+      }
     })
 
     const offExit = backend.on('term-exit', (ev) => {
-      if (ev.sessionId !== sessionIdRef.current) return
-      setExitedCode(ev.exitCode ?? 0)
-      term.writeln(`\r\n\x1b[33m[终端进程已退出，退出码 ${ev.exitCode ?? 0}]\x1b[0m`)
-      sessionIdRef.current = null
+      const code = ev.exitCode ?? 0
+      if (ev.sessionId === ctrl.sessionId) {
+        setExitedCode(code)
+        term.writeln(`\r\n\x1b[33m[终端进程已退出，退出码 ${code}]\x1b[0m`)
+        ctrl.sessionId = null
+        return
+      }
+      if (ctrl.connecting) {
+        ctrl.pendingExit.set(ev.sessionId, code)
+      }
     })
 
+    let resizeTimer: number | null = null
     const ro = new ResizeObserver(() => {
-      try {
-        fit.fit()
-        const sid = sessionIdRef.current
-        if (sid && term.cols >= 20 && term.rows >= 5) {
-          void backend.termResize(sid, term.cols, term.rows).catch(() => {})
+      if (resizeTimer !== null) window.clearTimeout(resizeTimer)
+      resizeTimer = window.setTimeout(() => {
+        resizeTimer = null
+        try {
+          fit.fit()
+          const sid = ctrl.sessionId
+          if (sid && term.cols >= 20 && term.rows >= 5) {
+            const last = ctrl.lastSize
+            if (!last || last.cols !== term.cols || last.rows !== term.rows) {
+              ctrl.lastSize = { cols: term.cols, rows: term.rows }
+              void backend.termResize(sid, term.cols, term.rows).catch(() => {})
+            }
+          }
+        } catch {
+          // Ignore transient layout measurements
         }
-      } catch {
-        // Ignore transient layout measurements
-      }
+      }, RESIZE_DEBOUNCE_MS)
     })
     ro.observe(container)
 
     void connectShell('powershell')
 
     return () => {
+      ctrl.unmounted = true
+      ctrl.seq += 1
+      ctrl.connecting = false
+      if (resizeTimer !== null) window.clearTimeout(resizeTimer)
       ro.disconnect()
       offOut()
       offExit()
       dataDisp.dispose()
-      const sid = sessionIdRef.current
-      sessionIdRef.current = null
+      ctrl.pendingOutput.clear()
+      ctrl.pendingExit.clear()
+      const sid = ctrl.sessionId
+      ctrl.sessionId = null
       if (sid) void backend.termClose(sid).catch(() => {})
       term.dispose()
     }
@@ -178,6 +263,10 @@ export function TerminalPanel({ device }: { device: DeviceId }) {
 
       <div
         ref={hostRef}
+        data-capture-keys="true"
+        onKeyDown={(e) => {
+          e.nativeEvent.stopPropagation()
+        }}
         className="min-h-[340px] flex-1 overflow-hidden rounded-lg border border-line bg-[#141619] p-2"
       />
     </div>

@@ -27,6 +27,8 @@ interface RemoteState {
 
 const FAV_KEY = 'pcshare.favorites'
 const APPS_TTL = 5 * 60_000 // 与核心层一致：软件列表缓存 5 分钟
+const appReqSeq: Record<DeviceId, number> = {}
+const procReqSeq: Record<DeviceId, number> = {}
 
 function loadFavorites(): Record<DeviceId, string[]> {
   try {
@@ -47,21 +49,29 @@ export const useRemote = create<RemoteState>()((set, get) => ({
   async loadApps(device, force = false) {
     const cur = get().apps[device]
     if (!force && cur?.data && cur.at && Date.now() - cur.at < APPS_TTL) return
-    set((s) => ({ apps: { ...s.apps, [device]: { ...cur, loading: true } } }))
+    const seq = (appReqSeq[device] ?? 0) + 1
+    appReqSeq[device] = seq
+    set((s) => ({ apps: { ...s.apps, [device]: { ...s.apps[device], loading: true } } }))
     try {
-      const data = await backend.appList(device)
+      const data = await backend.appList(device, force)
+      if (appReqSeq[device] !== seq) return
       set((s) => ({ apps: { ...s.apps, [device]: { data, loading: false, at: Date.now() } } }))
     } catch (e) {
+      if (appReqSeq[device] !== seq) return
       set((s) => ({ apps: { ...s.apps, [device]: { ...s.apps[device], loading: false, error: humanError(e) } } }))
     }
   },
 
   async loadProcs(device) {
+    const seq = (procReqSeq[device] ?? 0) + 1
+    procReqSeq[device] = seq
     set((s) => ({ procs: { ...s.procs, [device]: { ...s.procs[device], loading: true } } }))
     try {
       const data = await backend.procList(device)
+      if (procReqSeq[device] !== seq) return
       set((s) => ({ procs: { ...s.procs, [device]: { data, loading: false, at: Date.now() } } }))
     } catch (e) {
+      if (procReqSeq[device] !== seq) return
       set((s) => ({ procs: { ...s.procs, [device]: { ...s.procs[device], loading: false, error: humanError(e) } } }))
     }
   },

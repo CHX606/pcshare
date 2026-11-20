@@ -23,13 +23,23 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{map_io_to_rpc, map_platform_to_rpc};
 use crate::path_guard::{
-    normalize_lexical_absolute, resolve_authorized_path, to_display_path, to_fs_path,
-    validate_single_name,
+    is_subpath_of, normalize_lexical_absolute, paths_equal, resolve_authorized_path,
+    to_display_path, to_fs_path, validate_single_name,
 };
+
+/// 传输流被暂停时对端发送的 QUIC reset 错误码（保留 `.pcshare.part` 供断点续传）。
+pub const STREAM_STOP_CODE_PAUSE: u32 = 498;
+/// 传输流被主动取消时对端发送的 QUIC reset 错误码（删除 `.pcshare.part`）。
+pub const STREAM_STOP_CODE_CANCEL: u32 = 499;
+/// 单文件批量读写通道允许的单个文件最大字节数（4 MB），超限应改走分块流式通道，防止整文件读入内存 OOM。
+pub const MAX_BATCH_FILE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_TRACKED_TASKS: usize = 256;
+const FINISHED_TASK_TTL: Duration = Duration::from_secs(30 * 60);
 
 struct ManagedTask {
     progress: FsTaskProgress,
     cancel: CancellationToken,
+    updated_at: Instant,
 }
 
 /// 临时 `.part` 文件守护：除非显式 `commit()`，否则无论正常报错、断流还是任务取消都会自动清理临时文件。
@@ -150,12 +160,13 @@ impl FsService {
     }
 
     /// 在阻塞线程池中读取目录，并按最多 2000 项一帧分批发送。
+    /// 返回 `Ok(true)` 表示业务成功，`Ok(false)` 表示已向对端返回业务错误帧。
     pub async fn list_to_stream<W>(
         &self,
         perms: &Permissions,
         args: FsListArgs,
         send: &mut W,
-    ) -> Result<(), crate::error::CoreError>
+    ) -> Result<bool, crate::error::CoreError>
     where
         W: AsyncWrite + Unpin + ?Sized,
     {
@@ -163,7 +174,7 @@ impl FsService {
             let resp: ResponseEnvelope<FsListBatch> =
                 ResponseEnvelope::err(ErrorCode::Forbidden, "对方没有开放读取文件的权限");
             write_frame(send, &resp).await?;
-            return Ok(());
+            return Ok(false);
         }
 
         let (clean_dir, fs_dir) = match resolve_authorized_path(&args.path, perms) {
@@ -171,7 +182,7 @@ impl FsService {
             Err(rpc_err) => {
                 let resp: ResponseEnvelope<FsListBatch> = ResponseEnvelope::Err(rpc_err);
                 write_frame(send, &resp).await?;
-                return Ok(());
+                return Ok(false);
             }
         };
 
@@ -201,11 +212,11 @@ impl FsService {
                     Err(rpc_err) => {
                         let resp: ResponseEnvelope<FsListBatch> = ResponseEnvelope::Err(rpc_err);
                         write_frame(send, &resp).await?;
-                        return Ok(());
+                        return Ok(false);
                     }
                 }
             }
-            return Ok(());
+            return Ok(true);
         }
 
         let clean_dir_clone = clean_dir.clone();
@@ -219,7 +230,7 @@ impl FsService {
             Err(rpc_err) => {
                 let resp: ResponseEnvelope<FsListBatch> = ResponseEnvelope::Err(rpc_err);
                 write_frame(send, &resp).await?;
-                return Ok(());
+                return Ok(false);
             }
         };
 
@@ -232,7 +243,7 @@ impl FsService {
                 total_hint: Some(0),
             };
             write_frame(send, &ResponseEnvelope::ok(batch)).await?;
-            return Ok(());
+            return Ok(true);
         }
 
         let mut cursor = 0usize;
@@ -247,7 +258,7 @@ impl FsService {
             write_frame(send, &ResponseEnvelope::ok(batch)).await?;
             cursor = end;
         }
-        Ok(())
+        Ok(true)
     }
 
     pub async fn bench_list_local(&self, dir: &Path) -> Result<usize, RpcError> {
@@ -392,13 +403,7 @@ impl FsService {
             if permanent {
                 for (clean, fs_p) in clean_paths.iter().zip(fs_paths.iter()) {
                     let disp = to_display_path(clean);
-                    let meta = fs::symlink_metadata(fs_p)
-                        .map_err(|e| map_io_to_rpc(&e, Some(&disp)))?;
-                    if meta.is_dir() && !meta.file_type().is_symlink() {
-                        fs::remove_dir_all(fs_p).map_err(|e| map_io_to_rpc(&e, Some(&disp)))?;
-                    } else {
-                        fs::remove_file(fs_p).map_err(|e| map_io_to_rpc(&e, Some(&disp)))?;
-                    }
+                    remove_path_permanent(fs_p).map_err(|e| map_io_to_rpc(&e, Some(&disp)))?;
                 }
                 Ok(())
             } else {
@@ -443,10 +448,27 @@ impl FsService {
         let mut sources = Vec::with_capacity(args.sources.len());
         for s in &args.sources {
             let (sc, sf) = resolve_authorized_path(s, perms)?;
-            if !sf.exists() {
+            let src_meta = fs::symlink_metadata(&sf).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    RpcError::new(
+                        ErrorCode::NotFound,
+                        format!("找不到源路径：{}", to_display_path(&sc)),
+                    )
+                } else {
+                    map_io_to_rpc(&e, Some(&to_display_path(&sc)))
+                }
+            })?;
+            // 提前拦截将文件夹复制/移动到自身或其子文件夹
+            if src_meta.is_dir()
+                && !is_symlink_or_junction(&sf, &src_meta)
+                && is_same_or_descendant(&dest_clean, &dest_fs, &sc, &sf)
+            {
                 return Err(RpcError::new(
-                    ErrorCode::NotFound,
-                    format!("找不到源路径：{}", to_display_path(&sc)),
+                    ErrorCode::Invalid,
+                    format!(
+                        "不能将文件夹“{}”复制或移动到自身或其子文件夹中",
+                        to_display_path(&sc)
+                    ),
                 ));
             }
             sources.push((sc, sf));
@@ -468,11 +490,19 @@ impl FsService {
 
         {
             let mut guard = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            prune_finished_tasks(&mut guard);
+            if guard.len() >= MAX_TRACKED_TASKS {
+                return Err(RpcError::new(
+                    ErrorCode::Busy,
+                    "当前同时进行的文件复制/移动任务过多，请稍后再试",
+                ));
+            }
             guard.insert(
                 task_id.clone(),
                 ManagedTask {
                     progress: initial.clone(),
                     cancel: cancel.clone(),
+                    updated_at: Instant::now(),
                 },
             );
         }
@@ -519,6 +549,7 @@ impl FsService {
         task.cancel.cancel();
         if task.progress.state == FsTaskState::Running {
             task.progress.state = FsTaskState::Cancelled;
+            task.updated_at = Instant::now();
         }
         Ok(task.progress.clone())
     }
@@ -529,7 +560,7 @@ impl FsService {
         perms: &Permissions,
         args: FsReadArgs,
         send: &mut W,
-    ) -> Result<(), crate::error::CoreError>
+    ) -> Result<bool, crate::error::CoreError>
     where
         W: AsyncWrite + Unpin + ?Sized,
     {
@@ -537,14 +568,14 @@ impl FsService {
             let resp: ResponseEnvelope<FsReadHeader> =
                 ResponseEnvelope::err(ErrorCode::Forbidden, "对方没有开放读取文件的权限");
             write_frame(send, &resp).await?;
-            return Ok(());
+            return Ok(false);
         }
 
         let (clean, fs_path) = match resolve_authorized_path(&args.path, perms) {
             Ok(p) => p,
             Err(err) => {
                 write_frame(send, &ResponseEnvelope::<FsReadHeader>::Err(err)).await?;
-                return Ok(());
+                return Ok(false);
             }
         };
         let disp = to_display_path(&clean);
@@ -554,7 +585,7 @@ impl FsService {
             Err(err) => {
                 let rpc = map_io_to_rpc(&err, Some(&disp));
                 write_frame(send, &ResponseEnvelope::<FsReadHeader>::Err(rpc)).await?;
-                return Ok(());
+                return Ok(false);
             }
         };
 
@@ -563,7 +594,7 @@ impl FsService {
             Err(err) => {
                 let rpc = map_io_to_rpc(&err, Some(&disp));
                 write_frame(send, &ResponseEnvelope::<FsReadHeader>::Err(rpc)).await?;
-                return Ok(());
+                return Ok(false);
             }
         };
 
@@ -571,7 +602,7 @@ impl FsService {
             let resp: ResponseEnvelope<FsReadHeader> =
                 ResponseEnvelope::err(ErrorCode::Invalid, format!("“{disp}”不是普通文件，无法直接下载"));
             write_frame(send, &resp).await?;
-            return Ok(());
+            return Ok(false);
         }
 
         let file_size = meta.len();
@@ -579,7 +610,7 @@ impl FsService {
             let resp: ResponseEnvelope<FsReadHeader> =
                 ResponseEnvelope::err(ErrorCode::Invalid, "读取起始位置超过文件总长度");
             write_frame(send, &resp).await?;
-            return Ok(());
+            return Ok(false);
         }
 
         if args.offset > 0
@@ -587,7 +618,7 @@ impl FsService {
         {
             let rpc = map_io_to_rpc(&err, Some(&disp));
             write_frame(send, &ResponseEnvelope::<FsReadHeader>::Err(rpc)).await?;
-            return Ok(());
+            return Ok(false);
         }
 
         let remaining = file_size - args.offset;
@@ -613,12 +644,12 @@ impl FsService {
             left -= n as u64;
         }
         send.flush().await?;
-        Ok(())
+        Ok(true)
     }
 
     /// 处理 `fs.write`（上传）：
     /// 1. 校验权限与冲突策略，回复 `FsWriteReady`
-    /// 2. 接收原始字节流写入同目录 `.part` 临时文件（若中途断流/取消，`PartFileGuard` 自动清除临时文件）
+    /// 2. 接收原始字节流写入同目录 `.part` 临时文件（若主动取消，`PartFileGuard` 自动清除临时文件；若断网/暂停则保留）
     /// 3. 完整收齐后恢复修改时间、原子改名为目标文件，最后回复 `FsWriteDone`
     pub async fn handle_write_stream<R, W>(
         &self,
@@ -626,7 +657,7 @@ impl FsService {
         args: FsWriteArgs,
         recv: &mut R,
         send: &mut W,
-    ) -> Result<(), crate::error::CoreError>
+    ) -> Result<bool, crate::error::CoreError>
     where
         R: AsyncRead + Unpin + ?Sized,
         W: AsyncWrite + Unpin + ?Sized,
@@ -640,7 +671,7 @@ impl FsService {
                 ),
             )
             .await?;
-            return Ok(());
+            return Ok(false);
         }
 
         if args.offset > args.size {
@@ -652,14 +683,14 @@ impl FsService {
                 ),
             )
             .await?;
-            return Ok(());
+            return Ok(false);
         }
 
         let (initial_clean, initial_fs) = match resolve_authorized_path(&args.path, perms) {
             Ok(p) => p,
             Err(err) => {
                 write_frame(send, &ResponseEnvelope::<FsWriteReady>::Err(err)).await?;
-                return Ok(());
+                return Ok(false);
             }
         };
 
@@ -675,7 +706,7 @@ impl FsService {
                         ),
                     )
                     .await?;
-                    return Ok(());
+                    return Ok(false);
                 }
                 ConflictPolicy::Skip => {
                     let disp = to_display_path(&initial_clean);
@@ -687,7 +718,7 @@ impl FsService {
                         }),
                     )
                     .await?;
-                    return Ok(());
+                    return Ok(true);
                 }
                 ConflictPolicy::Overwrite => (initial_clean, initial_fs),
                 ConflictPolicy::RenameKeepBoth => pick_unique_target(&initial_clean),
@@ -702,13 +733,13 @@ impl FsService {
                 &ResponseEnvelope::<FsWriteReady>::err(ErrorCode::Invalid, "无效的目标文件路径"),
             )
             .await?;
-            return Ok(());
+            return Ok(false);
         };
         let parent_fs = to_fs_path(parent_clean);
         if let Err(err) = tokio::fs::create_dir_all(&parent_fs).await {
             let rpc = map_io_to_rpc(&err, Some(&to_display_path(parent_clean)));
             write_frame(send, &ResponseEnvelope::<FsWriteReady>::Err(rpc)).await?;
-            return Ok(());
+            return Ok(false);
         }
 
         let file_name = final_clean
@@ -736,7 +767,7 @@ impl FsService {
                             ),
                         )
                         .await?;
-                        return Ok(());
+                        return Ok(false);
                     }
                     let _ = f.set_len(args.offset).await;
                     f.seek(std::io::SeekFrom::Start(args.offset)).await?;
@@ -745,7 +776,7 @@ impl FsService {
                 Err(err) => {
                     let rpc = map_io_to_rpc(&err, Some(&to_display_path(&part_clean)));
                     write_frame(send, &ResponseEnvelope::<FsWriteReady>::Err(rpc)).await?;
-                    return Ok(());
+                    return Ok(false);
                 }
             }
         } else {
@@ -754,7 +785,7 @@ impl FsService {
                 Err(err) => {
                     let rpc = map_io_to_rpc(&err, Some(&to_display_path(&final_clean)));
                     write_frame(send, &ResponseEnvelope::<FsWriteReady>::Err(rpc)).await?;
-                    return Ok(());
+                    return Ok(false);
                 }
             }
         };
@@ -788,10 +819,7 @@ impl FsService {
                     received += n as u64;
                 }
                 Err(io_err) => {
-                    let msg = io_err.to_string();
-                    let is_pause = msg.contains("498");
-                    let is_explicit_cancel =
-                        io_err.kind() == std::io::ErrorKind::ConnectionReset && !is_pause;
+                    let is_explicit_cancel = is_explicit_cancel_error(&io_err);
                     if !is_explicit_cancel {
                         let _ = part_file.flush().await;
                         guard.commit();
@@ -836,11 +864,13 @@ impl FsService {
                     }),
                 )
                 .await?;
-                Ok(())
+                Ok(true)
             }
             Err(rpc_err) => {
+                // 目标可能被短暂占用，保留已完整接收的 .pcshare.part 便于续传秒完成
+                guard.commit();
                 write_frame(send, &ResponseEnvelope::<FsWriteDone>::Err(rpc_err)).await?;
-                Ok(())
+                Ok(false)
             }
         }
     }
@@ -966,12 +996,12 @@ impl FsService {
         perms: &Permissions,
         args: FsWalkArgs,
         send: &mut W,
-    ) -> Result<(), crate::error::CoreError> {
+    ) -> Result<bool, crate::error::CoreError> {
         let entries = match self.walk_local(perms, &args.sources).await {
             Ok(list) => list,
             Err(err) => {
                 write_frame(send, &ResponseEnvelope::<FsWalkBatch>::Err(err)).await?;
-                return Ok(());
+                return Ok(false);
             }
         };
         if entries.is_empty() {
@@ -983,7 +1013,7 @@ impl FsService {
                 }),
             )
             .await?;
-            return Ok(());
+            return Ok(true);
         }
         let total = entries.len();
         let mut idx = 0usize;
@@ -996,7 +1026,7 @@ impl FsService {
             write_frame(send, &ResponseEnvelope::ok(batch)).await?;
             idx = end;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// 接收单条数据流里连续发来的一批小文件与子目录（任务 2.4 小文件优化）。
@@ -1006,7 +1036,7 @@ impl FsService {
         args: FsWriteBatchArgs,
         recv: &mut R,
         send: &mut W,
-    ) -> Result<(), crate::error::CoreError>
+    ) -> Result<bool, crate::error::CoreError>
     where
         R: AsyncRead + Unpin + ?Sized,
         W: AsyncWrite + Unpin + ?Sized,
@@ -1017,19 +1047,19 @@ impl FsService {
                 &ResponseEnvelope::<()>::err(ErrorCode::Forbidden, "对方没有开放写入文件的权限"),
             )
             .await?;
-            return Ok(());
+            return Ok(false);
         }
         let (dest_clean, dest_fs) = match resolve_authorized_path(&args.dest_dir, perms) {
             Ok(p) => p,
             Err(err) => {
                 write_frame(send, &ResponseEnvelope::<()>::Err(err)).await?;
-                return Ok(());
+                return Ok(false);
             }
         };
         if let Err(e) = tokio::fs::create_dir_all(&dest_fs).await {
             let rpc = map_io_to_rpc(&e, Some(&to_display_path(&dest_clean)));
             write_frame(send, &ResponseEnvelope::<()>::Err(rpc)).await?;
-            return Ok(());
+            return Ok(false);
         }
         // 回复握手成功
         write_frame(send, &ResponseEnvelope::ok(())).await?;
@@ -1046,11 +1076,13 @@ impl FsService {
             },
         }
 
-        let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<WriteJob>(512);
+        let (job_tx, job_rx) = tokio::sync::mpsc::channel::<WriteJob>(256);
         let shared_rx = Arc::new(Mutex::new(job_rx));
+        let abort = CancellationToken::new();
         let mut worker_handles = Vec::with_capacity(4);
         for _ in 0..4 {
             let rx_c = shared_rx.clone();
+            let abort_c = abort.clone();
             worker_handles.push(tokio::task::spawn_blocking(
                 move || -> Result<FsWriteBatchReply, RpcError> {
                     let mut written_files = 0u64;
@@ -1059,18 +1091,25 @@ impl FsService {
                     let mut local_dirs = std::collections::HashSet::<PathBuf>::new();
 
                     loop {
+                        if abort_c.is_cancelled() {
+                            break;
+                        }
                         let job = {
-                            let guard = rx_c.lock().unwrap_or_else(|e| e.into_inner());
-                            guard.recv()
+                            let mut guard = rx_c.lock().unwrap_or_else(|e| e.into_inner());
+                            guard.blocking_recv()
                         };
-                        let Ok(job) = job else {
+                        let Some(job) = job else {
                             break;
                         };
-                        match job {
+                        if abort_c.is_cancelled() {
+                            break;
+                        }
+                        let step_res: Result<(), RpcError> = match job {
                             WriteJob::Dir(dir_fs) => {
                                 if local_dirs.insert(dir_fs.clone()) {
-                                    fs::create_dir_all(&dir_fs)
-                                        .map_err(|e| map_io_to_rpc(&e, None))?;
+                                    fs::create_dir_all(&dir_fs).map_err(|e| map_io_to_rpc(&e, None))
+                                } else {
+                                    Ok(())
                                 }
                             }
                             WriteJob::File {
@@ -1080,7 +1119,7 @@ impl FsService {
                                 modified_ms,
                                 expected_hex,
                                 data,
-                            } => {
+                            } => (|| -> Result<(), RpcError> {
                                 if let Some(ref exp_hex) = expected_hex {
                                     let got_hex = blake3::hash(&data).to_hex().to_string();
                                     if &got_hex != exp_hex {
@@ -1090,13 +1129,14 @@ impl FsService {
                                         ));
                                     }
                                 }
+                                let disp = to_display_path(&target_clean);
                                 let initial_fs = to_fs_path(&target_clean);
                                 let final_fs = match conflict {
                                     ConflictPolicy::Overwrite => initial_fs,
                                     ConflictPolicy::Skip => {
                                         if initial_fs.exists() {
                                             skipped_files += 1;
-                                            continue;
+                                            return Ok(());
                                         }
                                         initial_fs
                                     }
@@ -1104,10 +1144,7 @@ impl FsService {
                                         if initial_fs.exists() {
                                             return Err(RpcError::new(
                                                 ErrorCode::AlreadyExists,
-                                                format!(
-                                                    "目标文件已存在：{}",
-                                                    to_display_path(&target_clean)
-                                                ),
+                                                format!("目标文件已存在：{disp}"),
                                             ));
                                         }
                                         initial_fs
@@ -1126,20 +1163,31 @@ impl FsService {
                                     fs::create_dir_all(parent)
                                         .map_err(|e| map_io_to_rpc(&e, None))?;
                                 }
-                                let mut f = File::create(&final_fs).map_err(|e| {
-                                    map_io_to_rpc(&e, Some(&to_display_path(&target_clean)))
-                                })?;
+                                if let Ok(meta) = fs::symlink_metadata(&final_fs)
+                                    && meta.file_type().is_symlink()
+                                {
+                                    return Err(RpcError::new(
+                                        ErrorCode::Forbidden,
+                                        format!("拒绝覆盖符号链接目标：{disp}"),
+                                    ));
+                                }
+                                let mut f = File::create(&final_fs)
+                                    .map_err(|e| map_io_to_rpc(&e, Some(&disp)))?;
                                 if !data.is_empty() {
-                                    std::io::Write::write_all(&mut f, &data).map_err(|e| {
-                                        map_io_to_rpc(&e, Some(&to_display_path(&target_clean)))
-                                    })?;
+                                    std::io::Write::write_all(&mut f, &data)
+                                        .map_err(|e| map_io_to_rpc(&e, Some(&disp)))?;
                                 }
                                 if let Some(ms) = modified_ms {
                                     let _ = f.set_modified(UNIX_EPOCH + Duration::from_millis(ms));
                                 }
                                 written_files += 1;
                                 written_bytes += data.len() as u64;
-                            }
+                                Ok(())
+                            })(),
+                        };
+                        if let Err(err) = step_res {
+                            abort_c.cancel();
+                            return Err(err);
                         }
                     }
                     Ok(FsWriteBatchReply {
@@ -1153,7 +1201,13 @@ impl FsService {
 
         let mut stream_err: Option<RpcError> = None;
         loop {
-            let item: BatchFileItem = read_frame(recv).await?;
+            if abort.is_cancelled() {
+                break;
+            }
+            let item: BatchFileItem = tokio::select! {
+                _ = abort.cancelled() => break,
+                r = read_frame::<_, BatchFileItem>(recv) => r?,
+            };
             if item.done {
                 break;
             }
@@ -1161,34 +1215,68 @@ impl FsService {
                 Ok(p) => p,
                 Err(rpc) => {
                     stream_err = Some(rpc);
+                    abort.cancel();
                     break;
                 }
             };
             let target_clean = dest_clean.join(&rel_clean);
-            if item.dir {
-                let dir_fs = to_fs_path(&target_clean);
-                if job_tx.send(WriteJob::Dir(dir_fs)).is_err() {
+            let target_disp = to_display_path(&target_clean);
+            let (auth_clean, auth_fs) = match resolve_authorized_path(&target_disp, perms) {
+                Ok(pair) => pair,
+                Err(rpc) => {
+                    stream_err = Some(rpc);
+                    abort.cancel();
                     break;
+                }
+            };
+            if item.dir {
+                tokio::select! {
+                    _ = abort.cancelled() => break,
+                    res = job_tx.send(WriteJob::Dir(auth_fs)) => {
+                        if res.is_err() {
+                            break;
+                        }
+                    }
                 }
                 continue;
             }
 
+            if item.size > MAX_BATCH_FILE_BYTES {
+                stream_err = Some(RpcError::new(
+                    ErrorCode::Invalid,
+                    format!(
+                        "批传单个文件过大（{} 字节，上限 {} 字节）：{}",
+                        item.size, MAX_BATCH_FILE_BYTES, item.rel_path
+                    ),
+                ));
+                abort.cancel();
+                break;
+            }
+
             let mut data = vec![0u8; item.size as usize];
             if item.size > 0 {
-                recv.read_exact(&mut data).await?;
+                tokio::select! {
+                    _ = abort.cancelled() => break,
+                    r = recv.read_exact(&mut data) => {
+                        r?;
+                    }
+                }
             }
-            if job_tx
-                .send(WriteJob::File {
-                    rel_path: item.rel_path,
-                    target_clean,
-                    conflict: args.conflict,
-                    modified_ms: item.modified_ms,
-                    expected_hex: item.blake3_hex,
-                    data,
-                })
-                .is_err()
-            {
-                break;
+            let job = WriteJob::File {
+                rel_path: item.rel_path,
+                target_clean: auth_clean,
+                conflict: args.conflict,
+                modified_ms: item.modified_ms,
+                expected_hex: item.blake3_hex,
+                data,
+            };
+            tokio::select! {
+                _ = abort.cancelled() => break,
+                res = job_tx.send(job) => {
+                    if res.is_err() {
+                        break;
+                    }
+                }
             }
         }
         drop(job_tx);
@@ -1224,19 +1312,25 @@ impl FsService {
             None => writer_res,
         };
         match final_res {
-            Ok(rep) => write_frame(send, &ResponseEnvelope::ok(rep)).await?,
-            Err(err) => write_frame(send, &ResponseEnvelope::<FsWriteBatchReply>::Err(err)).await?,
+            Ok(rep) => {
+                write_frame(send, &ResponseEnvelope::ok(rep)).await?;
+                Ok(true)
+            }
+            Err(err) => {
+                write_frame(send, &ResponseEnvelope::<FsWriteBatchReply>::Err(err)).await?;
+                Ok(false)
+            }
         }
-        Ok(())
     }
 
     /// 在单条流上连续读取一批小文件并发回（任务 2.4 下载端小文件优化）。
+    /// 支持并发预读与单文件超时，读取任一文件失败或超过大小上限立即中止报错（绝不静默跳过）。
     pub async fn handle_read_batch_stream<W>(
         &self,
         perms: &Permissions,
         args: FsReadBatchArgs,
         send: &mut W,
-    ) -> Result<(), crate::error::CoreError>
+    ) -> Result<bool, crate::error::CoreError>
     where
         W: AsyncWrite + Unpin + ?Sized,
     {
@@ -1246,34 +1340,126 @@ impl FsService {
                 &ResponseEnvelope::<()>::err(ErrorCode::Forbidden, "对方没有开放读取文件的权限"),
             )
             .await?;
-            return Ok(());
+            return Ok(false);
         }
         let mut resolved = Vec::with_capacity(args.sources.len());
         for s in &args.sources {
             match resolve_authorized_path(s, perms) {
-                Ok((_, fs_p)) => resolved.push((s.clone(), fs_p)),
+                Ok((clean, fs_p)) => resolved.push((s.clone(), to_display_path(&clean), fs_p)),
                 Err(rpc) => {
                     write_frame(send, &ResponseEnvelope::<()>::Err(rpc)).await?;
-                    return Ok(());
+                    return Ok(false);
                 }
             }
         }
+
+        // 握手前先核验所有请求项存在、为普通文件且未超出批传单文件上限
+        let check_list: Vec<(String, PathBuf)> = resolved
+            .iter()
+            .map(|(_, disp, fs_p)| (disp.clone(), fs_p.clone()))
+            .collect();
+        let precheck = tokio::task::spawn_blocking(move || -> Result<(), RpcError> {
+            for (disp, fs_p) in check_list {
+                let meta = fs::metadata(&fs_p).map_err(|e| map_io_to_rpc(&e, Some(&disp)))?;
+                if !meta.is_file() {
+                    return Err(RpcError::new(
+                        ErrorCode::Invalid,
+                        format!("批量读取遇到非普通文件：{disp}"),
+                    ));
+                }
+                if meta.len() > MAX_BATCH_FILE_BYTES {
+                    return Err(RpcError::new(
+                        ErrorCode::Invalid,
+                        format!(
+                            "文件超过小文件批传上限（{} 字节，上限 {} 字节）：{disp}",
+                            meta.len(),
+                            MAX_BATCH_FILE_BYTES
+                        ),
+                    ));
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| crate::error::CoreError::Internal(format!("批量读取校验异常：{e}")))?;
+        if let Err(rpc) = precheck {
+            write_frame(send, &ResponseEnvelope::<()>::Err(rpc)).await?;
+            return Ok(false);
+        }
+
         write_frame(send, &ResponseEnvelope::ok(())).await?;
 
-        for (src_str, fs_p) in resolved {
-            let read_res = tokio::task::spawn_blocking(move || -> std::io::Result<(Vec<u8>, Option<u64>)> {
-                let meta = fs::metadata(&fs_p)?;
-                let mtime = meta.modified().ok().and_then(system_time_to_ms);
-                let bytes = fs::read(&fs_p)?;
-                Ok((bytes, mtime))
-            })
-            .await
-            .map_err(|e| crate::error::CoreError::Internal(format!("批量读取线程异常：{e}")))?;
+        const READ_BATCH_CONCURRENCY: usize = 4;
+        const SINGLE_FILE_READ_TIMEOUT: Duration = Duration::from_secs(30);
+        let mut inflight = std::collections::VecDeque::with_capacity(READ_BATCH_CONCURRENCY);
+        let mut iter = resolved.into_iter();
 
-            let Ok((bytes, modified_ms)) = read_res else {
-                continue;
+        let spawn_reader = |src_str: String, disp: String, fs_p: PathBuf| {
+            tokio::task::spawn_blocking(
+                move || -> Result<(String, Vec<u8>, Option<u64>, String), RpcError> {
+                    let meta = fs::metadata(&fs_p).map_err(|e| map_io_to_rpc(&e, Some(&disp)))?;
+                    if !meta.is_file() {
+                        return Err(RpcError::new(
+                            ErrorCode::Invalid,
+                            format!("批量读取遇到非普通文件：{disp}"),
+                        ));
+                    }
+                    if meta.len() > MAX_BATCH_FILE_BYTES {
+                        return Err(RpcError::new(
+                            ErrorCode::Invalid,
+                            format!("文件大小已超过批传上限：{disp}"),
+                        ));
+                    }
+                    let mtime = meta.modified().ok().and_then(system_time_to_ms);
+                    let bytes = fs::read(&fs_p).map_err(|e| map_io_to_rpc(&e, Some(&disp)))?;
+                    if bytes.len() as u64 > MAX_BATCH_FILE_BYTES {
+                        return Err(RpcError::new(
+                            ErrorCode::Invalid,
+                            format!("文件大小已超过批传上限：{disp}"),
+                        ));
+                    }
+                    let hex = blake3::hash(&bytes).to_hex().to_string();
+                    Ok((src_str, bytes, mtime, hex))
+                },
+            )
+        };
+
+        for _ in 0..READ_BATCH_CONCURRENCY {
+            if let Some((src_str, disp, fs_p)) = iter.next() {
+                inflight.push_back(spawn_reader(src_str, disp, fs_p));
+            }
+        }
+
+        while let Some(handle) = inflight.pop_front() {
+            if let Some((src_str, disp, fs_p)) = iter.next() {
+                inflight.push_back(spawn_reader(src_str, disp, fs_p));
+            }
+            let joined = match tokio::time::timeout(SINGLE_FILE_READ_TIMEOUT, handle).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(e)) => {
+                    for h in inflight {
+                        h.abort();
+                    }
+                    return Err(crate::error::CoreError::Internal(format!(
+                        "批量读取线程异常：{e}"
+                    )));
+                }
+                Err(_) => {
+                    for h in inflight {
+                        h.abort();
+                    }
+                    return Err(crate::error::CoreError::Timeout);
+                }
             };
-            let blake3_hex = blake3::hash(&bytes).to_hex().to_string();
+            let (src_str, bytes, modified_ms, blake3_hex) = match joined {
+                Ok(item) => item,
+                Err(rpc) => {
+                    for h in inflight {
+                        h.abort();
+                    }
+                    return Err(crate::error::CoreError::Rpc(rpc));
+                }
+            };
             let hdr = BatchReadItemHeader {
                 done: false,
                 source_path: src_str,
@@ -1281,9 +1467,19 @@ impl FsService {
                 modified_ms,
                 blake3_hex,
             };
-            write_frame(send, &hdr).await?;
-            if !bytes.is_empty() {
-                send.write_all(&bytes).await?;
+            if let Err(e) = write_frame(send, &hdr).await {
+                for h in inflight {
+                    h.abort();
+                }
+                return Err(e.into());
+            }
+            if !bytes.is_empty()
+                && let Err(e) = send.write_all(&bytes).await
+            {
+                for h in inflight {
+                    h.abort();
+                }
+                return Err(e.into());
             }
         }
 
@@ -1296,7 +1492,7 @@ impl FsService {
         )
         .await?;
         send.flush().await?;
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -1350,6 +1546,9 @@ fn collect_walk_entries_sync(
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "root".to_string());
 
+    if is_symlink_or_junction(root_fs, &meta) {
+        return Ok(());
+    }
     if !meta.is_dir() {
         out.push(WalkEntry {
             rel_path: base_name,
@@ -1380,16 +1579,22 @@ fn collect_walk_entries_sync(
         let mut sub_dirs = Vec::new();
         for item_res in rd {
             let Ok(item) = item_res else { continue };
-            let Ok(m) = item.metadata() else { continue };
-            let ft = m.file_type();
+            let Ok(ft) = item.file_type() else { continue };
             if ft.is_symlink() {
+                continue;
+            }
+            let item_path = item.path();
+            let Ok(m) = fs::symlink_metadata(&item_path) else {
+                continue;
+            };
+            if is_symlink_or_junction(&item_path, &m) {
                 continue;
             }
             let name = item.file_name().to_string_lossy().into_owned();
             let child_clean = cur_clean.join(&name);
             let child_rel = format!(r"{cur_rel}\{name}");
-            if ft.is_dir() {
-                sub_dirs.push((child_clean, item.path(), child_rel));
+            if m.is_dir() {
+                sub_dirs.push((child_clean, item_path, child_rel));
             } else {
                 out.push(WalkEntry {
                     rel_path: child_rel,
@@ -1660,6 +1865,7 @@ fn run_copy_or_move_blocking(
             && let Some(t) = guard.get_mut(&task_id)
         {
             t.progress = snap.clone();
+            t.updated_at = Instant::now();
         }
         let _ = events_tx.send((peer_id.clone(), RemoteEvent::TaskProgress(snap)));
     };
@@ -1719,6 +1925,46 @@ fn run_copy_or_move_blocking(
             (initial_target_clean, initial_target_fs)
         };
 
+        // 拦截同路径覆盖（防止覆盖移动先删自身或覆盖复制截断为 0 字节）以及将目录复制/移动到自身子目录
+        if is_same_path(src_clean, src_fs, &target_clean, &target_fs) {
+            let err = RpcError::new(
+                ErrorCode::Invalid,
+                format!("源路径与目标路径相同，无法覆盖自身：{}", to_display_path(src_clean)),
+            );
+            emit(
+                FsTaskState::Failed,
+                processed_bytes,
+                total_bytes,
+                idx,
+                total_items,
+                None,
+                Some(err),
+            );
+            return;
+        }
+        let src_is_real_dir = fs::symlink_metadata(src_fs)
+            .map(|m| m.is_dir() && !is_symlink_or_junction(src_fs, &m))
+            .unwrap_or(false);
+        if src_is_real_dir && is_same_or_descendant(&target_clean, &target_fs, src_clean, src_fs) {
+            let err = RpcError::new(
+                ErrorCode::Invalid,
+                format!(
+                    "不能将文件夹“{}”复制或移动到自身或其子文件夹中",
+                    to_display_path(src_clean)
+                ),
+            );
+            emit(
+                FsTaskState::Failed,
+                processed_bytes,
+                total_bytes,
+                idx,
+                total_items,
+                None,
+                Some(err),
+            );
+            return;
+        }
+
         let cur_disp = Some(to_display_path(src_clean));
         emit(
             FsTaskState::Running,
@@ -1732,20 +1978,41 @@ fn run_copy_or_move_blocking(
 
         let step_res = match kind {
             FsTaskKind::Move => {
-                // 同盘符优先直接 rename；跨盘符失败则退化为递归复制再删除源
-                if target_fs.exists() && conflict == ConflictPolicy::Overwrite {
-                    let _ = if target_fs.is_dir() {
-                        fs::remove_dir_all(&target_fs)
-                    } else {
-                        fs::remove_file(&target_fs)
-                    };
-                }
-                match fs::rename(src_fs, &target_fs) {
+                // 同盘符优先直接 rename；不先盲删已有目标，避免跨盘符或失败时双丢数据
+                let mut backup_target: Option<PathBuf> = None;
+                let direct_rename = match fs::rename(src_fs, &target_fs) {
+                    Ok(()) => Ok(()),
+                    Err(first_err) if target_fs.exists() && conflict == ConflictPolicy::Overwrite => {
+                        // 将已有目标先移至同目录临时备份名，失败可恢复
+                        let bak_name = format!(
+                            ".pcshare.movebak.{}.tmp",
+                            fastrand::u64(..)
+                        );
+                        let bak_clean = target_clean
+                            .parent()
+                            .unwrap_or_else(|| Path::new(""))
+                            .join(&bak_name);
+                        let bak_fs = to_fs_path(&bak_clean);
+                        if fs::rename(&target_fs, &bak_fs).is_ok() {
+                            backup_target = Some(bak_fs);
+                            fs::rename(src_fs, &target_fs)
+                        } else {
+                            Err(first_err)
+                        }
+                    }
+                    Err(err) => Err(err),
+                };
+
+                match direct_rename {
                     Ok(()) => {
+                        if let Some(bak) = backup_target {
+                            let _ = remove_path_permanent(&bak);
+                        }
                         processed_bytes = processed_bytes.saturating_add(estimate_size(&target_fs));
                         Ok(())
                     }
                     Err(_) => {
+                        // 跨盘符移动：退化为递归复制，成功后再删除源和旧备份；失败时还原备份
                         let res = copy_recursive(
                             src_fs,
                             &target_clean,
@@ -1764,11 +2031,13 @@ fn run_copy_or_move_blocking(
                             },
                         );
                         if res.is_ok() {
-                            if src_fs.is_dir() {
-                                let _ = fs::remove_dir_all(src_fs);
-                            } else {
-                                let _ = fs::remove_file(src_fs);
+                            if let Some(bak) = backup_target {
+                                let _ = remove_path_permanent(&bak);
                             }
+                            let _ = remove_path_permanent(src_fs);
+                        } else if let Some(bak) = backup_target {
+                            let _ = remove_path_permanent(&target_fs);
+                            let _ = fs::rename(&bak, &target_fs);
                         }
                         res
                     }
@@ -1831,10 +2100,13 @@ fn estimate_size(fs_path: &Path) -> u64 {
     let Ok(meta) = fs::symlink_metadata(fs_path) else {
         return 0;
     };
+    if is_symlink_or_junction(fs_path, &meta) {
+        return 0;
+    }
     if meta.is_file() {
         return meta.len();
     }
-    if meta.is_dir() && !meta.file_type().is_symlink() {
+    if meta.is_dir() {
         let mut sum = 0u64;
         if let Ok(rd) = fs::read_dir(fs_path) {
             for e in rd.flatten() {
@@ -1858,9 +2130,13 @@ fn copy_recursive(
     }
     let disp = to_display_path(dst_clean);
     let meta = fs::symlink_metadata(src_fs).map_err(|e| map_io_to_rpc(&e, Some(&disp)))?;
+    // 显式跳过符号链接与 Windows 联接点，防止越出开放目录复制或遇目录软链报错
+    if is_symlink_or_junction(src_fs, &meta) {
+        return Ok(());
+    }
     let dst_fs = to_fs_path(dst_clean);
 
-    if meta.is_dir() && !meta.file_type().is_symlink() {
+    if meta.is_dir() {
         fs::create_dir_all(&dst_fs).map_err(|e| map_io_to_rpc(&e, Some(&disp)))?;
         for entry_res in fs::read_dir(src_fs).map_err(|e| map_io_to_rpc(&e, Some(&disp)))? {
             let entry = entry_res.map_err(|e| map_io_to_rpc(&e, Some(&disp)))?;
@@ -1905,5 +2181,106 @@ fn copy_recursive(
             let _ = writer.set_modified(mtime);
         }
         Ok(())
+    }
+}
+
+/// 判断目标是否为符号链接或 Windows 联接点（排除 OneDrive 等云占位重解析点）。
+fn is_symlink_or_junction(path: &Path, meta: &fs::Metadata) -> bool {
+    meta.file_type().is_symlink() || (is_windows_reparse_point(meta) && fs::read_link(path).is_ok())
+}
+
+fn is_windows_reparse_point(meta: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = meta;
+        false
+    }
+}
+
+fn remove_path_permanent(fs_p: &Path) -> std::io::Result<()> {
+    let meta = fs::symlink_metadata(fs_p)?;
+    if is_symlink_or_junction(fs_p, &meta) {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+            if (meta.file_attributes() & FILE_ATTRIBUTE_DIRECTORY) != 0 {
+                return fs::remove_dir(fs_p);
+            }
+        }
+        return fs::remove_file(fs_p);
+    }
+    if meta.is_dir() {
+        fs::remove_dir_all(fs_p)
+    } else {
+        fs::remove_file(fs_p)
+    }
+}
+
+fn is_same_path(a_clean: &Path, a_fs: &Path, b_clean: &Path, b_fs: &Path) -> bool {
+    if paths_equal(a_clean, b_clean) {
+        return true;
+    }
+    if let (Ok(ca), Ok(cb)) = (fs::canonicalize(a_fs), fs::canonicalize(b_fs)) {
+        let ca_clean = PathBuf::from(to_display_path(&ca));
+        let cb_clean = PathBuf::from(to_display_path(&cb));
+        return paths_equal(&ca_clean, &cb_clean);
+    }
+    false
+}
+
+fn is_same_or_descendant(
+    cand_clean: &Path,
+    cand_fs: &Path,
+    root_clean: &Path,
+    root_fs: &Path,
+) -> bool {
+    if is_subpath_of(cand_clean, root_clean) {
+        return true;
+    }
+    if let (Ok(cc), Ok(rc)) = (fs::canonicalize(cand_fs), fs::canonicalize(root_fs)) {
+        let cc_clean = PathBuf::from(to_display_path(&cc));
+        let rc_clean = PathBuf::from(to_display_path(&rc));
+        return is_subpath_of(&cc_clean, &rc_clean);
+    }
+    false
+}
+
+fn is_explicit_cancel_error(io_err: &std::io::Error) -> bool {
+    if let Some(read_err) = io_err
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<iroh::endpoint::ReadError>())
+    {
+        return matches!(
+            read_err,
+            iroh::endpoint::ReadError::Reset(code)
+                if code.into_inner() == u64::from(STREAM_STOP_CODE_CANCEL)
+        );
+    }
+    false
+}
+
+fn prune_finished_tasks(tasks: &mut HashMap<String, ManagedTask>) {
+    tasks.retain(|_, t| {
+        t.progress.state == FsTaskState::Running || t.updated_at.elapsed() < FINISHED_TASK_TTL
+    });
+    while tasks.len() >= MAX_TRACKED_TASKS {
+        let oldest_finished = tasks
+            .iter()
+            .filter(|(_, t)| t.progress.state != FsTaskState::Running)
+            .min_by_key(|(_, t)| t.updated_at)
+            .map(|(k, _)| k.clone());
+        match oldest_finished {
+            Some(k) => {
+                tasks.remove(&k);
+            }
+            None => break,
+        }
     }
 }

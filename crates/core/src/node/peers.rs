@@ -37,6 +37,9 @@ impl CoreNode {
         let updated = self.storage.update_settings(f)?;
         self.lan_discovery
             .update_device_name(updated.device_name.clone());
+        self.clipboard_auto_sync_enabled
+            .store(updated.clipboard_auto_sync, Ordering::SeqCst);
+        self.clipboard_auto_sync_notify.notify_one();
         Ok(updated)
     }
 
@@ -80,13 +83,13 @@ impl CoreNode {
     }
 
     pub fn remove_peer(&self, peer_id: &str) -> Result<bool, CoreError> {
-        if let Some(cancel) = self
+        if let Some(entry) = self
             .peer_workers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(peer_id)
         {
-            cancel.cancel();
+            entry.cancel.cancel();
         }
         if let Some(conn) = self
             .active_conns
@@ -96,6 +99,31 @@ impl CoreNode {
         {
             conn.close(CLOSE_UNAUTHORIZED.into(), b"removed");
         }
+        // 强制断开该对端所有已建立的入站连接，立即终止终端、事件流、实时桌面与目录监听
+        if let Some(in_list) = self
+            .incoming_conns
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(peer_id)
+        {
+            for conn in in_list {
+                conn.close(CLOSE_UNAUTHORIZED.into(), b"removed");
+            }
+        }
+        self.fs_watch.unwatch_all_for_peer(peer_id);
+        self.edit_sync.remove_peer_sessions(peer_id);
+        self.dial_locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(peer_id);
+        self.apps_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(peer_id);
+        self.direct_grants
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, g| g.allowed_peer_id != peer_id);
         self.peer_states
             .write()
             .unwrap_or_else(|e| e.into_inner())
@@ -113,20 +141,32 @@ impl CoreNode {
 
     pub async fn shutdown(&self) {
         let _ = self.dir_cache.flush();
+        let _ = self.storage.flush_peers();
         self.edit_sync.shutdown();
         let _ = self.trigger_power_cancel();
         self.fs_watch.shutdown();
         self.lan_discovery.stop();
         self.shutdown_token.cancel();
-        let workers: Vec<CancellationToken> = self
-            .peer_workers
+        self.clipboard_auto_sync_notify.notify_waiters();
+        let direct_cancels: Vec<CancellationToken> = self
+            .active_direct_transfers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .drain()
             .map(|(_, c)| c)
             .collect();
+        for c in direct_cancels {
+            c.cancel();
+        }
+        let workers: Vec<PeerWorkerEntry> = self
+            .peer_workers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+            .map(|(_, e)| e)
+            .collect();
         for w in workers {
-            w.cancel();
+            w.cancel.cancel();
         }
         let conns: Vec<Connection> = self
             .active_conns
@@ -136,6 +176,16 @@ impl CoreNode {
             .map(|(_, c)| c)
             .collect();
         for c in conns {
+            c.close(CLOSE_OK.into(), b"shutdown");
+        }
+        let in_conns: Vec<Connection> = self
+            .incoming_conns
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+            .flat_map(|(_, v)| v)
+            .collect();
+        for c in in_conns {
             c.close(CLOSE_OK.into(), b"shutdown");
         }
         self.endpoint.close().await;

@@ -33,11 +33,14 @@ impl RpcStream<'_> {
         Ok(())
     }
     async fn on_fs_list(&mut self, args: FsListArgs) -> Result<(), CoreError> {
-        self.audit("fs.list", &args.path, true);
-        self.node
+        let detail = args.path.clone();
+        let res = self
+            .node
             .fs_service
             .list_to_stream(&self.record.permissions, args, self.send)
-            .await?;
+            .await;
+        self.audit("fs.list", &detail, matches!(res, Ok(true)));
+        res?;
         Ok(())
     }
     async fn on_fs_stat(&mut self, args: FsStatArgs) -> Result<(), CoreError> {
@@ -112,7 +115,27 @@ impl RpcStream<'_> {
         Ok(())
     }
     async fn on_fs_task_cancel(&mut self, args: FsTaskIdArgs) -> Result<(), CoreError> {
-        let res = self.node.fs_service.task_cancel(&args.task_id);
+        let res = match self.node.fs_service.task_cancel(&args.task_id) {
+            Ok(prog) => Ok(prog),
+            Err(err) if err.code == ErrorCode::NotFound => {
+                if self.node.cancel_direct_transfer(&args.task_id) {
+                    Ok(FsTaskProgress {
+                        task_id: args.task_id,
+                        kind: FsTaskKind::Copy,
+                        state: FsTaskState::Cancelled,
+                        processed_bytes: 0,
+                        total_bytes: 0,
+                        processed_items: 0,
+                        total_items: 0,
+                        current_item: None,
+                        error: None,
+                    })
+                } else {
+                    Err(err)
+                }
+            }
+            Err(err) => Err(err),
+        };
         write_rpc_result(self.send, res).await?;
         Ok(())
     }

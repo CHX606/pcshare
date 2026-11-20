@@ -380,4 +380,251 @@ mod win_tests {
             let _ = platform.set_clipboard_text(&s);
         }
     }
+
+    #[test]
+    fn dpapi_empty_secret_roundtrip_is_safe() {
+        let platform = NativePlatform::new();
+        let encrypted = platform
+            .protect_secret(&[])
+            .expect("DPAPI protect empty slice must not UB");
+        let decrypted = platform
+            .unprotect_secret(&encrypted)
+            .expect("DPAPI unprotect empty plaintext must succeed without UB");
+        assert!(decrypted.is_empty());
+
+        let err = platform.unprotect_secret(&[]).unwrap_err();
+        assert!(matches!(err, PlatformError::System(_)));
+    }
+
+    #[test]
+    fn clipboard_rejects_oversized_png_before_opening_clipboard() {
+        fn crc32(bytes: &[u8]) -> u32 {
+            let mut crc = 0xFFFF_FFFFu32;
+            for &b in bytes {
+                crc ^= b as u32;
+                for _ in 0..8 {
+                    let mask = (crc & 1).wrapping_neg();
+                    crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+                }
+            }
+            !crc
+        }
+        fn push_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            out.extend_from_slice(kind);
+            out.extend_from_slice(data);
+            let mut crc_buf = Vec::with_capacity(4 + data.len());
+            crc_buf.extend_from_slice(kind);
+            crc_buf.extend_from_slice(data);
+            out.extend_from_slice(&crc32(&crc_buf).to_be_bytes());
+        }
+
+        // 构造合法 PNG 头但声明 9000x9000 尺寸，验证在分配像素缓冲及打开剪贴板前即被拒绝
+        let mut oversized_png = Vec::new();
+        oversized_png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+        let mut ihdr = Vec::with_capacity(13);
+        ihdr.extend_from_slice(&9000u32.to_be_bytes());
+        ihdr.extend_from_slice(&9000u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit RGBA
+        push_chunk(&mut oversized_png, b"IHDR", &ihdr);
+        push_chunk(&mut oversized_png, b"IDAT", &[]);
+        push_chunk(&mut oversized_png, b"IEND", &[]);
+
+        let platform = NativePlatform::new();
+        let err = platform.set_clipboard_png(&oversized_png).unwrap_err();
+        assert!(
+            matches!(err, PlatformError::InvalidInput(_)),
+            "oversized PNG must fail with InvalidInput, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn kill_process_distinguishes_not_found_and_permission_denied() {
+        let platform = NativePlatform::new();
+        // Spawn a short-lived process and wait for exit:
+        // 1) while `child` still holds its handle (zombie process), kill_process must return NotFound
+        let mut child = Command::new("cmd.exe")
+            .args(["/C", "exit", "0"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn short cmd");
+        let exited_pid = child.id();
+        let _ = child.wait();
+
+        let zombie_res = platform.kill_process(exited_pid);
+        assert!(
+            matches!(zombie_res, Err(PlatformError::NotFound(_))),
+            "expected NotFound for exited zombie PID {exited_pid}, got {zombie_res:?}"
+        );
+
+        // 2) after dropping the handle completely, kill_process must also return NotFound
+        drop(child);
+        let gone_res = platform.kill_process(exited_pid);
+        assert!(
+            matches!(gone_res, Err(PlatformError::NotFound(_))),
+            "expected NotFound for fully reaped PID {exited_pid}, got {gone_res:?}"
+        );
+
+        assert!(matches!(
+            platform.kill_process(0),
+            Err(PlatformError::PermissionDenied(_))
+        ));
+    }
+
+    #[test]
+    fn hotkey_preserves_existing_registration_on_invalid_or_conflicting_spec() {
+        use std::sync::Arc;
+
+        let p1 = NativePlatform::new();
+        let p2 = NativePlatform::new();
+
+        p1.set_global_hotkey(Some("Ctrl+Alt+Shift+F10"), Arc::new(|| {}))
+            .expect("register initial hotkey");
+
+        // 语法错误（多主键）必须报错且保留旧热键
+        let bad = p1.set_global_hotkey(Some("Ctrl+A+B"), Arc::new(|| {}));
+        assert!(matches!(bad, Err(PlatformError::InvalidInput(_))));
+        let conflict_check = p2.set_global_hotkey(Some("Ctrl+Alt+Shift+F10"), Arc::new(|| {}));
+        assert!(
+            matches!(conflict_check, Err(PlatformError::Busy(_))),
+            "old hotkey must remain registered after invalid update"
+        );
+
+        // 切换到被占用热键失败时也必须保留原热键
+        p2.set_global_hotkey(Some("Ctrl+Alt+Shift+F9"), Arc::new(|| {}))
+            .expect("register second hotkey on p2");
+        let conflict_switch = p1.set_global_hotkey(Some("Ctrl+Alt+Shift+F9"), Arc::new(|| {}));
+        assert!(matches!(conflict_switch, Err(PlatformError::Busy(_))));
+
+        // 原地更新同一热键的回调必须成功
+        p1.set_global_hotkey(Some("Ctrl+Alt+Shift+F10"), Arc::new(|| {}))
+            .expect("in-place callback update on same hotkey should succeed");
+
+        p1.set_global_hotkey(None, Arc::new(|| {})).unwrap();
+        p2.set_global_hotkey(None, Arc::new(|| {})).unwrap();
+    }
+
+    #[tokio::test]
+    async fn conpty_uses_bounded_receiver_and_job_object_reclaims_child_tree() {
+        use std::collections::HashSet;
+
+        let platform = NativePlatform::new();
+        let before_waitfors: HashSet<u32> = platform
+            .list_processes()
+            .expect("list processes before conpty")
+            .into_iter()
+            .filter(|p| p.name.eq_ignore_ascii_case("waitfor.exe"))
+            .map(|p| p.pid)
+            .collect();
+
+        let (session, rx) = platform
+            .open_pty_session(false, 100, 30, None)
+            .expect("open cmd.exe ConPTY session");
+        // 静态约束输出通道已升级为有界 Receiver（不再是 UnboundedReceiver）
+        let mut rx: tokio::sync::mpsc::Receiver<Vec<u8>> = rx;
+
+        // 直接用纯 cmd.exe 启动长驻子进程 waitfor.exe（注意 waitfor 信号名仅允许字母数字，不可含下划线）
+        let cmd = format!("waitfor /T 60 PCSHAREJOB{}\r\n", std::process::id());
+        session
+            .write_input(cmd.as_bytes())
+            .expect("write waitfor command");
+
+        let mut child_pid: Option<u32> = None;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        while tokio::time::Instant::now() < deadline {
+            while rx.try_recv().is_ok() {}
+            let procs = platform.list_processes().expect("list processes");
+            if let Some(found) = procs.iter().find(|p| {
+                p.name.eq_ignore_ascii_case("waitfor.exe") && !before_waitfors.contains(&p.pid)
+            }) {
+                child_pid = Some(found.pid);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        let child_pid = child_pid.unwrap_or_else(|| {
+            session.close();
+            panic!("did not observe spawned waitfor.exe child process inside ConPTY");
+        });
+
+        assert_eq!(session.try_wait().expect("try_wait running conpty"), None);
+
+        // 关闭会话必须立即释放，且随后再写入应返回 Busy
+        session.close();
+        assert!(matches!(
+            session.write_input(b"echo after_close\r\n"),
+            Err(PlatformError::Busy(_))
+        ));
+
+        // 校验 Job Object（KILL_ON_JOB_CLOSE）已连同子进程一起回收
+        let mut reclaimed = false;
+        for _ in 0..20 {
+            let procs = platform.list_processes().expect("list processes");
+            if !procs.iter().any(|p| p.pid == child_pid) {
+                reclaimed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        if !reclaimed {
+            let _ = platform.kill_process(child_pid);
+        }
+        assert!(
+            reclaimed,
+            "ConPTY Job Object should terminate child waitfor.exe PID {child_pid} upon session.close()"
+        );
+    }
+
+    #[tokio::test]
+    async fn monitors_indexing_trash_and_drag_out_validation() {
+        let platform = NativePlatform::new();
+
+        // 显示器排序后索引与展示名称编号必须一致，且主显示器排在 0 号位
+        let monitors = platform.list_monitors().expect("list monitors");
+        for (idx, m) in monitors.iter().enumerate() {
+            assert_eq!(m.index, idx as u32);
+            assert!(
+                m.name.contains(&format!("#{}", idx + 1)),
+                "monitor name '{}' should match index #{}",
+                m.name,
+                idx + 1
+            );
+            assert!(m.dpi_scale_percent >= 100);
+        }
+        if monitors.iter().any(|m| m.is_primary) {
+            assert!(monitors[0].is_primary);
+        }
+
+        // 回收站空列表返回成功，不存在路径返回 NotFound
+        platform.move_to_trash(&[]).expect("empty trash list ok");
+        let missing = std::env::temp_dir().join(format!(
+            "pcshare_missing_file_{}.tmp",
+            std::process::id()
+        ));
+        assert!(matches!(
+            platform.move_to_trash(std::slice::from_ref(&missing)),
+            Err(PlatformError::NotFound(_))
+        ));
+
+        // 拖出接口校验空列表与缺失路径
+        assert!(matches!(
+            platform.start_file_drag_out(&[]).await,
+            Err(PlatformError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            platform.start_file_drag_out(&[missing]).await,
+            Err(PlatformError::NotFound(_))
+        ));
+
+        // 不存在的 app_id 图标提取返回 Ok(None) 且不会出错
+        assert_eq!(
+            platform
+                .app_icon("pcshare_nonexistent_app_id_xyz")
+                .await
+                .expect("missing app icon should return Ok(None)"),
+            None
+        );
+    }
 }

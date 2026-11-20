@@ -80,15 +80,26 @@ impl CoreNode {
     pub(super) fn spawn_clipboard_autosync_loop(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
         let shutdown = self.shutdown_token.clone();
+        let notify = self.clipboard_auto_sync_notify.clone();
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_millis(900));
-            ticker.tick().await;
             loop {
+                let Some(node) = weak.upgrade() else { break };
+                // 关闭自动同步时彻底挂起等待通知，零轮询唤醒且不再深拷贝 Settings
+                if !node.clipboard_auto_sync_enabled.load(Ordering::SeqCst) {
+                    drop(node);
+                    tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        _ = notify.notified() => continue,
+                    }
+                }
+                drop(node);
+
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
-                    _ = ticker.tick() => {
+                    _ = notify.notified() => continue,
+                    _ = tokio::time::sleep(Duration::from_millis(900)) => {
                         let Some(node) = weak.upgrade() else { break; };
-                        if !node.storage.settings().clipboard_auto_sync {
+                        if !node.clipboard_auto_sync_enabled.load(Ordering::SeqCst) {
                             continue;
                         }
                         let seq = node.platform.clipboard_sequence();
@@ -100,11 +111,12 @@ impl CoreNode {
                             continue;
                         }
                         let online_ids: Vec<String> = node
-                            .storage
-                            .list_peers()
-                            .into_iter()
-                            .filter(|p| node.has_active_conn(&p.endpoint_id))
-                            .map(|p| p.endpoint_id)
+                            .active_conns
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .iter()
+                            .filter(|(_, c)| c.close_reason().is_none())
+                            .map(|(id, _)| id.clone())
                             .collect();
                         for pid in online_ids {
                             let _ = node.push_local_clipboard_to_peer(&pid).await;
@@ -193,6 +205,33 @@ impl CoreNode {
         .map_err(|e| CoreError::Internal(format!("导出诊断包任务异常：{e}")))?
     }
 
+    pub(super) fn register_incoming_conn(&self, peer_id: &str, conn: Connection) {
+        let mut guard = self
+            .incoming_conns
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let list = guard.entry(peer_id.to_string()).or_default();
+        list.retain(|c| c.close_reason().is_none());
+        list.push(conn);
+    }
+
+    pub(super) fn unregister_incoming_conn(&self, peer_id: &str, stable_id: usize) -> bool {
+        let mut guard = self
+            .incoming_conns
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(list) = guard.get_mut(peer_id) else {
+            return false;
+        };
+        list.retain(|c| c.stable_id() != stable_id && c.close_reason().is_none());
+        if list.is_empty() {
+            guard.remove(peer_id);
+            false
+        } else {
+            true
+        }
+    }
+
     pub(crate) fn insert_direct_grant(&self, token: String, rec: DirectGrantRecord) {
         let mut guard = self.direct_grants.lock().unwrap_or_else(|e| e.into_inner());
         guard.retain(|_, v| Instant::now() < v.expires_at);
@@ -203,18 +242,69 @@ impl CoreNode {
         &self.direct_grants
     }
 
+    pub(crate) fn register_direct_transfer(&self, transfer_id: String, cancel: CancellationToken) {
+        self.active_direct_transfers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(transfer_id, cancel);
+    }
+
+    pub(crate) fn unregister_direct_transfer(&self, transfer_id: &str) {
+        self.active_direct_transfers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(transfer_id);
+    }
+
+    pub(crate) fn cancel_direct_transfer(&self, transfer_id: &str) -> bool {
+        if let Some(cancel) = self
+            .active_direct_transfers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(transfer_id)
+        {
+            cancel.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
     pub(crate) fn emit_remote_event(&self, peer_id: &str, event: RemoteEvent) {
         let _ = self.remote_events_tx.send((peer_id.to_string(), event));
     }
 
-    pub(crate) fn ensure_peer_worker_public(self: &Arc<Self>, peer_id: &str, conn: Connection) {
-        let mut guard = self.peer_workers.lock().unwrap_or_else(|e| e.into_inner());
-        if !guard.contains_key(peer_id) {
+    /// 确保目标源设备的 `sub.events` 订阅已就绪（无 50ms 盲等），并在连接断开时自动清理占位条目。
+    pub(crate) async fn ensure_peer_event_subscription(
+        self: &Arc<Self>,
+        peer_id: &str,
+        conn: Connection,
+    ) {
+        let (worker_id, tok) = {
+            let mut guard = self.peer_workers.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.contains_key(peer_id) {
+                return;
+            }
+            let wid = self.next_worker_id.fetch_add(1, Ordering::Relaxed);
             let tok = CancellationToken::new();
-            guard.insert(peer_id.to_string(), tok.clone());
-            drop(guard);
-            self.spawn_event_subscriber(peer_id.to_string(), conn, tok);
-        }
+            guard.insert(
+                peer_id.to_string(),
+                PeerWorkerEntry {
+                    id: wid,
+                    cancel: tok.clone(),
+                },
+            );
+            (wid, tok)
+        };
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        self.spawn_event_subscriber_inner(
+            peer_id.to_string(),
+            conn,
+            tok,
+            Some(ready_tx),
+            Some(worker_id),
+        );
+        let _ = timeout(Duration::from_secs(5), ready_rx).await;
     }
 
     pub(crate) fn invalidate_active_conn(&self, peer_id: &str) {
@@ -228,6 +318,7 @@ impl CoreNode {
         }
     }
 
+    #[doc(hidden)]
     pub fn force_drop_active_conn_for_test(&self, peer_id: &str) {
         if let Some(conn) = self
             .active_conns

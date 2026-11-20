@@ -1,81 +1,138 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { backend } from '../../api'
 import { humanError } from '../../api/errors'
-import type { DeviceId, FsSearchHit } from '../../api/types'
+import type { DeviceId, FsSearchBatchEvent, FsSearchHit } from '../../api/types'
 import { Icon } from '../../components/Icon'
 import { Button } from '../../components/Modal'
 import { formatSize } from '../../lib/format'
 import { parentPath } from '../../lib/path'
-import { useFiles } from '../../store/files'
+import { useFiles, type PaneSide } from '../../store/files'
 import { toast } from '../../store/toasts'
 
 interface Props {
   device: DeviceId
+  side: PaneSide
   rootPath: string
   onClose: () => void
 }
 
 /** 任务 3.9：文件搜索栏（被控端遍历、边搜边回结果、支持随时取消）。 */
-export function FileSearchPanel({ device, rootPath, onClose }: Props) {
+export function FileSearchPanel({ device, side, rootPath, onClose }: Props) {
   const [query, setQuery] = useState('')
   const [searchId, setSearchId] = useState<string | null>(null)
   const [running, setRunning] = useState(false)
   const [scannedDirs, setScannedDirs] = useState(0)
   const [hits, setHits] = useState<FsSearchHit[]>([])
 
+  const activeSearchIdRef = useRef<string | null>(null)
+  const awaitingStartRef = useRef(false)
+  const requestSeqRef = useRef(0)
+  const cancelledSeqRef = useRef(0)
+  const unmountedRef = useRef(false)
+  const pendingBatchesRef = useRef<Map<string, FsSearchBatchEvent[]>>(new Map())
+
+  const applyBatch = useCallback((ev: FsSearchBatchEvent) => {
+    setScannedDirs(ev.scannedDirs)
+    if (ev.entries.length > 0) {
+      setHits((prev) => [...prev, ...ev.entries])
+    }
+    if (ev.done) {
+      setRunning(false)
+    }
+  }, [])
+
+  // 挂载即订阅 fs-search-batch，缓冲早于 searchId 返回的批次，避免小目录漏批卡死
   useEffect(() => {
-    if (!searchId) return
-    return backend.on('fs-search-batch', (ev) => {
-      if (ev.searchId !== searchId) return
-      setScannedDirs(ev.scannedDirs)
-      if (ev.entries.length > 0) {
-        setHits((prev) => [...prev, ...ev.entries])
+    unmountedRef.current = false
+    const pendingMap = pendingBatchesRef.current
+    const off = backend.on('fs-search-batch', (ev) => {
+      if (ev.device !== device) return
+      const curId = activeSearchIdRef.current
+      if (curId && ev.searchId === curId) {
+        applyBatch(ev)
+        return
       }
-      if (ev.done) {
-        setRunning(false)
+      if (awaitingStartRef.current) {
+        let queue = pendingMap.get(ev.searchId)
+        if (!queue) {
+          queue = []
+          pendingMap.set(ev.searchId, queue)
+        }
+        queue.push(ev)
       }
     })
-  }, [searchId])
-
-  useEffect(() => {
     return () => {
-      if (searchId) void backend.fsSearchCancel(searchId).catch(() => {})
+      unmountedRef.current = true
+      cancelledSeqRef.current = requestSeqRef.current
+      off()
+      pendingMap.clear()
+      const sid = activeSearchIdRef.current
+      activeSearchIdRef.current = null
+      if (sid) void backend.fsSearchCancel(sid).catch(() => {})
     }
-  }, [searchId])
+  }, [device, applyBatch])
 
   const startSearch = async (e: React.FormEvent) => {
     e.preventDefault()
     const q = query.trim()
     if (!q) return
-    if (searchId && running) {
-      await backend.fsSearchCancel(searchId).catch(() => {})
+    const prevSid = activeSearchIdRef.current
+    if (prevSid) {
+      activeSearchIdRef.current = null
+      await backend.fsSearchCancel(prevSid).catch(() => {})
     }
+    const seq = ++requestSeqRef.current
+    awaitingStartRef.current = true
+    pendingBatchesRef.current.clear()
+    setSearchId(null)
     setHits([])
     setScannedDirs(0)
     setRunning(true)
     try {
       const sid = await backend.fsSearchStart(device, rootPath, q)
+      if (unmountedRef.current || seq !== requestSeqRef.current || cancelledSeqRef.current >= seq) {
+        pendingBatchesRef.current.delete(sid)
+        void backend.fsSearchCancel(sid).catch(() => {})
+        return
+      }
+      awaitingStartRef.current = false
+      activeSearchIdRef.current = sid
       setSearchId(sid)
+      const buffered = pendingBatchesRef.current.get(sid)
+      pendingBatchesRef.current.clear()
+      if (buffered) {
+        for (const ev of buffered) applyBatch(ev)
+      }
     } catch (err) {
-      setRunning(false)
-      toast.error(humanError(err))
+      if (seq === requestSeqRef.current) {
+        awaitingStartRef.current = false
+        pendingBatchesRef.current.clear()
+        setRunning(false)
+        toast.error(humanError(err))
+      }
     }
   }
 
   const cancelSearch = async () => {
-    if (!searchId) return
-    await backend.fsSearchCancel(searchId).catch(() => {})
+    cancelledSeqRef.current = requestSeqRef.current
+    awaitingStartRef.current = false
+    pendingBatchesRef.current.clear()
     setRunning(false)
+    const sid = activeSearchIdRef.current
+    if (sid) {
+      activeSearchIdRef.current = null
+      await backend.fsSearchCancel(sid).catch(() => {})
+    }
   }
 
   const jumpToHit = (hit: FsSearchHit) => {
     if (hit.dir) {
-      useFiles.getState().open(device, hit.path)
+      useFiles.getState().open(device, hit.path, 'push', side)
       onClose()
     } else {
       const dir = parentPath(hit.path)
-      useFiles.getState().open(device, dir)
-      useFiles.getState().select(device, new Set([hit.name]), hit.name, hit.name)
+      useFiles.getState().open(device, dir, 'push', side)
+      useFiles.getState().select(device, new Set([hit.name]), hit.name, hit.name, side)
       onClose()
     }
   }

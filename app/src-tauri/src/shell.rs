@@ -34,13 +34,14 @@ pub(super) fn parse_launch_args() -> LaunchArgs {
     }
 }
 
-/// 打开或聚焦主窗口（后台常驻无窗口时会按需创建 WebView，关窗时销毁 WebView 以确保常驻内存 < 50 MB）。
-pub(super) fn create_or_focus_main_window(app: &AppHandle) {
+/// 必须在主线程调用：打开或聚焦主窗口（关窗销毁 WebView2 以确保后台常驻内存 < 50 MB）。
+/// 返回 `true` 表示主窗口原本不存在、本次为冷启新建；返回 `false` 表示主窗口原本已存在（仅恢复聚焦）或建窗失败。
+pub(super) fn ensure_main_window_on_main_thread(app: &AppHandle) -> bool {
     if let Some(win) = app.get_webview_window("main") {
         let _ = win.unminimize();
         let _ = win.show();
         let _ = win.set_focus();
-        return;
+        return false;
     }
     let builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
         .title("电脑共享")
@@ -52,7 +53,48 @@ pub(super) fn create_or_focus_main_window(app: &AppHandle) {
         Ok(extra) if !extra.trim().is_empty() => builder.additional_browser_args(&extra),
         _ => builder,
     };
-    let _ = builder.build();
+    match builder.build() {
+        Ok(win) => {
+            let app_for_destroy = app.clone();
+            win.on_window_event(move |event| {
+                if let tauri::WindowEvent::Destroyed = event
+                    && let Some(bridge) = app_for_destroy.try_state::<ManagedBridge>()
+                {
+                    let b = bridge.inner().clone();
+                    tauri::async_runtime::spawn(async move {
+                        b.on_main_window_destroyed().await;
+                    });
+                }
+            });
+            true
+        }
+        Err(err) => {
+            if let Some(bridge) = app.try_state::<ManagedBridge>() {
+                bridge
+                    .node()
+                    .log_event("ERROR", &format!("创建主窗口失败：{err}"));
+            }
+            false
+        }
+    }
+}
+
+/// 跨线程安全入口：统一通过 `run_on_main_thread` 串行建窗/聚焦，避免非主线程阻塞或并发建窗竞态。
+pub(super) fn create_or_focus_main_window(app: &AppHandle) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let _ = ensure_main_window_on_main_thread(&handle);
+    });
+}
+
+/// 全局热键专用入口：在主线程串行判断主窗口是否已存在，再联动快捷启动框状态。
+pub(super) fn open_or_toggle_launcher_window(app: &AppHandle, bridge: &Arc<BridgeState>) {
+    let handle = app.clone();
+    let launcher = bridge.clone();
+    let _ = app.run_on_main_thread(move || {
+        let cold_started = ensure_main_window_on_main_thread(&handle);
+        launcher.on_launcher_hotkey(cold_started);
+    });
 }
 
 fn fallback_tray_icon() -> Image<'static> {

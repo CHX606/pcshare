@@ -4,11 +4,12 @@
 //! - 文件损坏时自动备份为 `.corrupt.<timestamp>.bak`，重建默认文件并返回中文提示
 //! - 操作审计日志按天滚动，保留最近 30 天
 
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use chrono::{Duration as ChronoDuration, Local, NaiveDate, Utc};
 use iroh::{EndpointId, SecretKey};
@@ -138,7 +139,9 @@ pub struct LocalStorage {
     platform: Arc<dyn Platform>,
     secret_key: SecretKey,
     peers: RwLock<Vec<PeerRecord>>,
+    peers_io_lock: Mutex<()>,
     settings: RwLock<Settings>,
+    last_audit_prune_day: Mutex<Option<NaiveDate>>,
 }
 
 impl LocalStorage {
@@ -199,7 +202,9 @@ impl LocalStorage {
             platform,
             secret_key,
             peers: RwLock::new(peers_file.peers),
+            peers_io_lock: Mutex::new(()),
             settings: RwLock::new(settings),
+            last_audit_prune_day: Mutex::new(Some(Local::now().date_naive())),
         };
         let _ = storage.cleanup_expired_audits();
         Ok((storage, warnings))
@@ -233,10 +238,11 @@ impl LocalStorage {
         F: FnOnce(&mut Settings),
     {
         let mut guard = self.settings.write().unwrap_or_else(|e| e.into_inner());
-        f(&mut guard);
-        let snapshot = guard.clone();
-        write_json_atomic(&self.data_dir.join(SETTINGS_FILE), &snapshot)?;
-        Ok(snapshot)
+        let mut next = guard.clone();
+        f(&mut next);
+        write_json_atomic(&self.data_dir.join(SETTINGS_FILE), &next)?;
+        *guard = next.clone();
+        Ok(next)
     }
 
     pub fn list_peers(&self) -> Vec<PeerRecord> {
@@ -249,21 +255,56 @@ impl LocalStorage {
     }
 
     pub fn upsert_peer(&self, record: PeerRecord) -> Result<(), CoreError> {
+        let _io = self.peers_io_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut guard = self.peers.write().unwrap_or_else(|e| e.into_inner());
-        if let Some(existing) = guard
+        let mut next = guard.clone();
+        if let Some(existing) = next
             .iter_mut()
             .find(|p| p.endpoint_id == record.endpoint_id)
         {
             *existing = record;
         } else {
-            guard.push(record);
+            next.push(record);
         }
         write_json_atomic(
             &self.data_dir.join(PEERS_FILE),
             &PeersFile {
-                peers: guard.clone(),
+                peers: next.clone(),
             },
-        )
+        )?;
+        *guard = next;
+        Ok(())
+    }
+
+    /// 仅在内存中更新对端最近在线时间与中继地址（不写盘，避免高频心跳磨损磁盘）。
+    /// 返回 `(是否找到该对端, relay_url 是否发生变化)`。
+    pub fn touch_peer_seen_in_memory(
+        &self,
+        endpoint_id: &str,
+        seen_ms: u64,
+        relay_url: Option<String>,
+    ) -> (bool, bool) {
+        let mut guard = self.peers.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(peer) = guard.iter_mut().find(|p| p.endpoint_id == endpoint_id) {
+            peer.last_seen_ms = Some(seen_ms);
+            let mut relay_changed = false;
+            if let Some(url) = relay_url
+                && peer.relay_url.as_deref() != Some(url.as_str())
+            {
+                peer.relay_url = Some(url);
+                relay_changed = true;
+            }
+            (true, relay_changed)
+        } else {
+            (false, false)
+        }
+    }
+
+    /// 将当前内存中的已配对设备表快照原子落盘（不持 `peers` 写锁执行 `sync_all`）。
+    pub fn flush_peers(&self) -> Result<(), CoreError> {
+        let _io = self.peers_io_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let snapshot = self.peers.read().unwrap_or_else(|e| e.into_inner()).clone();
+        write_json_atomic(&self.data_dir.join(PEERS_FILE), &PeersFile { peers: snapshot })
     }
 
     pub fn touch_peer_seen(
@@ -272,8 +313,10 @@ impl LocalStorage {
         seen_ms: u64,
         relay_url: Option<String>,
     ) -> Result<(), CoreError> {
+        let _io = self.peers_io_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut guard = self.peers.write().unwrap_or_else(|e| e.into_inner());
-        if let Some(peer) = guard.iter_mut().find(|p| p.endpoint_id == endpoint_id) {
+        let mut next = guard.clone();
+        if let Some(peer) = next.iter_mut().find(|p| p.endpoint_id == endpoint_id) {
             peer.last_seen_ms = Some(seen_ms);
             if relay_url.is_some() {
                 peer.relay_url = relay_url;
@@ -281,9 +324,10 @@ impl LocalStorage {
             write_json_atomic(
                 &self.data_dir.join(PEERS_FILE),
                 &PeersFile {
-                    peers: guard.clone(),
+                    peers: next.clone(),
                 },
             )?;
+            *guard = next;
         }
         Ok(())
     }
@@ -294,8 +338,10 @@ impl LocalStorage {
         capabilities: Vec<String>,
         mac_addresses: Vec<String>,
     ) -> Result<(), CoreError> {
+        let _io = self.peers_io_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut guard = self.peers.write().unwrap_or_else(|e| e.into_inner());
-        if let Some(peer) = guard.iter_mut().find(|p| p.endpoint_id == endpoint_id) {
+        let mut next = guard.clone();
+        if let Some(peer) = next.iter_mut().find(|p| p.endpoint_id == endpoint_id) {
             let mut changed = false;
             if !capabilities.is_empty() && peer.capabilities != capabilities {
                 peer.capabilities = capabilities;
@@ -309,26 +355,30 @@ impl LocalStorage {
                 write_json_atomic(
                     &self.data_dir.join(PEERS_FILE),
                     &PeersFile {
-                        peers: guard.clone(),
+                        peers: next.clone(),
                     },
                 )?;
+                *guard = next;
             }
         }
         Ok(())
     }
 
     pub fn rename_peer(&self, endpoint_id: &str, new_name: String) -> Result<bool, CoreError> {
+        let _io = self.peers_io_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut guard = self.peers.write().unwrap_or_else(|e| e.into_inner());
-        let Some(peer) = guard.iter_mut().find(|p| p.endpoint_id == endpoint_id) else {
+        let mut next = guard.clone();
+        let Some(peer) = next.iter_mut().find(|p| p.endpoint_id == endpoint_id) else {
             return Ok(false);
         };
         peer.name = new_name;
         write_json_atomic(
             &self.data_dir.join(PEERS_FILE),
             &PeersFile {
-                peers: guard.clone(),
+                peers: next.clone(),
             },
         )?;
+        *guard = next;
         Ok(true)
     }
 
@@ -337,33 +387,39 @@ impl LocalStorage {
         endpoint_id: &str,
         permissions: Permissions,
     ) -> Result<bool, CoreError> {
+        let _io = self.peers_io_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut guard = self.peers.write().unwrap_or_else(|e| e.into_inner());
-        let Some(peer) = guard.iter_mut().find(|p| p.endpoint_id == endpoint_id) else {
+        let mut next = guard.clone();
+        let Some(peer) = next.iter_mut().find(|p| p.endpoint_id == endpoint_id) else {
             return Ok(false);
         };
         peer.permissions = permissions;
         write_json_atomic(
             &self.data_dir.join(PEERS_FILE),
             &PeersFile {
-                peers: guard.clone(),
+                peers: next.clone(),
             },
         )?;
+        *guard = next;
         Ok(true)
     }
 
     pub fn remove_peer(&self, endpoint_id: &str) -> Result<bool, CoreError> {
+        let _io = self.peers_io_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut guard = self.peers.write().unwrap_or_else(|e| e.into_inner());
-        let before = guard.len();
-        guard.retain(|p| p.endpoint_id != endpoint_id);
-        if guard.len() == before {
+        let mut next = guard.clone();
+        let before = next.len();
+        next.retain(|p| p.endpoint_id != endpoint_id);
+        if next.len() == before {
             return Ok(false);
         }
         write_json_atomic(
             &self.data_dir.join(PEERS_FILE),
             &PeersFile {
-                peers: guard.clone(),
+                peers: next.clone(),
             },
         )?;
+        *guard = next;
         Ok(true)
     }
 
@@ -375,15 +431,34 @@ impl LocalStorage {
     pub fn append_audit(&self, entry: AuditEntry) -> Result<(), CoreError> {
         let logs_dir = self.data_dir.join(LOGS_DIR);
         fs::create_dir_all(&logs_dir)?;
-        let date_str = Local::now().format("%Y-%m-%d").to_string();
+        let today = Local::now().date_naive();
+        let date_str = today.format("%Y-%m-%d");
         let log_path = logs_dir.join(format!("audit-{date_str}.jsonl"));
+        let mut line = serde_json::to_string(&entry)
+            .map_err(|e| CoreError::Internal(format!("序列化审计记录失败：{e}")))?;
+        line.push('\n');
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(log_path)?;
-        let line = serde_json::to_string(&entry)
-            .map_err(|e| CoreError::Internal(format!("序列化审计记录失败：{e}")))?;
-        writeln!(file, "{line}")?;
+        file.write_all(line.as_bytes())?;
+
+        // 跨天运行时每日最多清理一次 30 天前的过期审计日志
+        let should_prune = {
+            let mut last = self
+                .last_audit_prune_day
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if *last == Some(today) {
+                false
+            } else {
+                *last = Some(today);
+                true
+            }
+        };
+        if should_prune {
+            let _ = self.cleanup_expired_audits();
+        }
         Ok(())
     }
 
@@ -404,19 +479,26 @@ impl LocalStorage {
         files.sort();
         files.reverse();
 
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(limit.min(512));
         for path in files {
+            let need = limit.saturating_sub(out.len());
+            if need == 0 {
+                break;
+            }
             let file = File::open(path)?;
-            let lines: Vec<String> = BufReader::new(file)
-                .lines()
-                .map_while(Result::ok)
-                .collect();
-            for line in lines.into_iter().rev() {
+            let mut ring: VecDeque<AuditEntry> = VecDeque::with_capacity(need.min(512));
+            for line in BufReader::new(file).lines().map_while(Result::ok) {
                 if let Ok(entry) = serde_json::from_str::<AuditEntry>(&line) {
-                    out.push(entry);
-                    if out.len() >= limit {
-                        return Ok(out);
+                    if ring.len() == need {
+                        ring.pop_front();
                     }
+                    ring.push_back(entry);
+                }
+            }
+            for entry in ring.into_iter().rev() {
+                out.push(entry);
+                if out.len() >= limit {
+                    return Ok(out);
                 }
             }
         }
@@ -521,6 +603,13 @@ fn backup_corrupt_file(path: &Path) -> Result<PathBuf, CoreError> {
 pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), CoreError> {
     let json = serde_json::to_vec_pretty(value)
         .map_err(|e| CoreError::Internal(format!("序列化配置失败：{e}")))?;
+    write_bytes_atomic(path, &json)
+}
+
+/// 紧凑 JSON 原子落盘（用于目录缓存等体积敏感的大 JSON 文件）。
+pub fn write_json_compact_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), CoreError> {
+    let json = serde_json::to_vec(value)
+        .map_err(|e| CoreError::Internal(format!("序列化缓存失败：{e}")))?;
     write_bytes_atomic(path, &json)
 }
 

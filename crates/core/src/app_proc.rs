@@ -58,6 +58,13 @@ pub fn authorize_launch(perms: &Permissions, args: &AppLaunchArgs) -> Result<Str
         return Ok(to_display_path(&clean));
     }
 
+    if looks_like_drive_relative_path(target) {
+        return Err(RpcError::new(
+            ErrorCode::Invalid,
+            format!("请填写完整绝对路径（例如 C:\\目录\\文件），不支持盘符相对路径：{target}"),
+        ));
+    }
+
     if let Some(scheme) = scheme.as_deref() {
         // file: 和 shell: 能打开任意文件夹或文件，绕过开放文件夹的限制。
         if !perms.allowed_roots.is_empty() && matches!(scheme, "file" | "shell") {
@@ -84,6 +91,16 @@ fn looks_like_absolute_path(target: &str) -> bool {
     let drive = b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':';
     let drive_abs = drive && (b.len() == 2 || b[2] == b'\\' || b[2] == b'/');
     drive_abs || target.starts_with(r"\\") || target.starts_with("//")
+}
+
+/// 识别 Windows 盘符相对路径（例如 `C:secret.docx`、`c:dir\a.exe`），防止绕过 `allowed_roots` 边界。
+fn looks_like_drive_relative_path(target: &str) -> bool {
+    let b = target.as_bytes();
+    b.len() >= 3
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && b[2] != b'\\'
+        && b[2] != b'/'
 }
 
 /// 取出 `https:`、`ms-settings:` 这类地址的协议名（小写）；盘符 `C:` 不算。

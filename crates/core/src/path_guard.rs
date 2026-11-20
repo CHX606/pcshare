@@ -102,13 +102,13 @@ pub fn resolve_authorized_path(
 ) -> Result<(PathBuf, PathBuf), RpcError> {
     let lexical = normalize_lexical_absolute(raw)?;
 
-    // 若路径本身或其已有祖先存在符号链接，用实际解析路径再次核验，防止软链逃逸
-    let effective_check_path = resolve_existing_ancestors(&lexical);
-
     if !permissions.allowed_roots.is_empty() {
+        // 若路径本身或其已有祖先存在符号链接（含悬空符号链接），用实际解析路径再次核验，防止软链逃逸
+        let effective_check_path = resolve_existing_ancestors(&lexical)?;
         let allowed = permissions.allowed_roots.iter().any(|root_str| {
-            if let Ok(root_norm) = normalize_lexical_absolute(root_str) {
-                let root_real = resolve_existing_ancestors(&root_norm);
+            if let Ok(root_norm) = normalize_lexical_absolute(root_str)
+                && let Ok(root_real) = resolve_existing_ancestors(&root_norm)
+            {
                 is_subpath_of(&lexical, &root_norm)
                     && is_subpath_of(&effective_check_path, &root_real)
             } else {
@@ -127,7 +127,35 @@ pub fn resolve_authorized_path(
     Ok((lexical, fs_path))
 }
 
-fn resolve_existing_ancestors(path: &Path) -> PathBuf {
+const MAX_SYMLINK_HOPS: u8 = 16;
+
+fn clean_link_target(target: &Path) -> PathBuf {
+    let s = target.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\??\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = s.strip_prefix(r"\??\") {
+        PathBuf::from(rest)
+    } else if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        target.to_path_buf()
+    }
+}
+
+fn resolve_existing_ancestors(path: &Path) -> Result<PathBuf, RpcError> {
+    resolve_existing_ancestors_depth(path, 0)
+}
+
+fn resolve_existing_ancestors_depth(path: &Path, depth: u8) -> Result<PathBuf, RpcError> {
+    if depth > MAX_SYMLINK_HOPS {
+        return Err(RpcError::new(
+            ErrorCode::Forbidden,
+            "路径包含过深或循环符号链接，已拒绝访问",
+        ));
+    }
+
     let mut tail = Vec::new();
     let mut cursor = Some(path);
     while let Some(curr) = cursor {
@@ -137,8 +165,43 @@ fn resolve_existing_ancestors(path: &Path) -> PathBuf {
             for seg in tail.into_iter().rev() {
                 base.push(seg);
             }
-            return base;
+            return Ok(base);
         }
+
+        // 若目标或其祖先是悬空符号链接/联接点，canonicalize 会失败；
+        // 绝不能退回父目录放行，必须解析链接目标并递归核验其最终落点。
+        if let Ok(meta) = std::fs::symlink_metadata(&fs_curr) {
+            let link_target = std::fs::read_link(&fs_curr).ok();
+            if meta.file_type().is_symlink() || link_target.is_some() {
+                let raw_target = link_target.ok_or_else(|| {
+                    RpcError::new(
+                        ErrorCode::Forbidden,
+                        "无法解析符号链接目标，为防止越界已拒绝访问",
+                    )
+                })?;
+                let cleaned_target = clean_link_target(&raw_target);
+                let mut combined = if cleaned_target.is_absolute() {
+                    cleaned_target
+                } else {
+                    let parent = curr.parent().ok_or_else(|| {
+                        RpcError::new(ErrorCode::Forbidden, "符号链接缺少父目录，已拒绝访问")
+                    })?;
+                    parent.join(&cleaned_target)
+                };
+                for seg in tail.into_iter().rev() {
+                    combined.push(seg);
+                }
+                let next_lexical = normalize_lexical_absolute(&combined.to_string_lossy())
+                    .map_err(|_| {
+                        RpcError::new(
+                            ErrorCode::Forbidden,
+                            "符号链接指向不受允许或无效的路径，已拒绝访问",
+                        )
+                    })?;
+                return resolve_existing_ancestors_depth(&next_lexical, depth + 1);
+            }
+        }
+
         if let Some(name) = curr.file_name() {
             tail.push(name.to_os_string());
             cursor = curr.parent();
@@ -146,10 +209,11 @@ fn resolve_existing_ancestors(path: &Path) -> PathBuf {
             break;
         }
     }
-    path.to_path_buf()
+    Ok(path.to_path_buf())
 }
 
-fn is_subpath_of(candidate: &Path, root: &Path) -> bool {
+/// 检查 `candidate` 是否位于 `root` 之下（含等于 `root`），供路径边界及移动/复制祖先防递归校验复用。
+pub fn is_subpath_of(candidate: &Path, root: &Path) -> bool {
     let cand_comps: Vec<String> = candidate
         .components()
         .map(|c| normalize_component(&c))
@@ -159,6 +223,13 @@ fn is_subpath_of(candidate: &Path, root: &Path) -> bool {
         return false;
     }
     cand_comps[..root_comps.len()] == root_comps[..]
+}
+
+/// 比较两个词法规范化路径是否指向同一路径（Windows 下忽略大小写）。
+pub fn paths_equal(a: &Path, b: &Path) -> bool {
+    let a_comps: Vec<String> = a.components().map(|c| normalize_component(&c)).collect();
+    let b_comps: Vec<String> = b.components().map(|c| normalize_component(&c)).collect();
+    a_comps == b_comps
 }
 
 fn normalize_component(comp: &Component<'_>) -> String {
@@ -173,16 +244,67 @@ fn normalize_component(comp: &Component<'_>) -> String {
     }
 }
 
-/// 校验单个文件名（用于 `fs.rename`），不允许包含路径分隔符或保留名称。
+fn is_windows_reserved_device_name(name: &str) -> bool {
+    let base = name.split('.').next().unwrap_or(name).trim_end_matches(' ');
+    let upper = base.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
+/// 校验单个文件名（用于 `fs.rename`、上传/批传段名等），不允许包含路径分隔符、控制字符、末尾点号/空格或系统保留设备名。
 pub fn validate_single_name(name: &str) -> Result<&str, RpcError> {
+    if name.chars().any(|c| c.is_control()) {
+        return Err(RpcError::new(
+            ErrorCode::Invalid,
+            "文件名不能包含控制字符",
+        ));
+    }
     let trimmed = name.trim();
     if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
-        return Err(RpcError::new(ErrorCode::Invalid, "新名称不能为空，也不能是 . 或 .."));
+        return Err(RpcError::new(
+            ErrorCode::Invalid,
+            "新名称不能为空，也不能是 . 或 ..",
+        ));
+    }
+    if name.ends_with(['.', ' ']) || trimmed.ends_with('.') {
+        return Err(RpcError::new(
+            ErrorCode::Invalid,
+            "文件名不能以点号或空格结尾",
+        ));
     }
     if trimmed.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|']) {
         return Err(RpcError::new(
             ErrorCode::Invalid,
             "文件名不能包含 \\ / : * ? \" < > | 等特殊字符",
+        ));
+    }
+    if is_windows_reserved_device_name(trimmed) {
+        return Err(RpcError::new(
+            ErrorCode::Invalid,
+            format!("文件名不能使用系统保留名称：{trimmed}"),
         ));
     }
     Ok(trimmed)

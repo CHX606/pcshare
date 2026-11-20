@@ -140,6 +140,13 @@ pub(crate) async fn transfer_start(
 }
 
 #[tauri::command]
+pub(crate) async fn task_list(
+    state: State<'_, ManagedBridge>,
+) -> Result<Reply<Vec<UiTaskProgress>>, ()> {
+    Ok(state.task_list())
+}
+
+#[tauri::command]
 pub(crate) async fn task_pause(
     state: State<'_, ManagedBridge>,
     task_id: String,
