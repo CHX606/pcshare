@@ -443,6 +443,20 @@ export interface DesktopOpened {
   sessionId: number
   /** 对端支持原始鼠标键盘（移动、按下、松开、滚轮、按键）；否则只能单击、双击、文字和组合键。 */
   rawInput: boolean
+  /** 请求了“对方分辨率跟随本机”时的结果 */
+  fit?: DesktopFit
+  /** 调整分辨率没成功的原因；会话本身照常可用 */
+  fitError?: string
+}
+
+/** 对方显示器临时调整分辨率的结果；applied 为假时保持原样，note 说明原因。 */
+export interface DesktopFit {
+  applied: boolean
+  width: number
+  height: number
+  previousWidth: number
+  previousHeight: number
+  note?: string | null
 }
 
 /** desktop_next 返回的二进制帧头。 */

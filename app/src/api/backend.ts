@@ -185,7 +185,14 @@ export interface Backend {
   }): Promise<InputOutcome>
 
   // 实时桌面会话：远程设备用；查看本机仍用 shotCapture
-  desktopOpen(opts: { device: DeviceId; monitorIndex?: number; hwnd?: string }): Promise<DesktopOpened>
+  /** fitWidth / fitHeight：让对方把这块显示器临时切到本机分辨率（物理像素），会话关闭后对方自动改回。 */
+  desktopOpen(opts: {
+    device: DeviceId
+    monitorIndex?: number
+    hwnd?: string
+    fitWidth?: number
+    fitHeight?: number
+  }): Promise<DesktopOpened>
   /** 取下一帧；逐步模式下会一直等到有输入、手动刷新或链路恢复。会话关闭时以 not_found 失败。 */
   desktopNext(sessionId: number): Promise<DesktopFrame>
   /** 每批 1～64 个事件，等上一批确认再发下一批。 */

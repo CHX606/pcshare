@@ -1,7 +1,7 @@
-use super::{host_input, host_video};
+use super::{host_display, host_input, host_video};
 use crate::{CoreError, CoreNode, error::map_platform_to_rpc};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
-use pcshare_proto::desktop::{CONTROL, VIDEO, VideoOpen};
+use pcshare_proto::desktop::{CONTROL, DISPLAY, VIDEO, VideoOpen};
 use pcshare_proto::{
     ErrorCode, PROTOCOL_VERSION, PermissionScope, RequestEnvelope, ResponseEnvelope, RpcError,
     write_frame,
@@ -17,7 +17,7 @@ impl CoreNode {
         mut send: SendStream,
         mut recv: RecvStream,
     ) -> Result<(), CoreError> {
-        let scope = if env.cmd == CONTROL {
+        let scope = if env.cmd == CONTROL || env.cmd == DISPLAY {
             PermissionScope::InputControl
         } else {
             PermissionScope::Screenshot
@@ -57,6 +57,9 @@ impl CoreNode {
         if env.cmd == VIDEO {
             let req: VideoOpen = parse(env.args)?;
             return host_video::serve(self, peer, conn, req, send, recv).await;
+        }
+        if env.cmd == DISPLAY {
+            return host_display::serve(self, peer, parse(env.args)?, send, recv).await;
         }
         host_input::serve(self, peer, parse(env.args)?, send, recv).await
     }

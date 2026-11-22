@@ -3,6 +3,7 @@
 use crate::PlatformError;
 use crate::PlatformMouseBtn;
 
+pub mod display;
 #[cfg(windows)]
 mod capture_args;
 #[cfg(windows)]

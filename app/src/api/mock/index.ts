@@ -679,7 +679,12 @@ export function createMockBackend(): Backend & { debug: MockDebug } {
       await reach(opts.device, 20)
       const sessionId = ++desktopSeq
       desktopSessions.set(sessionId, { wake: null, closed: false, dirty: true, frames: 0, lastInput: '' })
-      return { sessionId, rawInput: true }
+      // 模拟对方原来是 2560×1440，按本机分辨率临时切换
+      const fit =
+        opts.fitWidth && opts.fitHeight
+          ? { applied: true, width: opts.fitWidth, height: opts.fitHeight, previousWidth: 2560, previousHeight: 1440 }
+          : undefined
+      return { sessionId, rawInput: true, fit }
     },
     async desktopNext(sessionId) {
       const s = desktopSessions.get(sessionId)

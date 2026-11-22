@@ -1,6 +1,7 @@
 //! Adaptive desktop sessions over two multiplexed, authenticated QUIC streams.
 mod feedback;
 mod host;
+mod host_display;
 mod host_input;
 mod host_video;
 mod legacy;

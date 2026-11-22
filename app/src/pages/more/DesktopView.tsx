@@ -20,6 +20,8 @@ import {
   LONG_PRESS_MS,
   TouchGesture,
   canDecodeVideo,
+  describeFit,
+  localScreenPixels,
   mapPointToRemotePixel,
   parseSourceChoice,
   pickSourceChoice,
@@ -107,6 +109,16 @@ function DesktopStatsFooter({
 
 const BUTTONS: DesktopMouseButton[] = ['left', 'middle', 'right']
 
+/** “对方分辨率跟随本机”开关，记在本机，默认打开。 */
+const FOLLOW_KEY = 'pcshare.desktop.followResolution'
+function loadFollow(): boolean {
+  try {
+    return localStorage.getItem(FOLLOW_KEY) !== '0'
+  } catch {
+    return true
+  }
+}
+
 /** 解码配置是否可用，按编码字符串缓存。 */
 const codecSupport = new Map<string, Promise<boolean>>()
 function codecSupported(codec: string): Promise<boolean> {
@@ -148,6 +160,11 @@ export function DesktopView({
   const [visible, setVisible] = useState(() => !document.hidden)
   const [fullscreen, setFullscreen] = useState(false)
   const [barOpen, setBarOpen] = useState(true)
+  /** 当前画面的像素宽高。对方传来的图最宽 1280，全屏时要据此放大铺满屏幕。 */
+  const [frameSize, setFrameSize] = useState<{ w: number; h: number } | null>(null)
+  /** 看整块显示器时让对方临时切到本机分辨率，关闭看屏后对方自动改回。 */
+  const [followRes, setFollowRes] = useState(loadFollow)
+  const [fitStatus, setFitStatus] = useState<{ text: string; warn: boolean } | null>(null)
 
   const [statsChannel] = useState(() => new StatsChannel())
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -216,8 +233,11 @@ export function DesktopView({
     const draw = (img: CanvasImageSource, w: number, h: number, t: ShotTransform) => {
       const c = canvasRef.current
       if (!c || stopped) return
-      if (c.width !== w) c.width = w
-      if (c.height !== h) c.height = h
+      if (c.width !== w || c.height !== h) {
+        c.width = w
+        c.height = h
+        setFrameSize({ w, h })
+      }
       c.getContext('2d')?.drawImage(img, 0, 0, w, h)
       transformRef.current = t
       const now = performance.now()
@@ -281,8 +301,19 @@ export function DesktopView({
       setHasFrame(false)
       statsChannel.set(null)
       setWarning(null)
+      setFitStatus(null)
       try {
-        const opened = await backend.desktopOpen({ device, ...parseSourceChoice(sourceChoice) })
+        const source = parseSourceChoice(sourceChoice)
+        // 只有看整块显示器才调整分辨率；看单个窗口时没有意义
+        const fit =
+          followRes && source.monitorIndex != null
+            ? localScreenPixels(window.screen.width, window.screen.height, window.devicePixelRatio)
+            : null
+        const opened = await backend.desktopOpen({
+          device,
+          ...source,
+          ...(fit ? { fitWidth: fit.width, fitHeight: fit.height } : {}),
+        })
         if (stopped) {
           void backend.desktopClose(opened.sessionId).catch(() => undefined)
           return
@@ -291,6 +322,9 @@ export function DesktopView({
         sessionId = id
         sessionRef.current = id
         setRawInput(opened.rawInput)
+        setFitStatus(describeFit(opened.fit, opened.fitError))
+        // 对方分辨率变了，来源列表里显示的尺寸也跟着刷新
+        if (opened.fit?.applied) void loadTargets(() => stopped)
         queueRef.current = new DesktopInputQueue(
           (events) => backend.desktopInput(id, events),
           (err) => {
@@ -349,7 +383,7 @@ export function DesktopView({
         void release.then(() => backend.desktopClose(id).catch(() => undefined))
       }
     }
-  }, [device, sourceChoice, visible, generation, statsChannel])
+  }, [device, sourceChoice, visible, generation, statsChannel, followRes, loadTargets])
 
   const interactive = canInput && phase.kind === 'running'
   const pointerOnly = interactive && rawInput
@@ -600,6 +634,24 @@ export function DesktopView({
           >
             全屏看屏
           </button>
+
+          <button
+            type="button"
+            aria-pressed={followRes}
+            onClick={() => {
+              const next = !followRes
+              setFollowRes(next)
+              try {
+                localStorage.setItem(FOLLOW_KEY, next ? '1' : '0')
+              } catch {
+                // 存不下也不影响这次使用
+              }
+            }}
+            title="看整块显示器时，把对方屏幕临时切到和本机一样的分辨率，画面正好铺满；关闭看屏后对方自动改回。只能用对方显示器支持的分辨率"
+            className="h-8 rounded-md border border-line bg-panel px-2.5 text-xs hover:bg-hover aria-pressed:border-accent aria-pressed:text-accent"
+          >
+            对方分辨率跟随本机
+          </button>
         </div>
 
         {!rawInput && phase.kind === 'running' && (
@@ -628,6 +680,12 @@ export function DesktopView({
           </>
         )}
       </Toolbar>
+
+      {fitStatus && (
+        <p role="status" className={`px-1 text-xs ${fitStatus.warn ? 'text-warn' : 'text-muted'}`}>
+          {fitStatus.text}
+        </p>
+      )}
 
       {warning && (
         <div role="alert" className="flex items-start gap-2.5 rounded-lg border border-warn/50 bg-warn/10 px-3.5 py-2.5 text-xs leading-relaxed">
@@ -726,11 +784,18 @@ export function DesktopView({
                 onLegacyClick(e, 'right', false)
               }}
               // h-auto w-auto 让画面按原比例缩放；只写最大宽高会被横竖分别压扁。
+              // 全屏时画面可能比屏幕小（对方传来的图最宽 1280），按比例放大到贴住屏幕的宽或高；
+              // 画布框和画面大小一致，点按坐标按画布框换算仍然准确，所以不用 object-fit。
+              style={
+                fullscreen && viewMode === 'fit' && frameSize
+                  ? { width: `min(100vw, calc(100vh * ${frameSize.w} / ${frameSize.h}))` }
+                  : undefined
+              }
               className={`outline-none ${fullscreen ? '' : 'rounded border border-line shadow-sm focus:border-accent'} ${
                 viewMode !== 'fit'
                   ? 'h-auto w-auto max-w-none'
                   : fullscreen
-                    ? 'h-auto max-h-screen w-auto max-w-full'
+                    ? 'h-auto max-w-none'
                     : 'h-auto max-h-[calc(100vh-300px)] w-auto max-w-full'
               } ${interactive ? 'cursor-crosshair' : ''} ${pointerOnly ? 'touch-none select-none' : ''}`}
             />

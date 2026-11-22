@@ -1,4 +1,5 @@
 import type {
+  DesktopFit,
   DesktopFrame,
   DesktopFrameMeta,
   DesktopInputEvent,
@@ -58,6 +59,29 @@ export function parseSourceChoice(choice: string): { monitorIndex?: number; hwnd
   if (choice.startsWith('win:')) return { hwnd: choice.slice(4) }
   const idx = Number(choice.slice(4))
   return { monitorIndex: Number.isFinite(idx) ? idx : 0 }
+}
+
+/** 本机屏幕的物理像素：浏览器给的是 CSS 像素，乘以系统缩放比还原。 */
+export function localScreenPixels(cssWidth: number, cssHeight: number, ratio: number): { width: number; height: number } {
+  const r = Number.isFinite(ratio) && ratio > 0 ? ratio : 1
+  return { width: Math.round(cssWidth * r), height: Math.round(cssHeight * r) }
+}
+
+/** 把对方分辨率的调整结果写成一句话；warn 为真时用醒目颜色。 */
+export function describeFit(
+  fit: DesktopFit | undefined,
+  error: string | undefined,
+): { text: string; warn: boolean } | null {
+  if (error) return { text: `没能调整对方分辨率：${error}`, warn: true }
+  if (!fit) return null
+  if (fit.applied) {
+    return {
+      text: `已把对方屏幕临时改成 ${fit.width}×${fit.height}（原来 ${fit.previousWidth}×${fit.previousHeight}），关闭看屏后自动改回`,
+      warn: false,
+    }
+  }
+  if (fit.note) return { text: fit.note, warn: true }
+  return { text: `对方屏幕已经是 ${fit.width}×${fit.height}，和本机一致`, warn: false }
 }
 
 export const QUICK_KEYS = [

@@ -3,12 +3,13 @@ use iroh::endpoint::{Connection, RecvStream, SendStream};
 use pcshare_proto::desktop::{
     self, DesktopInput, MAX_VIDEO_PACKET, PacketHeader, VideoOpen, VideoReady,
 };
-use pcshare_proto::{ResponseEnvelope, read_frame, write_frame};
+use pcshare_proto::{ResponseEnvelope, read_frame, read_optional_frame, write_frame};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+use tokio_util::sync::CancellationToken;
 
 pub(super) struct Channel {
     send: SendStream,
@@ -37,6 +38,15 @@ impl Channel {
         tokio::time::timeout(Duration::from_secs(24), start)
             .await
             .map_err(|_| CoreError::Timeout)?
+    }
+
+    /// 保持这条流直到会话取消或对方先结束，然后正常关闭，让对方据此收尾（例如还原分辨率）。
+    pub async fn hold(mut self, cancel: CancellationToken) {
+        tokio::select! {
+            _ = cancel.cancelled() => {}
+            _ = read_optional_frame::<_, u8>(&mut self.recv) => {}
+        }
+        let _ = self.send.finish();
     }
 
     pub async fn input(

@@ -5,6 +5,8 @@ import {
   MAX_INPUT_BATCH,
   TouchGesture,
   buildDesktopPacket,
+  describeFit,
+  localScreenPixels,
   mapPointToRemotePixel,
   parseDesktopPacket,
   parseSourceChoice,
@@ -203,5 +205,23 @@ describe('TouchGesture', () => {
     g.move(p(50, 0), p(50, 0))
     expect(g.cancel()).toBe(true)
     expect(g.cancel()).toBe(false)
+  })
+})
+
+describe('对方分辨率跟随本机', () => {
+  it('按系统缩放比把 CSS 像素还原成物理像素', () => {
+    expect(localScreenPixels(1536, 864, 1.25)).toEqual({ width: 1920, height: 1080 })
+    expect(localScreenPixels(1280, 720, 1.5)).toEqual({ width: 1920, height: 1080 })
+    expect(localScreenPixels(1920, 1080, 0)).toEqual({ width: 1920, height: 1080 })
+  })
+
+  it('把调整结果写成一句话', () => {
+    expect(describeFit(undefined, undefined)).toBeNull()
+    expect(describeFit(undefined, '对方程序版本较旧')).toEqual({ text: '没能调整对方分辨率：对方程序版本较旧', warn: true })
+    const applied = { applied: true, width: 1920, height: 1080, previousWidth: 2560, previousHeight: 1440 }
+    expect(describeFit(applied, undefined)?.text).toContain('临时改成 1920×1080（原来 2560×1440）')
+    const kept = { applied: false, width: 1920, height: 1080, previousWidth: 1920, previousHeight: 1080 }
+    expect(describeFit(kept, undefined)).toEqual({ text: '对方屏幕已经是 1920×1080，和本机一致', warn: false })
+    expect(describeFit({ ...kept, note: '对方显示器没有更接近本机的分辨率，保持原样' }, undefined)?.warn).toBe(true)
   })
 })

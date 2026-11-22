@@ -4,7 +4,39 @@ use serde::{Deserialize, Serialize};
 
 pub const VIDEO: &str = "desktop.video";
 pub const CONTROL: &str = "desktop.control";
+/// 看屏期间让被控端把一块显示器临时切到控制端的分辨率；流关闭即还原。
+pub const DISPLAY: &str = "desktop.display";
+/// 被控端支持 [`DISPLAY`] 时在能力列表里带上这一项。
+pub const CAP_DISPLAY_FIT: &str = "desktop.display.v1";
 pub const MAX_VIDEO_PACKET: usize = 4 * 1024 * 1024;
+
+/// [`DISPLAY`] 的请求：把第 `monitor` 块显示器调到接近 `width × height`（物理像素）。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DisplayFit {
+    pub monitor: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl DisplayFit {
+    pub fn validate(&self) -> Result<(), RpcError> {
+        let ok = (320..=16_384).contains(&self.width) && (240..=16_384).contains(&self.height);
+        ok.then_some(())
+            .ok_or_else(|| RpcError::new(ErrorCode::Invalid, "本机分辨率参数无效"))
+    }
+}
+
+/// [`DISPLAY`] 的回复。`applied` 为假时屏幕保持原样，`note` 说明原因。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DisplayFitted {
+    pub applied: bool,
+    pub width: u32,
+    pub height: u32,
+    pub previous_width: u32,
+    pub previous_height: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

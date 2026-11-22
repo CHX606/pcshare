@@ -147,6 +147,8 @@ export function createTauriBackend(): Backend {
         device: opts.device,
         monitorIndex: opts.monitorIndex ?? null,
         hwnd: opts.hwnd ?? null,
+        fitWidth: opts.fitWidth ?? null,
+        fitHeight: opts.fitHeight ?? null,
       }),
     desktopNext: async (sessionId) => {
       // 成功时直接返回二进制，失败时以 { code, msg } 拒绝，不走 Reply 包装

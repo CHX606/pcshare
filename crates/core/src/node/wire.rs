@@ -113,6 +113,7 @@ pub fn node_capabilities() -> Vec<String> {
     ];
     if cfg!(windows) {
         caps.push("desktop.v1".into());
+        caps.push(pcshare_proto::desktop::CAP_DISPLAY_FIT.into());
     }
     caps
 }

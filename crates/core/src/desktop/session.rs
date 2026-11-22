@@ -60,6 +60,40 @@ impl DesktopSession {
     pub fn supports_raw_input(&self) -> bool {
         self.modern
     }
+
+    /// 请求对方把正在看的显示器临时切到 `width × height`（本机物理像素）。
+    /// 对方在会话关闭、连接断开或权限收回时自动改回原分辨率。
+    pub async fn fit_display(&self, width: u32, height: u32) -> Result<desktop::DisplayFitted, CoreError> {
+        let Source::Monitor(monitor) = self.source else {
+            return Err(super::invalid("只能调整整块显示器的分辨率"));
+        };
+        let supported = self
+            .node
+            .storage
+            .get_peer(&self.peer)
+            .is_some_and(|p| p.capabilities.iter().any(|c| c == desktop::CAP_DISPLAY_FIT));
+        if !supported {
+            return Err(RpcError::new(
+                ErrorCode::Unsupported,
+                "对方程序版本较旧，不支持跟随本机分辨率，升级对方后可用",
+            )
+            .into());
+        }
+        let req = desktop::DisplayFit {
+            monitor,
+            width,
+            height,
+        };
+        req.validate()?;
+        let open = Channel::open(&self.node, &self.peer, desktop::DISPLAY, req);
+        let (channel, fitted, _) = tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => return Err(CoreError::Cancelled),
+            result = open => result?,
+        };
+        tokio::spawn(channel.hold(self.cancel.clone()));
+        Ok(fitted)
+    }
     pub fn refresh(&self) {
         self.refresh.publish(None);
     }

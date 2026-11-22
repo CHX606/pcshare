@@ -46,7 +46,9 @@ impl CoreNode {
         let env: RequestEnvelope = read_frame(&mut recv).await?;
         if matches!(
             env.cmd.as_str(),
-            pcshare_proto::desktop::VIDEO | pcshare_proto::desktop::CONTROL
+            pcshare_proto::desktop::VIDEO
+                | pcshare_proto::desktop::CONTROL
+                | pcshare_proto::desktop::DISPLAY
         ) {
             return self.serve_desktop(peer_id, conn, env, send, recv).await;
         }

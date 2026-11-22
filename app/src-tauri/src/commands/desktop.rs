@@ -4,7 +4,7 @@ use pcshare_core::{
     CoreError,
     desktop::{DesktopFrame, DesktopSession},
 };
-use pcshare_proto::desktop::{DesktopInput, Source};
+use pcshare_proto::desktop::{DesktopInput, DisplayFitted, Source};
 use serde::Serialize;
 use std::sync::Arc;
 use tauri::{Manager, Resource, ResourceId, Webview, ipc::Response};
@@ -26,6 +26,36 @@ impl Drop for SessionResource {
 pub(crate) struct Opened {
     session_id: ResourceId,
     raw_input: bool,
+    /// 请求了“对方分辨率跟随本机”时的结果
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fit: Option<FitReport>,
+    /// 调整分辨率没成功时给人看的原因；会话本身照常可用
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fit_error: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FitReport {
+    applied: bool,
+    width: u32,
+    height: u32,
+    previous_width: u32,
+    previous_height: u32,
+    note: Option<String>,
+}
+
+impl From<DisplayFitted> for FitReport {
+    fn from(f: DisplayFitted) -> Self {
+        Self {
+            applied: f.applied,
+            width: f.width,
+            height: f.height,
+            previous_width: f.previous_width,
+            previous_height: f.previous_height,
+            note: f.note,
+        }
+    }
 }
 
 #[tauri::command]
@@ -35,6 +65,8 @@ pub(crate) async fn desktop_open(
     device: String,
     monitor_index: Option<u32>,
     hwnd: Option<String>,
+    fit_width: Option<u32>,
+    fit_height: Option<u32>,
 ) -> Result<Reply<Opened>, ()> {
     let source = match (monitor_index, hwnd) {
         (Some(_), Some(_)) => {
@@ -46,19 +78,28 @@ pub(crate) async fn desktop_open(
             _ => return Ok(Reply::err(UiErrorCode::Invalid, "无效的窗口编号")),
         },
     };
-    let result = DesktopSession::open(state.node(), &device, source)
-        .await
-        .map(|session| {
-            let raw_input = session.supports_raw_input();
-            let session_id = webview
-                .resources_table()
-                .add(SessionResource(Arc::new(session)));
-            Opened {
-                session_id,
-                raw_input,
-            }
-        });
-    Ok(Reply::from_core(result))
+    let session = match DesktopSession::open(state.node(), &device, source).await {
+        Ok(s) => s,
+        Err(e) => return Ok(Reply::from_core(Err(e))),
+    };
+    // 先调分辨率再开始取帧，视频流直接按新分辨率打开，免得刚开就重新同步
+    let (fit, fit_error) = match (fit_width, fit_height, source) {
+        (Some(w), Some(h), Source::Monitor(_)) => match session.fit_display(w, h).await {
+            Ok(f) => (Some(f.into()), None),
+            Err(e) => (None, Some(e.to_user_message())),
+        },
+        _ => (None, None),
+    };
+    let raw_input = session.supports_raw_input();
+    let session_id = webview
+        .resources_table()
+        .add(SessionResource(Arc::new(session)));
+    Ok(Reply::ok(Opened {
+        session_id,
+        raw_input,
+        fit,
+        fit_error,
+    }))
 }
 
 fn session(webview: &Webview, id: ResourceId) -> Result<Arc<DesktopSession>, ApiErrorBody> {

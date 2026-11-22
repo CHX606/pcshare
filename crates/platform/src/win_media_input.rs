@@ -140,6 +140,34 @@ struct RawMonitorEntry {
 }
 
 pub fn list_monitors_impl() -> Result<Vec<PlatformMonitor>, PlatformError> {
+    let monitors = sorted_monitor_entries()
+        .into_iter()
+        .enumerate()
+        .map(|(idx, mut entry)| {
+            entry.monitor.index = idx as u32;
+            entry.monitor.name = format_monitor_display_name(
+                idx,
+                entry.monitor.is_primary,
+                entry.monitor.width,
+                entry.monitor.height,
+                &entry.raw_name,
+            );
+            entry.monitor
+        })
+        .collect();
+    Ok(monitors)
+}
+
+/// 第 `index` 块显示器的系统设备名（如 `\\.\DISPLAY1`），序号规则与 `list_monitors_impl` 相同。
+pub(crate) fn monitor_device_name(index: u32) -> Option<String> {
+    sorted_monitor_entries()
+        .into_iter()
+        .nth(index as usize)
+        .map(|e| e.raw_name)
+}
+
+/// 枚举全部显示器，主显示器排在第一位，其余保持系统枚举顺序。
+fn sorted_monitor_entries() -> Vec<RawMonitorEntry> {
     let mut raw_list: Vec<RawMonitorEntry> = Vec::new();
     unsafe extern "system" fn enum_monitor_cb(
         hmon: HMONITOR,
@@ -195,24 +223,9 @@ pub fn list_monitors_impl() -> Result<Vec<PlatformMonitor>, PlatformError> {
             LPARAM(&mut raw_list as *mut Vec<RawMonitorEntry> as isize),
         );
     }
-    // 先把主显示器排在第一位，再按最终序号统一生成 index 与展示名称
+    // 先把主显示器排在第一位，再由调用方按最终序号统一生成 index 与展示名称
     raw_list.sort_by_key(|e| (!e.monitor.is_primary, e.order));
-    let monitors = raw_list
-        .into_iter()
-        .enumerate()
-        .map(|(idx, mut entry)| {
-            entry.monitor.index = idx as u32;
-            entry.monitor.name = format_monitor_display_name(
-                idx,
-                entry.monitor.is_primary,
-                entry.monitor.width,
-                entry.monitor.height,
-                &entry.raw_name,
-            );
-            entry.monitor
-        })
-        .collect();
-    Ok(monitors)
+    raw_list
 }
 
 fn format_monitor_display_name(
