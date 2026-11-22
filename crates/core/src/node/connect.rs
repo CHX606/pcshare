@@ -16,6 +16,73 @@ impl CoreNode {
         self.dial_and_handshake(peer_id).await
     }
 
+    /// 获取或建立第 `lane`（`0..4`）条数据面 QUIC 连接：
+    /// `lane == 0` 复用主连接；`lane >= 1` 建立独立 QUIC 连接使多核并行执行 AEAD 加解密与 UDP 收发，
+    /// 若辅助连接拨号受阻则平滑回退主连接。
+    pub(crate) async fn get_or_connect_bulk_lane(
+        self: &Arc<Self>,
+        peer_id: &str,
+        lane: usize,
+    ) -> Result<Connection, CoreError> {
+        let main_conn = self.get_or_connect(peer_id).await?;
+        let slot = lane % 4;
+        if slot == 0 {
+            return Ok(main_conn);
+        }
+        let key = (peer_id.to_string(), slot);
+        {
+            let guard = self.bulk_conns.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(c) = guard.get(&key)
+                && c.close_reason().is_none()
+            {
+                return Ok(c.clone());
+            }
+        }
+        match self.dial_bulk_lane(peer_id, &main_conn).await {
+            Ok(aux_conn) => {
+                let mut guard = self.bulk_conns.write().unwrap_or_else(|e| e.into_inner());
+                if let Some(existing) = guard.get(&key)
+                    && existing.close_reason().is_none()
+                {
+                    let keep = existing.clone();
+                    drop(guard);
+                    aux_conn.close(CLOSE_OK.into(), b"dup_lane");
+                    return Ok(keep);
+                }
+                guard.insert(key, aux_conn.clone());
+                Ok(aux_conn)
+            }
+            Err(_) => Ok(main_conn),
+        }
+    }
+
+    async fn dial_bulk_lane(
+        &self,
+        peer_id: &str,
+        main_conn: &Connection,
+    ) -> Result<Connection, CoreError> {
+        let peer = self
+            .storage
+            .get_peer(peer_id)
+            .ok_or_else(|| CoreError::InvalidArgument(format!("设备尚未配对：{peer_id}")))?;
+        let target_id: EndpointId = peer
+            .endpoint_id
+            .parse()
+            .map_err(|_| CoreError::InvalidArgument(format!("身份码无效：{peer_id}")))?;
+
+        let mut direct_addrs = super::wire::observed_addrs(main_conn);
+        for &a in &peer.direct_addrs {
+            if !direct_addrs.contains(&a) {
+                direct_addrs.push(a);
+            }
+        }
+        let addr = build_endpoint_addr(target_id, peer.relay_url.as_deref(), &direct_addrs);
+        timeout(Duration::from_secs(3), self.endpoint.connect(addr, ALPN_MAIN))
+            .await
+            .map_err(|_| CoreError::Timeout)?
+            .map_err(|e| CoreError::NotConnected(format!("建立辅助传输连接失败：{e}")))
+    }
+
     pub(super) async fn dial_and_handshake(
         self: &Arc<Self>,
         peer_id: &str,

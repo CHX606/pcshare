@@ -76,6 +76,8 @@ async fn roundtrip_all_stage1_commands_and_replies() {
             path: r"E:\work\upload.bin".to_string(),
             size: 1_048_576,
             offset: 0,
+            range_length: None,
+            defer_finalize: false,
             modified_ms: Some(1_700_000_123_000),
             conflict: ConflictPolicy::Skip,
         }),
@@ -534,5 +536,70 @@ async fn read_frame_limited_enforces_handshake_cap_and_reads_chunked_frames() {
         let decoded: serde_json::Value = read_frame(&mut reader).await.unwrap();
         write_task.await.unwrap();
         assert_eq!(decoded["blob"].as_str().unwrap().len(), 150 * 1024);
+    }
+}
+
+#[tokio::test]
+async fn compressed_frame_roundtrip_and_bomb_protection() {
+    // 1. Large repetitive JSON shrinks significantly and roundtrips identically
+    let entries: Vec<DirEntry> = (0..1000)
+        .map(|i| DirEntry {
+            name: format!("季度财务汇总报表_{i:04}.xlsx"),
+            path: format!(r"D:\共享资料\年度归档\季度财务汇总报表_{i:04}.xlsx"),
+            kind: EntryKind::File,
+            size: 262_144 + i as u64,
+            modified_ms: Some(1_700_000_000_000 + i as u64),
+            created_ms: None,
+            readonly: false,
+        })
+        .collect();
+    let batch = ResponseEnvelope::ok(FsListBatch {
+        path: r"D:\共享资料\年度归档".to_string(),
+        entries,
+        has_more: false,
+        total_hint: Some(1000),
+    });
+
+    let mut plain_wire = Vec::new();
+    let plain_bytes = write_frame_maybe_compressed(&mut plain_wire, &batch, false)
+        .await
+        .unwrap();
+    let mut comp_wire = Vec::new();
+    let comp_bytes = write_frame_maybe_compressed(&mut comp_wire, &batch, true)
+        .await
+        .unwrap();
+    assert!(
+        comp_bytes * 3 < plain_bytes,
+        "compressed wire ({comp_bytes}) should be < 1/3 of plain wire ({plain_bytes})"
+    );
+    let hdr = u32::from_be_bytes(comp_wire[..4].try_into().unwrap());
+    assert_ne!(hdr & COMPRESSED_FRAME_FLAG, 0);
+
+    let mut cursor = &comp_wire[..];
+    let decoded: ResponseEnvelope<FsListBatch> = read_frame(&mut cursor).await.unwrap();
+    assert_eq!(decoded, batch);
+
+    // 2. Decompression bomb exceeding max_size is rejected without unbounded memory growth
+    {
+        use std::io::Write;
+        let mut raw_bomb = Vec::new();
+        let mut enc =
+            flate2::write::DeflateEncoder::new(&mut raw_bomb, flate2::Compression::best());
+        let big_zeros = vec![b' '; MAX_HANDSHAKE_FRAME_SIZE * 4];
+        enc.write_all(&big_zeros).unwrap();
+        enc.finish().unwrap();
+        assert!(raw_bomb.len() < 1024);
+
+        let mut framed = Vec::with_capacity(4 + raw_bomb.len());
+        let bomb_hdr = (raw_bomb.len() as u32) | COMPRESSED_FRAME_FLAG;
+        framed.extend_from_slice(&bomb_hdr.to_be_bytes());
+        framed.extend_from_slice(&raw_bomb);
+
+        let mut slice = &framed[..];
+        let err =
+            read_frame_limited::<_, serde_json::Value>(&mut slice, MAX_HANDSHAKE_FRAME_SIZE)
+                .await
+                .unwrap_err();
+        assert!(matches!(err, FrameError::FrameTooLarge { .. }));
     }
 }

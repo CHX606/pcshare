@@ -109,6 +109,7 @@ pub struct CoreNode {
     pub(crate) events_tx: broadcast::Sender<CoreEvent>,
     remote_events_tx: broadcast::Sender<(String, RemoteEvent)>,
     active_conns: RwLock<HashMap<String, Connection>>,
+    bulk_conns: RwLock<HashMap<(String, usize), Connection>>,
     incoming_conns: RwLock<HashMap<String, Vec<Connection>>>,
     dial_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     peer_states: RwLock<HashMap<String, DeviceConnState>>,
@@ -135,4 +136,4 @@ mod workers;
 
 pub(crate) use wire::build_endpoint_addr;
 pub use wire::node_capabilities;
-use wire::{inspect_conn_state, rpc_once, write_rpc_result};
+use wire::{inspect_conn_state, rpc_once, write_rpc_result, write_rpc_result_opts};

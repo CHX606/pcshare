@@ -24,6 +24,7 @@ struct GlobalOpts {
     data_dir: PathBuf,
     network_mode: NetworkMode,
     name_override: Option<String>,
+    bind_physical_nic: Option<bool>,
     json_output: bool,
 }
 
@@ -91,6 +92,7 @@ fn extract_global_opts(raw: Vec<String>) -> Result<(GlobalOpts, Vec<String>)> {
     let mut data_dir = default_data_dir();
     let mut network_mode = NetworkMode::PublicOrCustom;
     let mut name_override = None;
+    let mut bind_physical_nic = None;
     let mut json_output = false;
     let mut rest = Vec::new();
 
@@ -108,6 +110,16 @@ fn extract_global_opts(raw: Vec<String>) -> Result<(GlobalOpts, Vec<String>)> {
             "--name" => {
                 let val = iter.next().context("--name 后面需要指定设备名称")?;
                 name_override = Some(val);
+            }
+            "--bind-physical-nic" => {
+                let val = iter
+                    .next()
+                    .context("--bind-physical-nic 后面需要指定 on 或 off")?;
+                bind_physical_nic = match val.to_ascii_lowercase().as_str() {
+                    "on" | "true" | "1" => Some(true),
+                    "off" | "false" | "0" => Some(false),
+                    other => bail!("--bind-physical-nic 参数应为 on 或 off，收到：{other}"),
+                };
             }
             "--json" => {
                 json_output = true;
@@ -129,6 +141,7 @@ fn extract_global_opts(raw: Vec<String>) -> Result<(GlobalOpts, Vec<String>)> {
             data_dir,
             network_mode,
             name_override,
+            bind_physical_nic,
             json_output,
         },
         rest,
@@ -140,10 +153,11 @@ fn print_usage() {
         "电脑共享 · 命令行与后台程序 (pcshare-agent)
 
 全局选项：
-  --data-dir <路径>    指定配置与身份存储目录（默认 %APPDATA%\\pcshare）
-  --local              本地直连测试模式（不连接公网服务器）
-  --name <名称>        指定本机显示名称
-  --json               以 JSON 输出查询结果
+  --data-dir <路径>            指定配置与身份存储目录（默认 %APPDATA%\\pcshare）
+  --local                      本地直连测试模式（不连接公网服务器）
+  --name <名称>                指定本机显示名称
+  --bind-physical-nic <on|off> 是否将 IPv4 通信直绑主物理网卡（绕开代理 TUN）
+  --json                       以 JSON 输出查询结果
 
 被控端模式：
   pcshare-agent [serve] [--pair] [--auto-approve]
@@ -176,6 +190,7 @@ fn print_usage() {
 }
 
 async fn start_client_node(opts: &GlobalOpts) -> Result<Arc<CoreNode>> {
+    apply_nic_pref_if_needed(opts)?;
     let cfg = CoreConfig {
         data_dir: opts.data_dir.clone(),
         network_mode: opts.network_mode,
@@ -187,6 +202,16 @@ async fn start_client_node(opts: &GlobalOpts) -> Result<Arc<CoreNode>> {
         eprintln!("提示：{w}");
     }
     Ok(node)
+}
+
+fn apply_nic_pref_if_needed(opts: &GlobalOpts) -> Result<()> {
+    if let Some(bind_phys) = opts.bind_physical_nic {
+        let store = open_local_storage(opts)?;
+        store.update_settings(|s| {
+            s.bind_physical_nic = bind_phys;
+        })?;
+    }
+    Ok(())
 }
 
 fn open_local_storage(opts: &GlobalOpts) -> Result<LocalStorage> {
@@ -273,6 +298,7 @@ async fn cmd_serve(opts: &GlobalOpts, args: &[String]) -> Result<()> {
         }
     }
 
+    apply_nic_pref_if_needed(opts)?;
     let cfg = CoreConfig {
         data_dir: opts.data_dir.clone(),
         network_mode: opts.network_mode,

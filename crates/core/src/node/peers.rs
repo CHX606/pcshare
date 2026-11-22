@@ -99,6 +99,17 @@ impl CoreNode {
         {
             conn.close(CLOSE_UNAUTHORIZED.into(), b"removed");
         }
+        {
+            let mut bulk = self.bulk_conns.write().unwrap_or_else(|e| e.into_inner());
+            bulk.retain(|(pid, _), c| {
+                if pid == peer_id {
+                    c.close(CLOSE_UNAUTHORIZED.into(), b"removed");
+                    false
+                } else {
+                    true
+                }
+            });
+        }
         // 强制断开该对端所有已建立的入站连接，立即终止终端、事件流、实时桌面与目录监听
         if let Some(in_list) = self
             .incoming_conns
@@ -176,6 +187,16 @@ impl CoreNode {
             .map(|(_, c)| c)
             .collect();
         for c in conns {
+            c.close(CLOSE_OK.into(), b"shutdown");
+        }
+        let bulk_conns: Vec<Connection> = self
+            .bulk_conns
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+            .map(|(_, c)| c)
+            .collect();
+        for c in bulk_conns {
             c.close(CLOSE_OK.into(), b"shutdown");
         }
         let in_conns: Vec<Connection> = self

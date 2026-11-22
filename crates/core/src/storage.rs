@@ -67,6 +67,9 @@ pub struct Settings {
     pub autostart_prompted: bool,
     #[serde(default = "default_true")]
     pub portmap_enabled: bool,
+    /// 是否优先将 IPv4 传输直绑到具备真实默认网关的物理网卡（开启代理 TUN 时可绕开虚拟网卡转发损耗）
+    #[serde(default)]
+    pub bind_physical_nic: bool,
     #[serde(default = "default_quick_hotkey")]
     pub quick_hotkey: String,
     #[serde(default)]
@@ -84,6 +87,7 @@ impl Settings {
             autostart_elevated: false,
             autostart_prompted: false,
             portmap_enabled: true,
+            bind_physical_nic: false,
             quick_hotkey: default_quick_hotkey(),
             clipboard_auto_sync: false,
             recent_folders: Vec::new(),

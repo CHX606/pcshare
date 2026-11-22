@@ -316,6 +316,15 @@ impl CoreNode {
         {
             old.close(1u32.into(), b"stale_retry");
         }
+        let mut bulk = self.bulk_conns.write().unwrap_or_else(|e| e.into_inner());
+        bulk.retain(|(pid, _), c| {
+            if pid == peer_id {
+                c.close(1u32.into(), b"stale_retry");
+                false
+            } else {
+                true
+            }
+        });
     }
 
     #[doc(hidden)]
@@ -327,6 +336,12 @@ impl CoreNode {
             .get(peer_id)
         {
             conn.close(99u32.into(), b"simulated_drop");
+        }
+        let bulk = self.bulk_conns.read().unwrap_or_else(|e| e.into_inner());
+        for ((pid, _), c) in bulk.iter() {
+            if pid == peer_id {
+                c.close(99u32.into(), b"simulated_drop");
+            }
         }
     }
 }

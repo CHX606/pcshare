@@ -756,12 +756,22 @@ pub struct FsReadHeader {
     pub modified_ms: Option<u64>,
 }
 
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FsWriteArgs {
     pub path: String,
     pub size: u64,
     #[serde(default)]
     pub offset: u64,
+    /// 分片并发上传模式下本条流写入的字节长度；缺省 `None` 表示顺序写至文件末尾（兼容 0.4.1）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_length: Option<u64>,
+    /// 为 `true` 时写完本分片仅落盘保留 `.pcshare.part` 而不立即原子改名，由最终收尾请求统一落盘改名。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub defer_finalize: bool,
     #[serde(default)]
     pub modified_ms: Option<u64>,
     #[serde(default)]

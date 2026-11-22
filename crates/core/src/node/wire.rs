@@ -59,6 +59,7 @@ pub(super) async fn rpc_once<R: DeserializeOwned>(
             .open_bi()
             .await
             .map_err(|e| CoreError::NotConnected(format!("和对方的连接已断开：{e}")))?;
+        let _ = send.set_priority(8);
         write_frame(&mut send, &env).await?;
         send.finish()
             .map_err(|e| CoreError::Internal(format!("结束请求流失败：{e}")))?;
@@ -73,11 +74,19 @@ pub(super) async fn write_rpc_result<T: serde::Serialize>(
     send: &mut SendStream,
     res: Result<T, RpcError>,
 ) -> Result<(), CoreError> {
+    write_rpc_result_opts(send, res, false).await
+}
+
+pub(super) async fn write_rpc_result_opts<T: serde::Serialize>(
+    send: &mut SendStream,
+    res: Result<T, RpcError>,
+    compress: bool,
+) -> Result<(), CoreError> {
     let env = match res {
         Ok(data) => ResponseEnvelope::Ok(data),
         Err(err) => ResponseEnvelope::Err(err),
     };
-    write_frame(send, &env).await?;
+    let _ = write_frame_maybe_compressed(send, &env, compress).await?;
     Ok(())
 }
 
@@ -88,6 +97,8 @@ pub fn node_capabilities() -> Vec<String> {
         "fs.v2".to_string(),
         "transfer.v1".to_string(),
         "transfer.v2".to_string(),
+        CAP_TRANSFER_STRIPED.to_string(),
+        CAP_FRAME_DEFLATE.to_string(),
         "app.v1".to_string(),
         "app.v2".to_string(),
         "proc.v1".to_string(),

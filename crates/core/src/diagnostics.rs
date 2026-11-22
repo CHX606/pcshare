@@ -161,6 +161,18 @@ fn prune_old_runtime_logs(logs_dir: &Path) {
     }
 }
 
+/// 获取 iroh 默认公共中转服务器地址列表（用于诊断汇总展示，避免上层硬编码过时地址）。
+pub fn default_netcheck_relay_urls() -> Vec<String> {
+    let map = RelayMode::Default.relay_map();
+    let mut urls: Vec<String> = map
+        .urls::<Vec<_>>()
+        .into_iter()
+        .map(|u| u.to_string().trim_end_matches('/').to_string())
+        .collect();
+    urls.sort();
+    urls
+}
+
 /// 执行网络体检（仅在用户明确点击时调用；会连接 iroh 公共中转或自定义中转服务器）。
 pub async fn run_netcheck(custom_relay_urls: &[String]) -> Result<NetcheckReport, CoreError> {
     let mut builder = Endpoint::builder(presets::N0);

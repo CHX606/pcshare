@@ -1,6 +1,64 @@
 use super::*;
 pub(super) mod desktop;
 
+macro_rules! bridge_arc_async_cmds {
+    ($( $name:ident ( $( $arg:ident : $ty:ty ),* $(,)? ) -> $ret:ty ; )*) => {
+        $(
+            #[allow(clippy::too_many_arguments)]
+            #[tauri::command]
+            pub(crate) async fn $name(
+                state: State<'_, ManagedBridge>,
+                $( $arg : $ty ),*
+            ) -> Result<Reply<$ret>, ()> {
+                Ok(state.inner().clone().$name( $( $arg ),* ).await)
+            }
+        )*
+    };
+}
+
+macro_rules! bridge_ref_async_cmds {
+    ($( $name:ident ( $( $arg:ident : $ty:ty ),* $(,)? ) -> $ret:ty ; )*) => {
+        $(
+            #[tauri::command]
+            pub(crate) async fn $name(
+                state: State<'_, ManagedBridge>,
+                $( $arg : $ty ),*
+            ) -> Result<Reply<$ret>, ()> {
+                Ok(state.$name( $( $arg ),* ).await)
+            }
+        )*
+    };
+}
+
+macro_rules! bridge_sync_cmds {
+    ($( $name:ident ( $( $arg:ident : $ty:ty ),* $(,)? ) -> $ret:ty ; )*) => {
+        $(
+            #[tauri::command]
+            pub(crate) async fn $name(
+                state: State<'_, ManagedBridge>,
+                $( $arg : $ty ),*
+            ) -> Result<Reply<$ret>, ()> {
+                Ok(state.$name( $( $arg ),* ))
+            }
+        )*
+    };
+}
+
+macro_rules! bridge_blocking_cmds {
+    ($( $label:literal => $name:ident ( $( $arg:ident : $ty:ty ),* $(,)? ) -> $ret:ty ; )*) => {
+        $(
+            #[tauri::command]
+            pub(crate) async fn $name(
+                state: State<'_, ManagedBridge>,
+                $( $arg : $ty ),*
+            ) -> Result<Reply<$ret>, ()> {
+                let bridge = state.inner().clone();
+                spawn_blocking_reply($label, move || bridge.$name( $( $arg ),* )).await
+            }
+        )*
+    };
+}
+
 pub(super) mod applications;
 pub(super) mod devices;
 pub(super) mod files;

@@ -18,6 +18,12 @@ impl RpcStream<'_> {
         self.node
             .record_audit(self.peer, &self.record.name, action, detail, ok);
     }
+    fn supports_deflate(&self) -> bool {
+        self.record
+            .capabilities
+            .iter()
+            .any(|c| c == CAP_FRAME_DEFLATE)
+    }
 }
 
 impl CoreNode {

@@ -14,6 +14,7 @@ mod embedded {
     use std::sync::Mutex;
 
     const PROGRAM: &[u8] = include_bytes!("../../media/ffmpeg-win64.gz");
+    const STAMP_FILE: &str = "ffmpeg.verified";
     static CHECKED: Mutex<Option<PathBuf>> = Mutex::new(None);
 
     pub(super) fn executable(dir: &Path) -> Result<PathBuf, PlatformError> {
@@ -30,6 +31,59 @@ mod embedded {
         Ok(file)
     }
 
+    pub(super) fn verify_cold(dir: &Path) -> Result<PathBuf, PlatformError> {
+        let media_dir = dir.join("media").join(SHA256);
+        let file = media_dir.join("ffmpeg.exe");
+        install(&media_dir, &file)
+            .map_err(|e| PlatformError::System(format!("准备视频编码器失败：{e}")))?;
+        Ok(file)
+    }
+
+    fn expected_stamp(meta: &std::fs::Metadata) -> Option<String> {
+        let modified_ns = meta
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
+        Some(format!("{}:{}:{}", meta.len(), modified_ns, SHA256))
+    }
+
+    fn write_stamp(dir: &Path, path: &Path) {
+        if let Ok(meta) = std::fs::metadata(path)
+            && let Some(stamp) = expected_stamp(&meta)
+        {
+            let stamp_path = dir.join(STAMP_FILE);
+            let tmp = dir.join(format!("{STAMP_FILE}.{}.tmp", fastrand::u64(..)));
+            if std::fs::write(&tmp, stamp.as_bytes()).is_ok() {
+                let _ = std::fs::rename(&tmp, &stamp_path);
+            } else {
+                let _ = std::fs::remove_file(&tmp);
+            }
+        }
+    }
+
+    fn is_verified_fast(dir: &Path, path: &Path) -> io::Result<bool> {
+        let meta = match std::fs::metadata(path) {
+            Ok(m) if m.is_file() => m,
+            Ok(_) => return Ok(false),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        if let Some(expected) = expected_stamp(&meta)
+            && let Ok(saved) = std::fs::read_to_string(dir.join(STAMP_FILE))
+            && saved.trim() == expected
+        {
+            return Ok(true);
+        }
+        if matches_hash(path)? {
+            write_stamp(dir, path);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     fn matches_hash(path: &Path) -> io::Result<bool> {
         let mut input = match File::open(path) {
             Ok(f) => f,
@@ -37,7 +91,14 @@ mod embedded {
             Err(e) => return Err(e),
         };
         let mut hash = Sha256::new();
-        io::copy(&mut input, &mut hash)?;
+        let mut buf = vec![0u8; 512 * 1024];
+        loop {
+            let n = io::Read::read(&mut input, &mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hash.update(&buf[..n]);
+        }
         Ok(format!("{:x}", hash.finalize()) == SHA256)
     }
 
@@ -51,7 +112,7 @@ mod embedded {
         if !build.exists() {
             std::fs::write(build, include_bytes!("../../media/FFmpeg-build.txt"))?;
         }
-        if matches_hash(path)? {
+        if is_verified_fast(dir, path)? {
             return Ok(());
         }
         let temp = dir.join(format!("{}.{}.tmp", std::process::id(), fastrand::u64(..)));
@@ -67,9 +128,11 @@ mod embedded {
                 return Err(io::Error::other("编码器校验失败"));
             }
             match std::fs::rename(&temp, path) {
-                Err(_) if matches_hash(path)? => std::fs::remove_file(&temp),
-                other => other,
+                Err(_) if matches_hash(path)? => std::fs::remove_file(&temp)?,
+                other => other?,
             }
+            write_stamp(dir, path);
+            Ok(())
         })();
         if result.is_err() {
             let _ = std::fs::remove_file(&temp);
@@ -115,6 +178,18 @@ pub(super) fn executable(dir: &Path) -> Result<PathBuf, PlatformError> {
     #[cfg(feature = "embedded-ffmpeg")]
     {
         embedded::executable(dir)
+    }
+    #[cfg(not(feature = "embedded-ffmpeg"))]
+    {
+        external::executable(dir)
+    }
+}
+
+#[doc(hidden)]
+pub fn verify_embedded_encoder_ready(dir: &Path) -> Result<PathBuf, PlatformError> {
+    #[cfg(feature = "embedded-ffmpeg")]
+    {
+        embedded::verify_cold(dir)
     }
     #[cfg(not(feature = "embedded-ffmpeg"))]
     {

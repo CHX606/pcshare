@@ -130,10 +130,11 @@ fn packet(frame: DesktopFrame) -> Result<Vec<u8>, serde_json::Error> {
         transform,
         codec,
     };
-    let header = serde_json::to_vec(&info)?;
-    let mut packet = Vec::with_capacity(4 + header.len() + frame.bytes.len());
-    packet.extend_from_slice(&(header.len() as u32).to_be_bytes());
-    packet.extend_from_slice(&header);
+    let mut packet = Vec::with_capacity(4 + 256 + frame.bytes.len());
+    packet.extend_from_slice(&[0u8; 4]);
+    serde_json::to_writer(&mut packet, &info)?;
+    let header_len = packet.len() - 4;
+    packet[..4].copy_from_slice(&(header_len as u32).to_be_bytes());
     packet.extend_from_slice(&frame.bytes);
     Ok(packet)
 }

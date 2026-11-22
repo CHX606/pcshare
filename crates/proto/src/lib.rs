@@ -21,12 +21,17 @@ pub const DEFAULT_LIST_BATCH_SIZE: usize = 2000;
 pub const FIRST_LIST_BATCH_SIZE: usize = 500;
 /// 小文件单流连续批传阈值：256 KB（见分阶段任务 2.4 节）。
 pub const SMALL_FILE_BATCH_THRESHOLD: u64 = 256 * 1024;
-/// 文件传输分块大小：64 KB（见分阶段任务 1.8 节）。
-pub const TRANSFER_CHUNK_SIZE: usize = 64 * 1024;
+/// 文件传输分块大小：512 KB（配合顺序预读缓冲池与 QUIC 高吞吐窗口，100% 兼容原始字节流协议）。
+pub const TRANSFER_CHUNK_SIZE: usize = 512 * 1024;
+/// 协议能力协商标记：控制大帧 Deflate 压缩（仅双方同时具备时启用，向下兼容 0.4.1）。
+pub const CAP_FRAME_DEFLATE: &str = "frame.deflate.v1";
+/// 协议能力协商标记：大文件多连接分片并发上传（仅双方同时具备时启用，向下兼容 0.4.1）。
+pub const CAP_TRANSFER_STRIPED: &str = "transfer.striped.v1";
 
 pub use error::{ErrorCode, FrameError, RpcError};
 pub use frame::{
-    MAX_FRAME_SIZE, MAX_HANDSHAKE_FRAME_SIZE, read_frame, read_frame_limited, read_optional_frame,
-    read_optional_frame_limited, write_frame, write_raw_frame,
+    COMPRESSED_FRAME_FLAG, COMPRESS_THRESHOLD_BYTES, MAX_FRAME_SIZE, MAX_HANDSHAKE_FRAME_SIZE,
+    read_frame, read_frame_limited, read_optional_frame, read_optional_frame_limited, write_frame,
+    write_frame_maybe_compressed, write_raw_frame,
 };
 pub use messages::*;

@@ -237,11 +237,24 @@ pub struct UiSystemNotice {
     pub kind: String,
 }
 
+/// 单次精确容量预分配并原地切片编码 `data:<mime>;base64,...`，消除中间 Base64 `String` 分配与二次整块拷贝。
+pub fn encode_data_url(mime_prefix: &str, raw: &[u8]) -> String {
+    let p_bytes = mime_prefix.as_bytes();
+    let b64_len = raw.len().div_ceil(3) * 4;
+    let mut buf = vec![0u8; p_bytes.len() + b64_len];
+    buf[..p_bytes.len()].copy_from_slice(p_bytes);
+    let written = base64::engine::general_purpose::STANDARD
+        .encode_slice(raw, &mut buf[p_bytes.len()..])
+        .expect("exact base64 output slice length");
+    buf.truncate(p_bytes.len() + written);
+    String::from_utf8(buf).expect("ascii data url")
+}
+
 fn convert_captured_shot(shot: CapturedShot) -> UiCapturedShot {
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&shot.jpeg_bytes);
+    let image_data_url = encode_data_url("data:image/jpeg;base64,", &shot.jpeg_bytes);
     let t = shot.header.transform;
     UiCapturedShot {
-        image_data_url: format!("data:image/jpeg;base64,{b64}"),
+        image_data_url,
         byte_len: shot.header.byte_len,
         captured_at_ms: shot.header.captured_at_ms,
         transform: UiShotTransform {
@@ -323,16 +336,13 @@ fn convert_remote_clipboard(d: RemoteClipboardData) -> UiClipboardPreview {
             width: None,
             height: None,
         },
-        ClipKind::ImagePng => {
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&d.png_bytes);
-            UiClipboardPreview {
-                kind: "image_png".to_string(),
-                text: None,
-                image_data_url: Some(format!("data:image/png;base64,{b64}")),
-                width: d.header.image_width,
-                height: d.header.image_height,
-            }
-        }
+        ClipKind::ImagePng => UiClipboardPreview {
+            kind: "image_png".to_string(),
+            text: None,
+            image_data_url: Some(encode_data_url("data:image/png;base64,", &d.png_bytes)),
+            width: d.header.image_width,
+            height: d.header.image_height,
+        },
     }
 }
 
@@ -1086,16 +1096,13 @@ impl BridgeState {
                     png_bytes,
                     width,
                     height,
-                } => {
-                    let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
-                    UiClipboardPreview {
-                        kind: "image_png".to_string(),
-                        text: None,
-                        image_data_url: Some(format!("data:image/png;base64,{b64}")),
-                        width: Some(width),
-                        height: Some(height),
-                    }
-                }
+                } => UiClipboardPreview {
+                    kind: "image_png".to_string(),
+                    text: None,
+                    image_data_url: Some(encode_data_url("data:image/png;base64,", &png_bytes)),
+                    width: Some(width),
+                    height: Some(height),
+                },
             }));
         }
 

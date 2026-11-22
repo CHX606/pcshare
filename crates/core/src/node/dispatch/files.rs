@@ -34,10 +34,11 @@ impl RpcStream<'_> {
     }
     async fn on_fs_list(&mut self, args: FsListArgs) -> Result<(), CoreError> {
         let detail = args.path.clone();
+        let compress = self.supports_deflate();
         let res = self
             .node
             .fs_service
-            .list_to_stream(&self.record.permissions, args, self.send)
+            .list_to_stream_opts(&self.record.permissions, args, self.send, compress)
             .await;
         self.audit("fs.list", &detail, matches!(res, Ok(true)));
         res?;

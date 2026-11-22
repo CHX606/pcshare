@@ -64,9 +64,10 @@ impl RpcStream<'_> {
         Ok(())
     }
     pub(super) async fn on_fs_walk(&mut self, args: FsWalkArgs) -> Result<(), CoreError> {
+        let compress = self.supports_deflate();
         self.node
             .fs_service
-            .walk_to_stream(&self.record.permissions, args, self.send)
+            .walk_to_stream_opts(&self.record.permissions, args, self.send, compress)
             .await?;
         Ok(())
     }
@@ -125,10 +126,11 @@ impl RpcStream<'_> {
     }
     pub(super) async fn on_fs_search(&mut self, args: FsSearchArgs) -> Result<(), CoreError> {
         let detail = args.query.clone();
+        let compress = self.supports_deflate();
         let res = self
             .node
             .fs_service
-            .search_to_stream(&self.record.permissions, args, self.send)
+            .search_to_stream_opts(&self.record.permissions, args, self.send, compress)
             .await;
         self.audit("fs.search", &detail, matches!(res, Ok(true)));
         res?;

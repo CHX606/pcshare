@@ -18,8 +18,9 @@ use windows::Win32::Graphics::Gdi::{
     HBRUSH, HFONT, HGDIOBJ, UpdateWindow,
 };
 use windows::Win32::NetworkManagement::IpHelper::{
-    GAA_FLAG_INCLUDE_PREFIX, GET_ADAPTERS_ADDRESSES_FLAGS, GetAdaptersAddresses,
-    IF_TYPE_SOFTWARE_LOOPBACK, IP_ADAPTER_ADDRESSES_LH,
+    GAA_FLAG_INCLUDE_GATEWAYS, GAA_FLAG_INCLUDE_PREFIX, GET_ADAPTERS_ADDRESSES_FLAGS,
+    GetAdaptersAddresses, IF_TYPE_ETHERNET_CSMACD, IF_TYPE_IEEE80211, IF_TYPE_SOFTWARE_LOOPBACK,
+    IP_ADAPTER_ADDRESSES_LH,
 };
 use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
 use windows::Win32::Networking::WinSock::{AF_INET, AF_UNSPEC, SOCKADDR_IN};
@@ -197,6 +198,94 @@ fn collect_ipv4_broadcast_targets() -> Vec<(Ipv4Addr, Ipv4Addr)> {
         }
     }
     targets.into_iter().collect()
+}
+
+unsafe fn borrowed_pwstr_to_string(ptr: PWSTR) -> String {
+    if ptr.0.is_null() {
+        return String::new();
+    }
+    unsafe {
+        let mut len = 0usize;
+        while len < 512 && *ptr.0.add(len) != 0 {
+            len += 1;
+        }
+        String::from_utf16_lossy(std::slice::from_raw_parts(ptr.0, len))
+    }
+}
+
+/// 枚举本机活动物理网卡（有线以太网 / Wi-Fi），过滤掉虚拟/代理 TUN 网卡与 `198.18.0.0/15` Fake-IP 网段，
+/// 选取具备真实默认网关且路由度量最优的物理 IPv4 地址，用于开启物理网卡直绑时绕开 TUN 劫持。
+pub fn primary_physical_ipv4_impl() -> Option<Ipv4Addr> {
+    let buf = query_adapters_addresses(
+        AF_INET.0 as u32,
+        GAA_FLAG_INCLUDE_PREFIX | GAA_FLAG_INCLUDE_GATEWAYS,
+    )?;
+
+    let mut best: Option<((u8, u32), Ipv4Addr)> = None;
+    let mut curr = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+    unsafe {
+        while !curr.is_null() {
+            let adapter = &*curr;
+            let is_phys_type = adapter.IfType == IF_TYPE_ETHERNET_CSMACD
+                || adapter.IfType == IF_TYPE_IEEE80211;
+            let valid_mac = adapter.PhysicalAddressLength == 6
+                && !adapter.PhysicalAddress[..6].iter().all(|&x| x == 0)
+                && !adapter.PhysicalAddress[..6].iter().all(|&x| x == 0xFF);
+            let has_gateway = !adapter.FirstGatewayAddress.is_null();
+
+            if adapter.OperStatus == IfOperStatusUp && is_phys_type && valid_mac && has_gateway {
+                let desc = borrowed_pwstr_to_string(adapter.Description);
+                let friendly = borrowed_pwstr_to_string(adapter.FriendlyName);
+                if !crate::is_virtual_or_tunnel_adapter_name(&desc, &friendly) {
+                    let mut ua_ptr = adapter.FirstUnicastAddress;
+                    while !ua_ptr.is_null() {
+                        let ua = &*ua_ptr;
+                        if !ua.Address.lpSockaddr.is_null()
+                            && ua.Address.iSockaddrLength
+                                >= std::mem::size_of::<SOCKADDR_IN>() as i32
+                        {
+                            let sa: SOCKADDR_IN = std::ptr::read_unaligned(
+                                ua.Address.lpSockaddr as *const SOCKADDR_IN,
+                            );
+                            if sa.sin_family == AF_INET {
+                                let b = sa.sin_addr.S_un.S_un_b;
+                                let ip = Ipv4Addr::new(b.s_b1, b.s_b2, b.s_b3, b.s_b4);
+                                let is_link_local = b.s_b1 == 169 && b.s_b2 == 254;
+                                let is_fake_tun = b.s_b1 == 198 && (b.s_b2 == 18 || b.s_b2 == 19);
+                                if !ip.is_loopback()
+                                    && !ip.is_unspecified()
+                                    && !ip.is_multicast()
+                                    && !is_link_local
+                                    && !is_fake_tun
+                                {
+                                    // 同等带网关条件下按 Windows 自身 Ipv4Metric 升序择优，同度量优先有线网卡
+                                    let kind_rank = if adapter.IfType == IF_TYPE_ETHERNET_CSMACD {
+                                        0u8
+                                    } else {
+                                        1u8
+                                    };
+                                    let score = (kind_rank, adapter.Ipv4Metric);
+                                    let replace = match best {
+                                        None => true,
+                                        Some(((best_kind, best_metric), _)) => {
+                                            (adapter.Ipv4Metric, kind_rank)
+                                                < (best_metric, best_kind)
+                                        }
+                                    };
+                                    if replace {
+                                        best = Some((score, ip));
+                                    }
+                                }
+                            }
+                        }
+                        ua_ptr = ua.Next;
+                    }
+                }
+            }
+            curr = adapter.Next;
+        }
+    }
+    best.map(|(_, ip)| ip)
 }
 
 pub fn parse_mac_bytes(mac: &str) -> Result<[u8; 6], PlatformError> {

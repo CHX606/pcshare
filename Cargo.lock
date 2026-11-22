@@ -3567,20 +3567,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "pcshare-probe"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "iroh",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "pcshare-proto"
 version = "0.4.1"
 dependencies = [
+ "flate2",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

@@ -11,8 +11,9 @@ impl RpcStream<'_> {
         }
     }
     async fn on_app_list(&mut self, args: AppListArgs) -> Result<(), CoreError> {
+        let compress = self.supports_deflate();
         let res = handle_app_list(&self.node.platform, &self.record.permissions, args).await;
-        write_rpc_result(self.send, res).await?;
+        write_rpc_result_opts(self.send, res, compress).await?;
         Ok(())
     }
     async fn on_app_icon(&mut self, args: AppIconArgs) -> Result<(), CoreError> {
@@ -28,8 +29,9 @@ impl RpcStream<'_> {
         Ok(())
     }
     async fn on_proc_list(&mut self) -> Result<(), CoreError> {
+        let compress = self.supports_deflate();
         let res = handle_proc_list(&self.node.platform, &self.record.permissions).await;
-        write_rpc_result(self.send, res).await?;
+        write_rpc_result_opts(self.send, res, compress).await?;
         Ok(())
     }
     async fn on_proc_kill(&mut self, args: ProcKillArgs) -> Result<(), CoreError> {

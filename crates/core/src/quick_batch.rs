@@ -14,7 +14,7 @@ use tokio::task::JoinSet;
 use crate::CoreNode;
 use crate::error::CoreError;
 use crate::events::DeviceConnState;
-use crate::pinyin::match_rank;
+use crate::pinyin::{CompiledQuery, match_rank};
 use crate::storage::RecentFolderItem;
 use crate::terminal::TerminalStreamEvent;
 
@@ -153,6 +153,7 @@ impl CoreNode {
         device_pairs.push(("self".to_string(), self_name.clone()));
 
         let (scoped_peer, keyword) = parse_device_and_keyword(query, &device_pairs);
+        let compiled_kw = CompiledQuery::new(keyword);
 
         let is_online = |pid: &str| -> bool {
             if pid == "self" {
@@ -197,7 +198,7 @@ impl CoreNode {
             let online = is_online(pid);
             if let Some(apps) = apps_snapshot.get(pid) {
                 for app in apps {
-                    if let Some(rank) = match_rank(&app.name, keyword) {
+                    if let Some(rank) = compiled_kw.match_rank(&app.name) {
                         let bonus = if single_online_remote == Some(pid.as_str()) {
                             0
                         } else if online {
@@ -228,7 +229,9 @@ impl CoreNode {
             {
                 continue;
             }
-            let rank_opt = match_rank(&rf.name, keyword).or_else(|| match_rank(&rf.path, keyword));
+            let rank_opt = compiled_kw
+                .match_rank(&rf.name)
+                .or_else(|| compiled_kw.match_rank(&rf.path));
             if let Some(rank) = rank_opt {
                 let online = is_online(&rf.peer_id);
                 let bonus = if single_online_remote == Some(rf.peer_id.as_str()) {

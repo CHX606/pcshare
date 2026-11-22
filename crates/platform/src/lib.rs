@@ -148,6 +148,11 @@ pub trait Platform: Send + Sync + 'static {
     /// 获取本机物理网卡地址列表（格式 `AA:BB:CC:DD:EE:FF`，用于网络唤醒，任务 3.5）。
     fn local_mac_addresses(&self) -> Vec<String>;
 
+    /// 获取本机带默认网关的主用物理网卡 IPv4 地址（自动排除代理 TUN、VPN、Hyper-V/WSL/Docker/VMware 等虚拟网卡）。
+    fn primary_physical_ipv4(&self) -> Option<std::net::Ipv4Addr> {
+        None
+    }
+
     /// 向局域网广播发送网络唤醒魔术包（任务 3.5）。
     fn send_wol_packets(&self, macs: &[String]) -> Result<usize, PlatformError>;
 
@@ -212,3 +217,41 @@ pub fn enable_per_monitor_dpi_awareness() {}
 mod stub_impl;
 #[cfg(not(windows))]
 pub use stub_impl::UnsupportedPlatform as NativePlatform;
+
+/// 判断网卡描述或友好名称是否属于代理 TUN、VPN 隧道或虚拟机虚拟网卡。
+pub fn is_virtual_or_tunnel_adapter_name(description: &str, friendly_name: &str) -> bool {
+    const VIRTUAL_KEYWORDS: &[&str] = &[
+        "wintun",
+        "wireguard",
+        "clash",
+        "mihomo",
+        "sing-box",
+        "singbox",
+        "tap-windows",
+        "tap adapter",
+        "openvpn",
+        "tailscale",
+        "zerotier",
+        "hyper-v",
+        "vethernet",
+        "wsl",
+        "vmware",
+        "virtualbox",
+        "vbox",
+        "docker",
+        "npcap",
+        "loopback",
+        "radmin",
+        "hamachi",
+        "sangfor",
+        "anyconnect",
+        "fortinet",
+        "pangp",
+        "meta tunnel",
+    ];
+    let desc_lower = description.to_ascii_lowercase();
+    let friendly_lower = friendly_name.to_ascii_lowercase();
+    VIRTUAL_KEYWORDS
+        .iter()
+        .any(|kw| desc_lower.contains(kw) || friendly_lower.contains(kw))
+}

@@ -62,7 +62,13 @@ pub struct VideoPacket {
 #[cfg(windows)]
 pub use encoder::VideoCapture;
 #[cfg(windows)]
+#[doc(hidden)]
+pub use encoder::prioritized_encoder_names_for_vendors;
+#[cfg(windows)]
 pub use pointer::{inject, verify_target};
+#[cfg(windows)]
+#[doc(hidden)]
+pub use program::verify_embedded_encoder_ready;
 #[cfg(windows)]
 pub use target::capture_area;
 

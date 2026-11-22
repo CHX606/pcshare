@@ -3,13 +3,14 @@ use super::{CaptureArea, CaptureSource, Encoding, VideoPacket, program};
 use crate::PlatformError;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader, Lines};
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 
 type Route = (Encoder, CapturePath);
 static LAST_ROUTE: Mutex<Option<Route>> = Mutex::new(None);
+static DXGI_VENDORS: OnceLock<Option<Vec<u32>>> = OnceLock::new();
 
 const STATS_PREFIX: &str = "PCSHARE_FRAME ";
 const STATS_TOKEN: &str = "PCSHARE_FRAME";
@@ -71,7 +72,7 @@ impl VideoCapture {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = cmd.spawn().map_err(system)?;
-        let bytes = BufReader::new(child.stdout.take().expect("piped stdout"));
+        let bytes = BufReader::with_capacity(128 * 1024, child.stdout.take().expect("piped stdout"));
         let stats = BufReader::new(child.stderr.take().expect("piped stderr")).lines();
         let mut capture = Self {
             _child: child,
@@ -239,24 +240,94 @@ fn is_valid_annex_b_packet(bytes: &[u8], key: bool) -> bool {
     false
 }
 
-fn candidates() -> [Route; 13] {
+fn detect_dxgi_hardware_vendors() -> Option<Vec<u32>> {
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIFactory1,
+    };
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1().ok()? };
+    let mut vendors = Vec::new();
+    let mut idx = 0u32;
+    while let Ok(adapter) = unsafe { factory.EnumAdapters1(idx) } {
+        idx += 1;
+        if let Ok(desc) = unsafe { adapter.GetDesc1() } {
+            let is_software = (desc.Flags & (DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32)) != 0
+                || desc.VendorId == 0x1414;
+            if !is_software && !vendors.contains(&desc.VendorId) {
+                vendors.push(desc.VendorId);
+            }
+        }
+    }
+    Some(vendors)
+}
+
+fn vendor_to_encoder(vendor_id: u32) -> Option<Encoder> {
+    match vendor_id {
+        0x10DE => Some(Encoder::Nvidia),
+        0x8086 => Some(Encoder::Intel),
+        0x1002 | 0x1022 => Some(Encoder::Amd),
+        _ => None,
+    }
+}
+
+fn candidates_for_vendors(vendors: Option<&[u32]>) -> Vec<Route> {
     use CapturePath::{Gdi, Graphics, Staged};
     use Encoder::{Amd, Intel, MediaFoundation, Nvidia, Software};
-    [
-        (Nvidia, Graphics),
-        (Intel, Graphics),
-        (Amd, Graphics),
-        (Nvidia, Staged),
-        (Intel, Staged),
-        (Amd, Staged),
-        (MediaFoundation, Staged),
-        (Software, Staged),
-        (Nvidia, Gdi),
-        (Intel, Gdi),
-        (Amd, Gdi),
-        (MediaFoundation, Gdi),
-        (Software, Gdi),
-    ]
+
+    match vendors {
+        Some(list) => {
+            let mut hw = Vec::with_capacity(3);
+            for &vid in list {
+                if let Some(enc) = vendor_to_encoder(vid)
+                    && !hw.contains(&enc)
+                {
+                    hw.push(enc);
+                }
+            }
+            let mut routes = Vec::with_capacity(hw.len() * 3 + 4);
+            for &enc in &hw {
+                routes.push((enc, Graphics));
+            }
+            for &enc in &hw {
+                routes.push((enc, Staged));
+            }
+            routes.push((MediaFoundation, Staged));
+            routes.push((Software, Staged));
+            for &enc in &hw {
+                routes.push((enc, Gdi));
+            }
+            routes.push((MediaFoundation, Gdi));
+            routes.push((Software, Gdi));
+            routes
+        }
+        None => vec![
+            (Nvidia, Graphics),
+            (Intel, Graphics),
+            (Amd, Graphics),
+            (Nvidia, Staged),
+            (Intel, Staged),
+            (Amd, Staged),
+            (MediaFoundation, Staged),
+            (Software, Staged),
+            (Nvidia, Gdi),
+            (Intel, Gdi),
+            (Amd, Gdi),
+            (MediaFoundation, Gdi),
+            (Software, Gdi),
+        ],
+    }
+}
+
+fn candidates() -> Vec<Route> {
+    let cached = DXGI_VENDORS.get_or_init(detect_dxgi_hardware_vendors);
+    candidates_for_vendors(cached.as_deref())
+}
+
+#[doc(hidden)]
+pub fn prioritized_encoder_names_for_vendors(vendors: Option<&[u32]>) -> Vec<&'static str> {
+    candidates_for_vendors(vendors)
+        .into_iter()
+        .map(|(enc, _)| enc.name())
+        .collect()
 }
 
 fn system(e: std::io::Error) -> PlatformError {

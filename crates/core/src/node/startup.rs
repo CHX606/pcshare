@@ -61,6 +61,7 @@ impl CoreNode {
             events_tx: services.events_tx,
             remote_events_tx: services.remote_events_tx,
             active_conns: RwLock::new(HashMap::new()),
+            bulk_conns: RwLock::new(HashMap::new()),
             incoming_conns: RwLock::new(HashMap::new()),
             dial_locks: Mutex::new(HashMap::new()),
             peer_states: RwLock::new(HashMap::new()),
@@ -168,15 +169,29 @@ async fn bind_endpoint(
     bind_port_v4: Option<u16>,
 ) -> Result<Endpoint, CoreError> {
     let settings = storage.settings();
+    let quic_cfg = iroh::endpoint::QuicTransportConfig::builder()
+        .max_concurrent_bidi_streams(iroh::endpoint::VarInt::from_u32(256))
+        .build();
     let mut builder = match config.network_mode {
         NetworkMode::PublicOrCustom => Endpoint::builder(presets::N0),
         NetworkMode::LocalTest => Endpoint::builder(presets::Minimal),
     };
-    builder = builder.secret_key(storage.secret_key().clone()).alpns(vec![
-        ALPN_MAIN.to_vec(),
-        ALPN_PAIR.to_vec(),
-        ALPN_DIRECT.to_vec(),
-    ]);
+    let portmap_cfg = if config.network_mode == NetworkMode::PublicOrCustom && settings.portmap_enabled
+    {
+        iroh::endpoint::PortmapperConfig::default()
+    } else {
+        iroh::endpoint::PortmapperConfig::Disabled
+    };
+
+    builder = builder
+        .transport_config(quic_cfg)
+        .portmapper_config(portmap_cfg)
+        .secret_key(storage.secret_key().clone())
+        .alpns(vec![
+            ALPN_MAIN.to_vec(),
+            ALPN_PAIR.to_vec(),
+            ALPN_DIRECT.to_vec(),
+        ]);
 
     builder = relay_settings(builder, config, &settings.custom_relay_urls)?;
     if let Some(port) = bind_port_v4 {
@@ -189,6 +204,12 @@ async fn bind_endpoint(
             .clear_ip_transports()
             .bind_addr(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
             .map_err(|e| CoreError::Internal(format!("绑定本地测试端口失败：{e}")))?;
+    } else if settings.bind_physical_nic
+        && let Some(phys_ip) = storage.platform().primary_physical_ipv4()
+    {
+        builder = builder
+            .bind_addr(SocketAddrV4::new(phys_ip, 0))
+            .map_err(|e| CoreError::Internal(format!("绑定物理网卡 {phys_ip} 失败：{e}")))?;
     }
 
     builder

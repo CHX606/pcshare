@@ -6,6 +6,7 @@ publish.workspace = true
 description = "电脑共享协议：消息类型、帧编码解码、错误码、版本与权限"
 
 [dependencies]
+flate2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

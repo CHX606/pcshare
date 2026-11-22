@@ -1,8 +1,8 @@
 # 整个项目是一个 Rust 工作区，以后的核心库、被控端、控制台都作为成员加进来。
 [workspace]
 resolver = "3"
-members = ["probe", "crates/*", "app/src-tauri"]
-exclude = ["app"]
+members = ["crates/*", "app/src-tauri"]
+exclude = ["app", "probe"]
 
 [workspace.package]
 version = "0.4.1"
@@ -16,6 +16,7 @@ blake3 = "1.8"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 constant_time_eq = "0.4"
 fastrand = "2.5"
+flate2 = "1"
 iroh = { version = "1.4", features = ["unstable-net-report"] }
 notify = "8.2"
 png = "0.18"
